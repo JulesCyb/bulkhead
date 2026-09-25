@@ -1,7 +1,7 @@
 """Agent identity creation (ADR-0005, Spec 6 / #46).
 
 Revision ID: 0032
-Revises: 0022
+Revises: 0031
 Create Date: 2026-09-25
 
 `control.identities` gains a `kind` column (`'person'` or `'agent'`, default `'person'` so every
@@ -37,7 +37,7 @@ from collections.abc import Sequence
 from alembic import op
 
 revision: str = "0032"
-down_revision: str | None = "0022"
+down_revision: str | None = "0031"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
