@@ -31,11 +31,20 @@
 # They are a deployment-wide ceiling/default that applies even to a connection tenant_session()
 # never touched. Defaults here must match app.config.ROLE_STATEMENT_TIMEOUT_MS /
 # ROLE_CONNECTION_LIMIT, which the embedded-Postgres integration test asserts against.
+#
+# GATEWAY_DB_PASSWORD (Spec 7 / #51): the model gateway (LiteLLM) is a required service with its
+# own role and its own database — never the application database. It gets no grant of any kind
+# on ${POSTGRES_DB} (no default privilege grants any such thing either, see above), and the
+# revoke below closes the one privilege every database grants PUBLIC by default: the ability to
+# CONNECT at all. Only app_owner and app keep an explicit CONNECT grant on ${POSTGRES_DB}.
 set -e
 : "${APP_STATEMENT_TIMEOUT_MS:=60000}"
 : "${APP_CONNECTION_LIMIT:=50}"
+: "${GATEWAY_DB_PASSWORD:=gateway}"
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
     CREATE EXTENSION IF NOT EXISTS vector;
+
+    REVOKE CONNECT ON DATABASE ${POSTGRES_DB} FROM PUBLIC;
 
     CREATE ROLE app_owner LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE
         PASSWORD '${APP_OWNER_DB_PASSWORD}';
@@ -52,4 +61,14 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
     ALTER ROLE app SET statement_timeout = '${APP_STATEMENT_TIMEOUT_MS}ms';
     GRANT CONNECT ON DATABASE ${POSTGRES_DB} TO app;
     GRANT USAGE ON SCHEMA public TO app;
+
+    CREATE ROLE gateway LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE
+        PASSWORD '${GATEWAY_DB_PASSWORD}';
 EOSQL
+
+# CREATE DATABASE cannot run inside the multi-statement heredoc above (it must not run in a
+# transaction block), so it gets its own psql invocation. "OWNER gateway" plus the default
+# REVOKE CONNECT FROM PUBLIC on ${POSTGRES_DB} above means the gateway role has no path — no
+# grant, no default privilege, no PUBLIC connect — to anything in the application database.
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
+    -c "CREATE DATABASE gateway OWNER gateway;"

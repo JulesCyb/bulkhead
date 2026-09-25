@@ -12,6 +12,9 @@ services:
       APP_CONNECTION_LIMIT: ${APP_CONNECTION_LIMIT:-50}
 
       APP_OWNER_DB_PASSWORD: ${APP_OWNER_DB_PASSWORD:-app_owner}
+      # The model gateway's own role/database password (Spec 7 / #51; see
+      # docker/postgres/01-init.sh) — never the application's own credential.
+      GATEWAY_DB_PASSWORD: ${GATEWAY_DB_PASSWORD:-gateway}
     volumes:
       - ./docker/postgres/01-init.sh:/docker-entrypoint-initdb.d/01-init.sh:ro
       - pgdata:/var/lib/postgresql/data
@@ -53,13 +56,24 @@ services:
       - "127.0.0.1:8000:8000"
     command: uv run --no-sync uvicorn app.main:app --host 0.0.0.0 --port 8000
 
-  # Optional: model gateway. Start with `docker compose --profile gateway up -d`
+  # Required (ADR-0009): every deployment runs its own model gateway, no profile flag. It gets
+  # its own database/role (never the app's — see docker/postgres/01-init.sh) and only the
+  # variables it actually needs: no APP_DB_PASSWORD/APP_OWNER_DB_PASSWORD, no LANGFUSE_* secret.
+  # An unset LITELLM_MASTER_KEY fails the render (`${...:?...}`) instead of shipping a gateway
+  # nobody can mint a tenant key against.
   litellm:
-    image: ghcr.io/berriai/litellm:main-stable
-    profiles: ["gateway"]
-    env_file: .env
+    image: ghcr.io/berriai/litellm:v1.80.11-stable.1  # pinned release, not a floating tag
+    environment:
+      DATABASE_URL: postgresql://gateway:${GATEWAY_DB_PASSWORD:-gateway}@postgres:5432/gateway
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY must be set — mint per-tenant virtual keys against it (docs/deployment.md)}
+      # Provider credentials for the aliases configured in docker/litellm/config.yaml.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     volumes:
       - ./docker/litellm/config.yaml:/app/config.yaml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
     command: ["--config", "/app/config.yaml", "--port", "4000"]
     ports:
       - "127.0.0.1:4000:4000"
