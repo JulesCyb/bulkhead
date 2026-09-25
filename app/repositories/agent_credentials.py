@@ -68,6 +68,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.context import RequestContext
 from app.db.models import AgentCredential
+from app.repositories.errors import NotFoundInTenant
 from app.repositories.memberships import MembershipRepository
 
 
@@ -75,13 +76,16 @@ def _hash_secret(secret: str) -> str:
     return hashlib.sha256(secret.encode("utf-8")).hexdigest()
 
 
-class UnknownAgentIdentity(ValueError):
+class UnknownAgentIdentity(NotFoundInTenant):
     """Raised by `create()` when `identity_id` does not carry an active `agent`-role membership
     in `ctx.tenant_id` -- including an identity this tenant has no record of at all, one that
     belongs to another tenant, and one that exists here but is a person, not an agent. RLS and
     this repository's own tenant-scoped query make all three indistinguishable by construction;
     the caller must answer all three the same way (a plain "not found"), never revealing which
-    one actually happened."""
+    one actually happened. Mapped to a 404 by `app.main.handle_not_found_in_tenant`
+    (`app.repositories.errors.NotFoundInTenant`'s one shared handler)."""
+
+    public_message = "No such agent identity in this tenant."
 
 
 class IssuedCredential(BaseModel):

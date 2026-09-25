@@ -38,12 +38,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.context import RequestContext
 from app.db.models import Membership, StandingGrant
+from app.repositories.errors import NotFoundInTenant
 
 
-class NotAnAgentMembership(ValueError):
+class NotAnAgentMembership(NotFoundInTenant):
     """Raised by `create()` when the target membership does not currently carry the `agent`
     role -- including a membership this tenant has no record of at all (RLS makes an unknown id
-    and a cross-tenant id indistinguishable, so both land here)."""
+    and a cross-tenant id indistinguishable, so both land here). Mapped to a 404 by
+    `app.main.handle_not_found_in_tenant` (`app.repositories.errors.NotFoundInTenant`'s one
+    shared handler) -- previously unmapped, so it fell through to the generic 500 handler
+    (finding from the 2026-09-25 review)."""
+
+    public_message = "No such agent membership in this tenant."
 
 
 class StandingGrantRecord(BaseModel):
