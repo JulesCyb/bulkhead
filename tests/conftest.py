@@ -109,8 +109,29 @@ def fake_history(history_calls):
 
 
 @pytest.fixture
-def deps(ctx, fake_search, fake_history) -> AssistantDeps:
-    return AssistantDeps(ctx=ctx, search=fake_search, load_history=fake_history)
+def save_calls() -> list[tuple[uuid.UUID, str, list[ModelMessage]]]:
+    """Every (tenant_id, conversation_id, messages) a fake `save_run` was actually asked to
+    persist -- ADR-0006, #34."""
+    return []
+
+
+@pytest.fixture
+def fake_save(save_calls):
+    """Records the run's persisted messages in-memory instead of touching a database — a test
+    that cares about a specific store (e.g. seeing an earlier run's reply on a second request)
+    writes its own fake keyed by conversation id instead of using this one."""
+
+    async def _save(
+        ctx: RequestContext, conversation_id: str, messages: list[ModelMessage]
+    ) -> None:
+        save_calls.append((ctx.tenant_id, conversation_id, messages))
+
+    return _save
+
+
+@pytest.fixture
+def deps(ctx, fake_search, fake_history, fake_save) -> AssistantDeps:
+    return AssistantDeps(ctx=ctx, search=fake_search, load_history=fake_history, save_run=fake_save)
 
 
 @pytest.fixture
