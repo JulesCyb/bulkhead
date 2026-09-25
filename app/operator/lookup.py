@@ -1,9 +1,9 @@
 """The tenant-lookup helper (Spec 9 / #68): resolves a tenant by id or by an unambiguous name,
 shared by every operator command (`list` today; `suspend`/`erase` in later Spec 9 tickets).
 
-Calls `control.enumerate_tenants()` (migration 0012) -- the same narrow, session_user-gated,
+Calls `control.enumerate_tenants()` (migration 0012) -- the same narrow, current_user-gated,
 `SECURITY DEFINER` cross-tenant read the tenant listing uses (see that migration's docstring for
-why a role-scoped bypass policy needs the `session_user = 'app_owner'` guard) -- and filters its
+why a role-scoped bypass policy needs the `current_user = 'app_owner'` guard) -- and filters its
 result by id or name here, rather than adding a second enumeration mechanism just for lookup.
 Neither `public.tenants.name` nor `control.tenants` enforces uniqueness on name, so an ambiguous
 name is a real possibility this helper must catch, not a theoretical one a constraint already

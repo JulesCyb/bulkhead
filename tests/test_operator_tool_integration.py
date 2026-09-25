@@ -202,10 +202,12 @@ async def test_lookup_raises_not_found_for_unknown_id_and_name(database_urls):
 async def test_app_cannot_widen_its_view_with_the_operator_read_flag(database_urls):
     """Regression (mirrors `test_app_cannot_widen_its_control_plane_view_with_the_migration_read_
     flag` in `tests/test_rls_integration.py` for 0016's identically-shaped flag): `app` can set
-    any custom setting in its own session, so `control_tenants_operator_read`/`tenants_operator_
-    read` must still require `session_user = 'app_owner'`, not just the flag, or `app` could read
-    every tenant's control-plane row through `control.tenants_view` just by setting
-    `app.control_operator_read` itself."""
+    any custom setting in its own session, and a real `app` session querying
+    `control.tenants_view`/`tenants` still has `current_user = 'app'` (views check table
+    permissions as their owner but do not reassign `current_user`, unlike a `SECURITY DEFINER`
+    function). So `control_tenants_operator_read`/`tenants_operator_read` requiring `current_user
+    = 'app_owner'`, not just the flag, must still leave `app` seeing only its own tenant even
+    after setting `app.control_operator_read` itself."""
     tenant_a = await _seed_tenant(database_urls["superuser"], name="Flag A")
     await _seed_tenant(database_urls["superuser"], name="Flag B")
 

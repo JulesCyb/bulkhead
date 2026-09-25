@@ -2,7 +2,7 @@
 operator or auditor see every tenant's isolation tier, residency, database alias, and suspension
 state without a direct database query.
 
-Reads `control.enumerate_tenants()` (migration 0012): a narrow, session_user-gated, `SECURITY
+Reads `control.enumerate_tenants()` (migration 0012): a narrow, current_user-gated, `SECURITY
 DEFINER` cross-tenant read -- never a plain role-scoped bypass policy on `control.tenants` or
 `public.tenants` directly, which (see that migration's docstring) would leak through
 `control.tenants_view` to the `app` role. Not granted to `app`; only `app_owner` may call it.
