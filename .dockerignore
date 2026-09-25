@@ -1,5 +1,9 @@
 # Never bake secrets or local state into image layers (COPY . . reads this list).
 .env
+# Any locally created env-var-file variant (.env.local, .env.production, ...) is excluded from
+# the build context by default too (#18) — only the tracked example template is exempted.
+.env.*
+!.env.example
 .git
 .venv
 __pycache__
