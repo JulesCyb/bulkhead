@@ -10,7 +10,7 @@ from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import Response
 from pydantic_ai.ui.vercel_ai import VercelAIAdapter
 
-from app.agents.assistant import AssistantDeps, assistant
+from app.agents.assistant import AssistantDeps, chat_assistant
 from app.deps import Context
 from app.llm import get_model
 from app.request_limit import RequestLimit
@@ -29,7 +29,7 @@ async def chat(request: Request, ctx: Context, _limit: RequestLimit) -> Response
     deps = AssistantDeps(ctx=ctx)
     return await VercelAIAdapter.dispatch_request(
         request,
-        agent=assistant,
+        agent=chat_assistant,
         deps=deps,
         model=get_model(deps.model_name),
         metadata=ctx.trace_attributes(),

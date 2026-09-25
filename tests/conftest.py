@@ -16,7 +16,7 @@ from pydantic_ai.models.test import TestModel
 os.environ.setdefault("EMBEDDING_PROVIDER", "openai")
 os.environ.setdefault("EMBEDDING_MODEL", "text-embedding-3-small")
 
-from app.agents.assistant import AssistantDeps, assistant
+from app.agents.assistant import AssistantDeps, chat_assistant, one_shot_assistant
 from app.context import RequestContext
 from app.repositories.documents import DocumentHit
 
@@ -47,6 +47,11 @@ def deps(ctx, fake_search) -> AssistantDeps:
 
 @pytest.fixture
 def test_model():
-    """TestModel calls every tool once and answers deterministically."""
-    with assistant.override(model=TestModel()):
-        yield
+    """TestModel calls every tool once and answers deterministically.
+
+    Overrides both agents (Spec 5 / #36 split) since a test may exercise either the one-shot
+    endpoints or /api/chat without knowing in advance which one it will hit.
+    """
+    tm = TestModel()
+    with one_shot_assistant.override(model=tm), chat_assistant.override(model=tm):
+        yield tm
