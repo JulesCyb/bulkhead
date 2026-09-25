@@ -1,6 +1,6 @@
 # ADR-0007: Writing tools run only after an approval by the asking member or under a standing grant
 
-- **Status:** proposed
+- **Status:** accepted
 - **Date:** 2026-09-12
 - **Deciders:** JulesCyb
 - **Skill version:** ai-app-blueprints v2.0.0 (research 2026-08)
@@ -50,6 +50,11 @@ per-tenant extension if a customer demands it.
   binding and the role check hold.
 - What becomes harder later: a member cannot make writes frictionless; a batch of writes needs
   one approval per action or a deliberately designed batch tool that is approved as a whole.
+
+Pending actions, standing grants, and audit events are ordinary tenant tables (`tenant_id`,
+RLS, registered in `app/db/tenant_tables.py`) and nothing more: when a tenant is erased they are
+removed with it, like every other tenant table. The actual erasure mechanics and backup horizon
+belong to Spec 9, not to this ADR.
 
 ## Revisit when …
 

@@ -60,8 +60,9 @@ Tests: `uv run pytest` — the RLS integration test is skipped when `pgserver` i
 | Roles | `docker/postgres/01-init.sh` | `app` (no superuser/BYPASSRLS, the long-running API's own role) and `app_owner` (no superuser/BYPASSRLS, owns every object, runs migrations only) |
 | Repository | `app/repositories/documents.py`, `app/repositories/conversations.py` | the only path to the DB — vector search, and server-held conversation history under RLS (ADR-0006) |
 | Retention | `app/retention.py`, `scripts/retention.py` | deletes each tenant's expired conversations (and their messages) through the same tenant-bound session every request uses — default 90 days, overridable per tenant via `tenants.settings["retention_days"]` (ADR-0006) |
-| Tools | `app/tools/documents.py` | context-aware search, shared by agent and MCP |
-| Agent | `app/agents/assistant.py` | PydanticAI agent, model resolved at runtime, tracing metadata |
+| Tools | `app/tools/documents.py` | context-aware search, plus the one worked writing-tool example (`rename_document`), shared by agent and MCP |
+| Approvals | `app/tools/approvals.py`, `app/repositories/pending_actions.py`, `app/repositories/standing_grants.py`, `app/repositories/approval_audit.py` | ADR-0007: a writing tool runs only after a member's approval (checked against a server-side pending action, never the client's message) or, for an agent identity with no person present, a tenant admin's standing grant for that one tool; every approval, refusal, and execution is an append-only audit record naming the actor and the means |
+| Agents | `app/agents/assistant.py` | two PydanticAI agents, split on purpose (ADR-0007): a one-shot agent (reading tools only, used by `/agents/assistant/run` and `/agents/assistant/stream`) and a chat agent (every reading tool plus the writing tool, used only by `/api/chat`, where an approval round-trip can exist); model resolved at runtime, tracing metadata |
 | API | `app/api/` | `/v1/t/{tenant_id}/agents/assistant/run`, `/v1/t/{tenant_id}/agents/assistant/stream` (SSE, both one-shot, no memory); `/v1/t/{tenant_id}/api/chat` (Vercel AI SDK) — server-held history: the server loads the stored conversation, trusts only the client's newest member-authored message, and persists the run's new messages back through the repository once it completes, independent of the client's own stream (ADR-0006) |
 | MCP server | `app/mcp/server.py` | the same tools for Claude Code / Claude Desktop: `stdio` for local development, `streamable-http` (production, requires a bearer token — no token, no connection outside local dev) mounted at `/v1/t/{tenant_id}/mcp` with per-connection identity (ADR-0005); the connecting client's own model sits outside residency enforcement — see [`docs/mcp-connection.md`](docs/mcp-connection.md) and [`docs/residency.md`](docs/residency.md#the-mcp-boundary) |
 | Models | `app/llm.py`, `app/embeddings.py` | provider abstraction; the LiteLLM gateway is mandatory, not an add-on (ADR-0009) |
@@ -85,7 +86,10 @@ Tests: `uv run pytest` — the RLS integration test is skipped when `pgserver` i
    through views. Break the role split and RLS is void — and the bug only surfaces with the
    second tenant.
 3. **DB access only through repositories**, agent access only through tools. Tools return what is
-   needed — everything returned ends up in the prompt sent to the model provider.
+   needed — everything returned ends up in the prompt sent to the model provider. Every writing
+   tool requires approval (ADR-0007): a member's approval is checked against a server-side
+   pending action, never the client's message, and an agent identity may write only under a
+   tenant admin's standing grant for that one tool — never an "always allow" for a person.
 4. **Embeddings are data.** They live in the same table under the same policy, and cache keys
    include the `tenant_id`.
 

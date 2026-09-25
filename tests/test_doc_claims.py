@@ -584,3 +584,66 @@ def test_readme_and_claude_md_state_a_token_is_required_outside_local_developmen
     make_it_your_own_section = README.split("## Make it your own", 1)[1]
     assert "mcp-connection.md" in make_it_your_own_section
     assert "token is required outside local development" in make_it_your_own_section
+
+
+ADR_0007 = (REPO_ROOT / "docs" / "adr" / "0007-approval-of-writing-tools.md").read_text(
+    encoding="utf-8"
+)
+
+
+def test_adr_0007_is_accepted_not_proposed() -> None:
+    # Spec 5's closing ticket (#42): the whole approval mechanism (pending actions, standing
+    # grants, the two-agent split, run limits) is now real, so the ADR moves from `proposed` to
+    # `accepted` per this repo's own convention (docs/agents/domain.md).
+    status_line = next(line for line in ADR_0007.splitlines() if line.startswith("- **Status:**"))
+    assert "accepted" in status_line
+    assert "proposed" not in status_line
+
+
+def test_adr_0007_states_these_tables_are_ordinary_tenant_tables_deferring_erasure_to_spec_9() -> (
+    None
+):
+    assert "ordinary tenant tables" in ADR_0007
+    assert "Spec 9" in ADR_0007
+    assert "removed with it" in ADR_0007 or "removed with the tenant" in ADR_0007
+
+
+def test_claude_md_writing_tool_rule_names_pending_actions_role_recheck_and_standing_grants() -> (
+    None
+):
+    # #42's content-check acceptance criterion: rule 4 must name all three mechanisms by name,
+    # not just gesture at "a confirmation step".
+    rule_4 = CLAUDE_MD.split("4. **Agents access data only through tools**", 1)[1].split(
+        "\n5. ", 1
+    )[0]
+    assert "pending action" in rule_4
+    assert "standing grant" in rule_4
+    assert "re-checks the acting membership's role" in rule_4 or "re-check" in rule_4
+
+
+def test_claude_md_writing_tool_rule_prohibits_always_allow_for_a_person() -> None:
+    rule_4 = CLAUDE_MD.split("4. **Agents access data only through tools**", 1)[1].split(
+        "\n5. ", 1
+    )[0]
+    assert "No derived project may ever add" in rule_4
+    assert "always allow" in rule_4.lower()
+
+
+def test_readme_module_table_names_the_approval_and_two_agent_modules() -> None:
+    approvals_row = next(line for line in README.splitlines() if line.startswith("| Approvals |"))
+    assert "pending_actions" in approvals_row
+    assert "standing_grants" in approvals_row
+    assert "approval_audit" in approvals_row
+
+    agents_row = next(line for line in README.splitlines() if line.startswith("| Agents |"))
+    assert "one-shot agent" in agents_row
+    assert "chat agent" in agents_row
+
+
+def test_readme_four_rules_summary_names_the_approval_mechanism() -> None:
+    rules_section = " ".join(
+        README.split("## The four rules that hold it together", 1)[1].split("## ", 1)[0].split()
+    )
+    assert "writing tool requires approval" in rules_section
+    assert "standing grant" in rules_section
+    assert "always allow" in rules_section.lower()
