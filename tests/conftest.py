@@ -15,6 +15,12 @@ from pydantic_ai.models.test import TestModel
 # bypasses these env vars entirely.
 os.environ.setdefault("EMBEDDING_PROVIDER", "openai")
 os.environ.setdefault("EMBEDDING_MODEL", "text-embedding-3-small")
+# ENVIRONMENT/AUTH_MODE have no default either (issue #14 / ADR-0011): a `.env` copied and left
+# unedited must fail to start rather than silently choosing `dev`/`dev-headers`. Same pattern as
+# above — tests that exercise the fail-closed default itself delete these from the environment
+# and pass `_env_file=None` directly.
+os.environ.setdefault("ENVIRONMENT", "dev")
+os.environ.setdefault("AUTH_MODE", "dev-headers")
 
 from app.agents.assistant import AssistantDeps, chat_assistant, one_shot_assistant
 from app.context import RequestContext

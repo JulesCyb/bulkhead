@@ -18,7 +18,7 @@ residency-resolution modules that consume this data.
 
 from functools import lru_cache
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Role-level settings for the `app` role (Spec 7 / #55): applied once in
@@ -56,14 +56,30 @@ RESIDENCY_ALLOW_LIST: dict[str, ResidencyRoute] = {
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    # secrets_dir (issue #14 / ADR-0011): in production, tenant secrets and connection strings can
+    # be supplied as files under /run/secrets (one file per field name) instead of, or in addition
+    # to, the process environment — a value here is still overridden by the matching environment
+    # variable if both are present. This lets an operator rotate a secret by replacing a file and
+    # redeploying, with no code change.
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", extra="ignore", secrets_dir="/run/secrets"
+    )
 
     app_name: str = "ai-app"
-    environment: str = "dev"
+    # No default (issue #14 / ADR-0011): a `.env` copied and left unedited must fail to construct
+    # rather than silently becoming a permissive local configuration.
+    environment: str
     cors_origins: str = "http://localhost:3000"
 
-    database_url: str = "postgresql+asyncpg://app:app@localhost:5432/app"
-    database_url_migrations: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/app"
+    # SecretStr (issue #14 / ADR-0011): every tenant-secret and connection-string field is held
+    # this way so the object's own repr/str never prints a live value — read with
+    # .get_secret_value() only at the one call site that needs the plain value.
+    database_url: SecretStr = SecretStr("postgresql+asyncpg://app:app@localhost:5432/app")
+    # The owner/migrations connection string is NOT a field here (issue #14 / ADR-0011): it is
+    # removed from the application's configuration object entirely, so no code path in the
+    # long-running API process can ever construct a connection with the database owner's
+    # privileges. Alembic's own environment module and scripts/seed.py resolve it from
+    # app.migration_settings instead — a source app.main and app.deps never import.
 
     # Explicit pool sizing (Spec 7 / #55) — named configuration instead of SQLAlchemy/driver
     # defaults, so the deployment's real concurrency ceiling (pool_size + max_overflow, per
@@ -78,24 +94,27 @@ class Settings(BaseSettings):
 
     llm_model: str = "anthropic:claude-sonnet-4-5"
     litellm_base_url: str | None = None
-    litellm_api_key: str | None = None
+    litellm_api_key: SecretStr | None = None
     # No default: a deployment with no embedding provider/model configured must refuse to
     # construct rather than silently reaching some default endpoint (ADR-0008).
     embedding_provider: str | None = None
     embedding_model: str | None = None
     embedding_dimensions: int = 1536
-    openai_api_key: str | None = None
-    anthropic_api_key: str | None = None
+    openai_api_key: SecretStr | None = None
+    anthropic_api_key: SecretStr | None = None
 
     # The deployment's (or, at a call site resolving a tenant's own setting, that tenant's)
     # residency. Must be a key of RESIDENCY_ALLOW_LIST — validated below.
     residency: str = "eu"
 
-    auth_mode: str = Field(default="dev-headers", pattern="^(dev-headers|jwt)$")
+    # No default (issue #14 / ADR-0011): same reasoning as `environment` above — a deployment
+    # must choose an auth mode explicitly rather than silently running header-based tenant
+    # impersonation under what looks like production.
+    auth_mode: str = Field(pattern="^(dev-headers|jwt)$")
 
     langfuse_host: str | None = None
     langfuse_public_key: str | None = None
-    langfuse_secret_key: str | None = None
+    langfuse_secret_key: SecretStr | None = None
 
     mcp_tenant_id: str | None = None
     mcp_user_id: str | None = None

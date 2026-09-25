@@ -52,7 +52,7 @@ def get_engine() -> AsyncEngine:
     if _engine is None:
         settings = get_settings()
         _engine = create_async_engine(
-            settings.database_url,
+            settings.database_url.get_secret_value(),
             pool_pre_ping=True,
             pool_size=settings.db_pool_size,
             max_overflow=settings.db_max_overflow,

@@ -18,8 +18,9 @@ def _client() -> AsyncOpenAI:
     # per call would leak connections and pay TCP+TLS setup on every search.
     s = get_settings()
     if s.litellm_base_url:
-        return AsyncOpenAI(base_url=s.litellm_base_url, api_key=s.litellm_api_key or "litellm")
-    return AsyncOpenAI(api_key=s.openai_api_key)
+        api_key = s.litellm_api_key.get_secret_value() if s.litellm_api_key else "litellm"
+        return AsyncOpenAI(base_url=s.litellm_base_url, api_key=api_key)
+    return AsyncOpenAI(api_key=s.openai_api_key.get_secret_value() if s.openai_api_key else None)
 
 
 async def embed(text: str) -> list[float]:

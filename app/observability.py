@@ -21,9 +21,10 @@ def setup_observability(settings: Settings) -> bool:
         settings.langfuse_host and settings.langfuse_public_key and settings.langfuse_secret_key
     ):
         return False
-    auth = base64.b64encode(
-        f"{settings.langfuse_public_key}:{settings.langfuse_secret_key}".encode()
-    ).decode()
+    secret_key = (
+        settings.langfuse_secret_key.get_secret_value() if settings.langfuse_secret_key else ""
+    )
+    auth = base64.b64encode(f"{settings.langfuse_public_key}:{secret_key}".encode()).decode()
     os.environ.setdefault(
         "OTEL_EXPORTER_OTLP_ENDPOINT", f"{settings.langfuse_host.rstrip('/')}/api/public/otel"
     )
