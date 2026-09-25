@@ -20,6 +20,7 @@ from app.api import agents, chat, health, memberships
 from app.config import Settings, get_settings
 from app.db.guard import run_role_rls_guard
 from app.observability import setup_observability
+from app.startup_checks import run_startup_checks
 
 log = logging.getLogger(__name__)
 
@@ -53,6 +54,11 @@ def check_auth_mode(settings: Settings) -> None:
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     check_auth_mode(settings)
+    # Fail-closed residency/model-allow-list guard (issue #59 / ADR-0008), same reasoning as
+    # check_auth_mode above: run again here, independent of the construction-time call in
+    # create_app, so a way of launching the process that constructs the app once and only later
+    # changes what get_settings() returns still hits it at lifespan startup.
+    run_startup_checks(settings)
     setup_observability(settings)
     # Fail-closed startup guard (issue #15 / ADR-0011): refuses to ever accept traffic while
     # connected as a superuser/BYPASSRLS role, or while any public-schema table lacks forced
@@ -188,6 +194,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # way of building the application object — including a test harness that never fires ASGI
     # lifespan events — can skip this guard.
     check_auth_mode(settings)
+    # Same reasoning, for the residency/model-allow-list guard (issue #59 / ADR-0008): a
+    # deliberately mismatched configuration must never construct an application object that
+    # could later accept a request, regardless of whether lifespan ever fires.
+    run_startup_checks(settings)
     # S1-T7 / #17: interactive API documentation is reachable only in development and test —
     # not a production-like deployment (docs/reviews/2026-09-12-security-review.md). Same
     # dev/test allow-list as check_auth_mode above.
