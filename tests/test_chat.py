@@ -299,7 +299,7 @@ async def test_second_request_against_same_conversation_sees_first_replys_histor
     monkeypatch.setattr(assistant_module.conversation_tools, "save_conversation_run", fake_save)
 
     seen: list[list[ModelMessage]] = []
-    monkeypatch.setattr(chat_module, "get_model", lambda name: _recording_model(seen))
+    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(_recording_model(seen)))
 
     tenant_id = uuid.uuid4()
     headers = _headers()
@@ -335,7 +335,7 @@ async def test_persistence_happens_even_when_the_response_is_not_fully_read(
     monkeypatch.setattr(
         assistant_module.conversation_tools, "load_conversation_history", fake_history
     )
-    monkeypatch.setattr(chat_module, "get_model", lambda name: TestModel())
+    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(TestModel()))
 
     save_done = asyncio.Event()
 
@@ -406,8 +406,8 @@ async def test_run_that_raises_persists_nothing_for_that_turn(client, monkeypatc
 
     monkeypatch.setattr(
         chat_module,
-        "get_model",
-        lambda name: FunctionModel(raising_call, stream_function=raising_stream),
+        "resolve_chat_model",
+        resolve_to_model(FunctionModel(raising_call, stream_function=raising_stream)),
     )
     async with client:
         response = await client.post(_chat_path(), json=_submit_message_body(), headers=_headers())
@@ -428,7 +428,7 @@ async def test_agent_run_receives_the_tenant_scoped_conversation_id(client, monk
         return original_run_stream(self, **kwargs)
 
     monkeypatch.setattr(VercelAIAdapter, "run_stream", spy_run_stream)
-    monkeypatch.setattr(chat_module, "get_model", lambda name: TestModel())
+    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(TestModel()))
 
     tenant_id = uuid.uuid4()
     async with client:
