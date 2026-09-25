@@ -6,7 +6,6 @@ Start: uv run uvicorn app.main:app --reload
 from __future__ import annotations
 
 import logging
-import re
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
 from contextlib import asynccontextmanager
@@ -18,6 +17,7 @@ from fastapi.responses import JSONResponse
 
 from app.api import agent_identities, agent_tokens, agents, chat, health, memberships
 from app.config import Settings, get_settings
+from app.context import RoleRequired
 from app.db.guard import run_role_rls_guard
 from app.mcp.server import build_streamable_http_app, check_mcp_mode
 from app.observability import setup_observability
@@ -76,12 +76,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
 
 
-# `RequestContext.require_role` (app/context.py) raises a bare `PermissionError` with this exact
-# message shape; matched here (never re-derived) so the log line below can name the required role
-# without the two places drifting apart.
-_REQUIRED_ROLE_RE = re.compile(r"^role '(\w+)' required$")
-
-
 async def handle_permission_error(request: Request, exc: Exception) -> JSONResponse:
     """ADR-0004: a failed `RequestContext.require_role` check answers 403, never 500 — clean and
     predictable regardless of which route, tool, or dependency called it. `PermissionError`
@@ -91,17 +85,23 @@ async def handle_permission_error(request: Request, exc: Exception) -> JSONRespo
     role) — never request content — so a pattern of repeated denials is visible in the
     application logs. `request.state.context` is the `RequestContext` `app.deps.get_context`
     already resolved for this request, in both dev-headers and jwt mode.
+
+    The required role comes from `exc.required_role` when `exc` is a `RoleRequired`
+    (`app/context.py`) — never re-derived from `str(exc)` with a regex, which broke the moment
+    the message text changed. A `PermissionError` raised from somewhere else (e.g.
+    `ConversationOwnershipError`) carries no such attribute, so `required_role` is `None` for it,
+    exactly as before.
     """
     message = str(exc) or "This action requires a role you don't have."
     ctx = getattr(request.state, "context", None)
-    match = _REQUIRED_ROLE_RE.match(message)
+    required_role = exc.required_role if isinstance(exc, RoleRequired) else None
     log.warning(
         "Role check denied",
         extra={
             "event": "role_check_denied",
             "tenant_id": str(ctx.tenant_id) if ctx is not None else None,
             "identity_id": str(ctx.identity_id) if ctx is not None else None,
-            "required_role": match.group(1) if match else None,
+            "required_role": required_role,
         },
     )
     return JSONResponse(
