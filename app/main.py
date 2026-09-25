@@ -6,7 +6,6 @@ Start: uv run uvicorn app.main:app --reload
 from __future__ import annotations
 
 import logging
-import re
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
 from contextlib import asynccontextmanager
@@ -18,9 +17,11 @@ from fastapi.responses import JSONResponse
 
 from app.api import agent_identities, agent_tokens, agents, chat, health, memberships
 from app.config import Settings, get_settings
+from app.context import RoleRequired
 from app.db.guard import run_role_rls_guard
 from app.mcp.server import build_streamable_http_app, check_mcp_mode
 from app.observability import setup_observability
+from app.repositories.agent_credentials import UnknownAgentIdentity
 from app.startup_checks import run_startup_checks
 
 log = logging.getLogger(__name__)
@@ -75,12 +76,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
 
 
-# `RequestContext.require_role` (app/context.py) raises a bare `PermissionError` with this exact
-# message shape; matched here (never re-derived) so the log line below can name the required role
-# without the two places drifting apart.
-_REQUIRED_ROLE_RE = re.compile(r"^role '(\w+)' required$")
-
-
 async def handle_permission_error(request: Request, exc: Exception) -> JSONResponse:
     """ADR-0004: a failed `RequestContext.require_role` check answers 403, never 500 — clean and
     predictable regardless of which route, tool, or dependency called it. `PermissionError`
@@ -90,22 +85,46 @@ async def handle_permission_error(request: Request, exc: Exception) -> JSONRespo
     role) — never request content — so a pattern of repeated denials is visible in the
     application logs. `request.state.context` is the `RequestContext` `app.deps.get_context`
     already resolved for this request, in both dev-headers and jwt mode.
+
+    The required role comes from `exc.required_role` when `exc` is a `RoleRequired`
+    (`app/context.py`) — never re-derived from `str(exc)` with a regex, which broke the moment
+    the message text changed. A `PermissionError` raised from somewhere else (e.g.
+    `ConversationOwnershipError`) carries no such attribute, so `required_role` is `None` for it,
+    exactly as before.
     """
     message = str(exc) or "This action requires a role you don't have."
     ctx = getattr(request.state, "context", None)
-    match = _REQUIRED_ROLE_RE.match(message)
+    required_role = exc.required_role if isinstance(exc, RoleRequired) else None
     log.warning(
         "Role check denied",
         extra={
             "event": "role_check_denied",
             "tenant_id": str(ctx.tenant_id) if ctx is not None else None,
             "identity_id": str(ctx.identity_id) if ctx is not None else None,
-            "required_role": match.group(1) if match else None,
+            "required_role": required_role,
         },
     )
     return JSONResponse(
         status_code=status.HTTP_403_FORBIDDEN,
         content={"error": "forbidden", "message": message},
+    )
+
+
+async def handle_unknown_agent_identity(request: Request, exc: Exception) -> JSONResponse:
+    """Finding from the 2026-09-25 review of #46: `issue_agent_credential` used to check only
+    that the *caller* was an admin, never that `identity_id` actually named an agent identity in
+    the caller's own tenant -- so an admin could mint a (unusable, but real) credential row for
+    another tenant's identity, or a person's, and the response would tell them which. This
+    handler is the one place that answer is given, and it gives the same answer -- a 404 with
+    this exact, fixed body -- for every reason `UnknownAgentIdentity`
+    (`app/repositories/agent_credentials.py`) can be raised: an id that names nothing, a
+    cross-tenant id, or a person's id. `str(exc)` (which does name the identity id) is logged for
+    operators, never put in the response, so the client never learns anything an unknown id
+    wouldn't also tell it."""
+    log.info("Agent-credential issue refused: unknown agent identity (%s)", exc)
+    return JSONResponse(
+        status_code=status.HTTP_404_NOT_FOUND,
+        content={"error": "not_found", "message": "No such agent identity in this tenant."},
     )
 
 
@@ -219,6 +238,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         openapi_url="/openapi.json" if docs_enabled else None,
     )
     app.add_exception_handler(PermissionError, handle_permission_error)
+    app.add_exception_handler(UnknownAgentIdentity, handle_unknown_agent_identity)
     app.add_exception_handler(Exception, handle_unhandled_exception)
     origins = settings.cors_origin_list
     app.add_middleware(
