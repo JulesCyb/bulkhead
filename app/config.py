@@ -143,6 +143,15 @@ class Settings(BaseSettings):
     mcp_tenant_id: str | None = None
     mcp_identity_id: str | None = None
 
+    # MCP transport (issue #48 / ADR-0005): a single documented setting choosing whether the
+    # tools server speaks its local-development transport (stdio, the process-wide identity from
+    # MCP_TENANT_ID/MCP_IDENTITY_ID above) or the networked one (streamable-http, a per-connection
+    # identity derived from a verified token via app.token_verifier). stdio is the default, so
+    # moving from a laptop to a real deployment is a configuration change -- one
+    # `app.mcp.server.check_mcp_mode` refuses to leave half-finished (ADR-0005's guard, mirroring
+    # `check_auth_mode` above).
+    mcp_transport: str = Field(default="stdio", pattern="^(stdio|streamable-http)$")
+
     # The process-wide token issuer used for every tenant whose control-plane
     # `identity_issuer` column is unset (issue #22 / ADR-0003): the interim "one operator-run
     # identity provider" case, open until a tenant brings its own. Read by
