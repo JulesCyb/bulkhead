@@ -525,11 +525,12 @@ def test_mcp_json_example_has_a_valid_networked_shape_with_a_token() -> None:
 
 def test_settings_load_from_env_example_file_without_error() -> None:
     # Every new MCP-transport / agent-token setting this spec introduces (MCP_TRANSPORT,
-    # JWT_VERIFICATION_KEY, JWT_ALGORITHM, AGENT_TOKEN_SIGNING_KEY, AGENT_TOKEN_TTL_SECONDS) has a
-    # working default -- loading the example file constructs cleanly with no override needed for
-    # any of them. EMBEDDING_PROVIDER/EMBEDDING_MODEL are deliberately blank in .env.example
-    # (ADR-0008: no default, must be set explicitly per deployment) so those two, pre-existing,
-    # unrelated required fields are the only ones supplied here.
+    # JWT_VERIFICATION_KEY, JWT_ALGORITHM, AGENT_TOKEN_SIGNING_KEY, AGENT_TOKEN_ALGORITHM,
+    # AGENT_TOKEN_VERIFICATION_KEY, AGENT_TOKEN_TTL_SECONDS) has a working default -- loading the
+    # example file constructs cleanly with no override needed for any of them.
+    # EMBEDDING_PROVIDER/EMBEDDING_MODEL are deliberately blank in .env.example (ADR-0008: no
+    # default, must be set explicitly per deployment) so those two, pre-existing, unrelated
+    # required fields are the only ones supplied here.
     settings = Settings(
         _env_file=str(REPO_ROOT / ".env.example"),
         _env_ignore_empty=True,
@@ -538,9 +539,14 @@ def test_settings_load_from_env_example_file_without_error() -> None:
     )
     assert settings.mcp_transport == "stdio"
     assert settings.jwt_algorithm == "RS256"
+    # Deliberately independent of jwt_algorithm above (review finding, Spec 6): a real IdP signs
+    # asymmetrically, this application's own agent tokens are signed/verified symmetrically by
+    # default -- see AGENT_TOKEN_ALGORITHM's comment block in .env.example.
+    assert settings.agent_token_algorithm == "HS256"
     assert settings.agent_token_ttl_seconds == 300
     assert settings.jwt_verification_key is None
     assert settings.agent_token_signing_key is None
+    assert settings.agent_token_verification_key is None
 
 
 def test_connection_guide_routes_match_the_agent_identity_and_token_routes() -> None:

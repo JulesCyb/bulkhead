@@ -18,6 +18,7 @@ residency-resolution modules that consume this data.
 
 from functools import lru_cache
 
+from cryptography.hazmat.primitives import serialization
 from pydantic import BaseModel, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -27,6 +28,35 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # is the per-transaction timeout the application sets on every tenant_session().
 ROLE_STATEMENT_TIMEOUT_MS = 60_000
 ROLE_CONNECTION_LIMIT = 50
+
+# Algorithm-confusion guard, shared by `jwt_algorithm` and `agent_token_algorithm` below (Spec 6
+# review finding: human and agent tokens must never be checkable with each other's algorithm or
+# key). Every algorithm PyJWT's `cryptography` backend supports for signing -- deliberately never
+# includes "none" or an empty string, so `Settings` construction itself is the first place a
+# downgrade-to-unsigned configuration is refused, before `app.jwt_verifier.verify_token` (which
+# also never accepts "none" -- it always passes an explicit `algorithms` allow-list to
+# `jwt.decode`) ever sees a token.
+_SUPPORTED_JWT_ALGORITHMS = frozenset(
+    {
+        "HS256",
+        "HS384",
+        "HS512",
+        "RS256",
+        "RS384",
+        "RS512",
+        "ES256",
+        "ES384",
+        "ES512",
+        "PS256",
+        "PS384",
+        "PS512",
+    }
+)
+_HS_ALGORITHMS = frozenset({"HS256", "HS384", "HS512"})
+# NIST SP 800-107 / RFC 2104: an HMAC key shorter than its hash's output size is weaker than the
+# hash offers -- 32 bytes is the floor for every HS* algorithm above (HS256's own digest size),
+# so one constant covers all three rather than sizing per algorithm.
+MIN_HS_SECRET_BYTES = 32
 
 
 class ResidencyRoute(BaseModel):
@@ -174,13 +204,45 @@ class Settings(BaseSettings):
     # Agent-credential token exchange (Spec 6 / #47, ADR-0005): the signing counterpart to
     # jwt_verification_key above -- used only to mint a short-lived access token when an agent
     # identity exchanges its own credential, never to verify a customer-owned identity provider's
-    # tokens (that stays jwt_verification_key/verify_token's job). For the symmetric algorithm
-    # this starter defaults verification to, this is literally the same secret as
-    # jwt_verification_key; kept as its own SecretStr field (file-backed via secrets_dir, same as
-    # every other secret here) so a deployment can rotate or split it independently. No default:
-    # an unconfigured signing key fails every exchange rather than silently minting an unsigned
-    # or otherwise weak token.
+    # tokens (that stays jwt_verification_key/verify_token's job). Kept as its own SecretStr field
+    # (file-backed via secrets_dir, same as every other secret here) so a deployment can rotate it
+    # independently of jwt_verification_key. No default: an unconfigured signing key fails every
+    # exchange rather than silently minting an unsigned or otherwise weak token.
+    #
+    # **Deliberately a separate algorithm from `jwt_algorithm` above (review finding, Spec 6 /
+    # ADR-0005 / ADR-0003).** A real tenant IdP signs human tokens with an asymmetric algorithm
+    # (RS256/ES256 -- `jwt_verification_key` holds only its *public* key, never a secret this
+    # deployment could forge a token with); the tokens this application mints for its own agent
+    # identities are naturally symmetric (there is no "IdP" on the other end to keep a private key
+    # from -- this process is both signer and verifier). Sharing one `jwt_algorithm` setting
+    # between the two, as an earlier version of this starter did, meant the first realistic
+    # production config (`JWT_ALGORITHM=RS256` for the real IdP) silently broke every agent token,
+    # since minting and verifying an agent token both used that same, now-asymmetric, algorithm
+    # against a plain shared secret. `agent_token_algorithm` defaults to `HS256` -- the common
+    # case, where `agent_token_signing_key` alone is both the signing and verification secret --
+    # and can be set to an asymmetric algorithm instead, in which case
+    # `agent_token_verification_key` below (explicit, or derived from this field, see there) holds
+    # the public half. The issuer-aware key/algorithm pinning in `app.deps.get_key_source` /
+    # `get_algorithm_source` (used by both the HTTP API and the MCP transport, via
+    # `app.token_verifier.verify_tenant_token`) is what actually enforces, per token, that a human
+    # (tenant-IdP) issuer is only ever checked against `jwt_verification_key`/`jwt_algorithm` and
+    # an agent issuer only ever against `agent_token_signing_key` (or
+    # `agent_token_verification_key`)/`agent_token_algorithm` -- never the other pair. This is the
+    # algorithm-confusion guard: neither `app.jwt_verifier.verify_token` nor `jwt.decode` itself
+    # is ever told to accept an algorithm the token's own header names (`algorithms` is always an
+    # explicit allow-list this settings object resolved ahead of time), so a token cannot pick its
+    # own verification algorithm, and "none" is never in `_SUPPORTED_JWT_ALGORITHMS` at all.
     agent_token_signing_key: SecretStr | None = None
+    agent_token_algorithm: str = "HS256"
+    # Only meaningful when `agent_token_algorithm` is asymmetric (see field docstring above): the
+    # public key `app.deps.get_key_source` verifies an agent token against, paired with the
+    # private key in `agent_token_signing_key`. Left unset for the default symmetric case (nothing
+    # to derive -- `agent_token_signing_key` alone serves both roles), and for an asymmetric
+    # algorithm with no explicit value here, `Settings` construction below derives it from
+    # `agent_token_signing_key` (which must then be a PEM private key) so a deployment only ever
+    # has to manage one secret file. Set it explicitly instead when the private key is not this
+    # process's to hold at all (e.g. minted by a separate signer).
+    agent_token_verification_key: SecretStr | None = None
     # Short-lived by design (ADR-0005): long enough for one connection/tool-call session to
     # authenticate once, short enough that a leaked token has a small blast radius.
     agent_token_ttl_seconds: int = 300
@@ -242,6 +304,85 @@ class Settings(BaseSettings):
                 f"Unknown residency {self.residency!r}. Configured residencies: "
                 f"{sorted(RESIDENCY_ALLOW_LIST)} (see RESIDENCY_ALLOW_LIST in app/config.py)."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _require_supported_jwt_algorithms(self) -> "Settings":
+        """Algorithm-confusion guard, part 1 (review finding, Spec 6): both algorithm settings
+        must name a real signing algorithm this deployment actually intends -- never "none", never
+        a typo that `jwt.decode`'s own `algorithms` allow-list would otherwise just silently never
+        match (which fails safe, but with a confusing "invalid or expired" 401 instead of a
+        startup error naming the actual mistake)."""
+        for setting_name, algorithm in (
+            ("JWT_ALGORITHM", self.jwt_algorithm),
+            ("AGENT_TOKEN_ALGORITHM", self.agent_token_algorithm),
+        ):
+            if algorithm not in _SUPPORTED_JWT_ALGORITHMS:
+                raise ValueError(
+                    f"{setting_name}={algorithm!r} is not a supported signing algorithm "
+                    f"(supported: {sorted(_SUPPORTED_JWT_ALGORITHMS)}). 'none' is never accepted, "
+                    "for either setting, under any configuration."
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _require_consistent_agent_token_key(self) -> "Settings":
+        """Algorithm-confusion guard, part 2, and the fail-closed startup check for the agent
+        signing key (review finding, Spec 6 / ADR-0005): nothing here runs unless
+        `agent_token_signing_key` is actually configured -- an unconfigured key already fails
+        every exchange at request time (`app/agent_credential_exchange.py`) by design, and this
+        validator's job is only to refuse a key that *is* configured but too weak, or
+        asymmetric-but-incomplete, before the process ever mints or verifies a single token.
+
+        - `agent_token_algorithm` is symmetric (HS*): `agent_token_signing_key` doubles as the
+          verification secret (`app.deps.get_key_source`) -- it must be at least
+          `MIN_HS_SECRET_BYTES` (32) bytes, the same floor RFC 2104 / NIST SP 800-107 recommend for
+          an HMAC key at least as long as the hash's own output, or a short, guessable secret would
+          make every agent token forgeable.
+        - `agent_token_algorithm` is asymmetric (RS*/ES*/PS*): `agent_token_signing_key` must be a
+          PEM-encoded private key (minting needs it), and `agent_token_verification_key` (the
+          public half `get_key_source` checks incoming tokens against) is derived from it
+          automatically when not set explicitly -- so a deployment switching to an asymmetric
+          agent-token algorithm only ever has to manage the one private-key secret, and a
+          malformed private key is refused here rather than at the first mint/verify call.
+        """
+        if self.agent_token_signing_key is None:
+            return self
+        secret_value = self.agent_token_signing_key.get_secret_value()
+
+        if self.agent_token_algorithm in _HS_ALGORITHMS:
+            if len(secret_value.encode("utf-8")) < MIN_HS_SECRET_BYTES:
+                raise ValueError(
+                    f"AGENT_TOKEN_SIGNING_KEY is shorter than {MIN_HS_SECRET_BYTES} bytes, too "
+                    f"short for AGENT_TOKEN_ALGORITHM={self.agent_token_algorithm!r} -- a short "
+                    "HMAC secret makes every agent token forgeable. Use a longer random secret "
+                    "(e.g. `openssl rand -hex 32`)."
+                )
+            return self
+
+        # Asymmetric agent_token_algorithm: agent_token_signing_key must be the PEM private key;
+        # derive the matching public key for verification when none was set explicitly.
+        if self.agent_token_verification_key is None:
+            try:
+                private_key = serialization.load_pem_private_key(
+                    secret_value.encode("utf-8"), password=None
+                )
+                public_pem = (
+                    private_key.public_key()
+                    .public_bytes(
+                        encoding=serialization.Encoding.PEM,
+                        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+                    )
+                    .decode("utf-8")
+                )
+            except Exception as exc:
+                raise ValueError(
+                    f"AGENT_TOKEN_ALGORITHM={self.agent_token_algorithm!r} is asymmetric: "
+                    "AGENT_TOKEN_SIGNING_KEY must be a PEM-encoded private key so its public key "
+                    "can be derived for verification, or set AGENT_TOKEN_VERIFICATION_KEY "
+                    "explicitly to the matching public key."
+                ) from exc
+            self.agent_token_verification_key = SecretStr(public_pem)
         return self
 
     # Run limits (ADR-0009, CONTEXT.md "Run limit"): the ceiling of model requests, tool calls,

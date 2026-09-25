@@ -6,7 +6,14 @@
   `JWT_VERIFICATION_KEY`/`JWT_ALGORITHM` plus, per tenant, `control.tenants.identity_issuer` (or
   `DEFAULT_IDENTITY_ISSUER` for the interim one-operator-run-provider case). The startup guard
   refuses `dev-headers` unless `ENVIRONMENT` is `dev`/`test` — set `ENVIRONMENT=prod` on servers
-  so a forgotten auth switch fails loudly instead of running open.
+  so a forgotten auth switch fails loudly instead of running open. `JWT_ALGORITHM` is a real IdP's
+  own algorithm (default `RS256`; `JWT_VERIFICATION_KEY` is only ever its *public* key) —
+  **never** the same setting as `AGENT_TOKEN_ALGORITHM` below, which is this application's own,
+  independent, and by default symmetric agent-token algorithm (see `docs/mcp-connection.md` and
+  the `AGENT_TOKEN_*` comment block in `.env.example`). If agent identities are in use, also set
+  `AGENT_TOKEN_SIGNING_KEY` to a random secret of at least 32 bytes (`openssl rand -hex 32`) — a
+  shorter one, or an unsupported/`none` algorithm for either setting, fails `Settings`
+  construction outright rather than starting with a weak or forgeable configuration.
 - **Passwords**: set `POSTGRES_PASSWORD` and `APP_DB_PASSWORD` in `.env` (compose interpolates
   them); the defaults are for localhost only.
 - **Ports**: compose binds 5432/8000/4000 to `127.0.0.1` — the reverse proxy (below) is the

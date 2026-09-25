@@ -123,7 +123,16 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    (`app.token_verifier`, the same module `app/deps.py` uses). A person's token resolves to
    delegation; an agent identity's own credential (`/v1/t/{tenant_id}/agent-identities`,
    `/agent-credentials`, `/agent-tokens`, admin-only to issue/revoke) resolves to autonomous use.
-   See [`docs/mcp-connection.md`](docs/mcp-connection.md) for connecting a client or issuing a
+   **Two independent algorithm/key settings, never one** (review finding): a person's token is
+   checked against `JWT_VERIFICATION_KEY`/`JWT_ALGORITHM` (a real IdP's own, typically asymmetric,
+   algorithm — this holds only its public key); an agent identity's token is minted by this
+   application itself and checked against `AGENT_TOKEN_SIGNING_KEY` (or
+   `AGENT_TOKEN_VERIFICATION_KEY`)/`AGENT_TOKEN_ALGORITHM` (default `HS256`, since this process is
+   both signer and verifier here). `app.deps.get_key_source`/`get_algorithm_source` pin the pair
+   per issuer (never per what the token's own header claims) — do not point `JWT_ALGORITHM` at an
+   agent token's algorithm or vice versa; see `.env.example`'s `AGENT_TOKEN_*` block and
+   `docs/mcp-connection.md` for the full table. See
+   [`docs/mcp-connection.md`](docs/mcp-connection.md) for connecting a client or issuing a
    credential.
 6. **Models via `app/llm.py`**; the model name comes from configuration or `tenants.settings["model"]`.
    The per-tenant entry point, `resolve_tenant_chat_model()`, validates that name against the

@@ -55,6 +55,7 @@ from app.jwt_verifier import KeySource, TokenVerificationError
 from app.tenant_suspension import TenantSuspendedError, ensure_tenant_not_suspended
 from app.token_verifier import (
     AGENT_IDENTITY_ISSUER,
+    AlgorithmSource,
     TenantTokenVerificationError,
     VerificationFailureReason,
     verify_tenant_token,
@@ -88,10 +89,38 @@ def get_key_source(settings: Annotated[Settings, Depends(get_settings)]) -> KeyS
         if issuer == AGENT_IDENTITY_ISSUER:
             if settings.agent_token_signing_key is None:
                 raise TokenVerificationError("no agent token signing key configured")
+            # Asymmetric agent_token_algorithm: verify against the public key
+            # (agent_token_verification_key -- explicit, or derived at Settings construction from
+            # agent_token_signing_key, see app/config.py), never the private signing key itself.
+            # Symmetric (HS*, the default): no separate verification key exists; the signing key
+            # doubles as the shared secret, exactly as before.
+            if settings.agent_token_verification_key is not None:
+                return settings.agent_token_verification_key.get_secret_value()
             return settings.agent_token_signing_key.get_secret_value()
         if settings.jwt_verification_key is None:
             raise TokenVerificationError("no verification key configured")
         return settings.jwt_verification_key.get_secret_value()
+
+    return _source
+
+
+def get_algorithm_source(settings: Annotated[Settings, Depends(get_settings)]) -> AlgorithmSource:
+    """The algorithm half of the same per-issuer pinning `get_key_source` above does for the
+    verification key (algorithm-confusion guard, review finding Spec 6 / ADR-0005 / ADR-0003): an
+    agent identity's token (`iss == AGENT_IDENTITY_ISSUER`) is only ever checked against
+    `agent_token_algorithm` (default `HS256`, the algorithm `app/agent_credential_exchange.py`
+    mints with); every other issuer -- a tenant's real IdP -- is only ever checked against
+    `jwt_algorithm` (default `RS256`). Never derived from the token's own header: `verify_token`
+    always passes whatever this returns as an explicit `algorithms` allow-list to `jwt.decode`, so
+    a token cannot pick its own algorithm, and an agent token can never be revalidated under the
+    human algorithm/key (or a human token under the agent one) even if both happened to be
+    configured to the same literal value.
+    """
+
+    def _source(issuer: str) -> tuple[str, ...]:
+        if issuer == AGENT_IDENTITY_ISSUER:
+            return (settings.agent_token_algorithm,)
+        return (settings.jwt_algorithm,)
 
     return _source
 
@@ -119,6 +148,7 @@ async def _get_jwt_context(
     settings: Settings,
     tenant_id: UUID,
     key_source: KeySource,
+    algorithm_source: AlgorithmSource,
     authorization: str | None,
 ) -> RequestContext:
     request_id = uuid.uuid4().hex
@@ -135,7 +165,7 @@ async def _get_jwt_context(
             tenant_id=tenant_id,
             key_source=key_source,
             default_issuer=settings.default_identity_issuer,
-            algorithms=(settings.jwt_algorithm,),
+            algorithm_source=algorithm_source,
         )
     except TenantTokenVerificationError as exc:
         if exc.reason is VerificationFailureReason.INVALID_OR_EXPIRED:
@@ -183,6 +213,7 @@ async def get_context(
     settings: Annotated[Settings, Depends(get_settings)],
     tenant_id: Annotated[UUID, Path()],
     key_source: Annotated[KeySource, Depends(get_key_source)],
+    algorithm_source: Annotated[AlgorithmSource, Depends(get_algorithm_source)],
     x_identity_id: Annotated[str | None, Header()] = None,
     x_roles: Annotated[str | None, Header()] = None,
     authorization: Annotated[str | None, Header()] = None,
@@ -221,7 +252,9 @@ async def get_context(
         request.state.context = ctx
         return ctx
 
-    return await _get_jwt_context(request, settings, tenant_id, key_source, authorization)
+    return await _get_jwt_context(
+        request, settings, tenant_id, key_source, algorithm_source, authorization
+    )
 
 
 Context = Annotated[RequestContext, Depends(get_context)]
