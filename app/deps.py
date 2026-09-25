@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings, get_settings
@@ -20,6 +20,7 @@ from app.db.session import tenant_session
 
 
 async def get_context(
+    request: Request,
     settings: Annotated[Settings, Depends(get_settings)],
     x_tenant_id: Annotated[str | None, Header()] = None,
     x_user_id: Annotated[str | None, Header()] = None,
@@ -37,7 +38,13 @@ async def get_context(
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid UUID in header") from exc
         roles = frozenset(r.strip() for r in (x_roles or "").split(",") if r.strip())
-        return RequestContext(tenant_id=tenant_id, user_id=user_id, roles=roles)
+        ctx = RequestContext(tenant_id=tenant_id, user_id=user_id, roles=roles)
+        # Stashed on request.state (not returned as a header here) so the ASGI middleware in
+        # app/main.py can attach it to the response regardless of the route's return type
+        # (JSONResponse, StreamingResponse, or the chat endpoint's Vercel AI stream), and so a
+        # request that fails before a context exists never gets the header at all.
+        request.state.request_id = ctx.request_id
+        return ctx
 
     # AUTH_MODE=jwt: verify the bearer token (signature, issuer, expiry) and read the claims.
     # Deliberately not implemented "somehow" — wrong auth is worse than none.
