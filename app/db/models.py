@@ -234,6 +234,9 @@ class PendingAction(Base):
     conversation_id: Mapped[str] = mapped_column(String(200))
     tool_name: Mapped[str] = mapped_column(String(200))
     args_hash: Mapped[str] = mapped_column(String(64))
+    # The model's own tool call id (migration 0038, #40): the key pydantic-ai's own approval
+    # resolution uses across the propose/resume runs -- see that migration's docstring.
+    tool_call_id: Mapped[str] = mapped_column(String(200))
     asking_membership_id: Mapped[UUID] = mapped_column(ForeignKey("memberships.id"))
     status: Mapped[str] = mapped_column(String(20), default="pending")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

@@ -74,6 +74,7 @@ class PendingActionRepository:
         conversation_id: str,
         tool_name: str,
         arguments: dict[str, Any],
+        tool_call_id: str,
         asking_membership_id: UUID,
         expires_in: timedelta,
     ) -> PendingAction:
@@ -81,12 +82,15 @@ class PendingActionRepository:
         (ADR-0007's ordering requirement). `expires_in` is the caller's own configured window
         (`Settings.pending_action_expiry_seconds`, or a per-call override) -- this method never
         hard-codes a duration, so two callers configured with different windows really do expire
-        at different offsets from their own creation time."""
+        at different offsets from their own creation time. `tool_call_id` is the model's own id
+        for this call (migration 0038) -- the key `get_by_tool_call()` uses to find this same row
+        again on the resumed run."""
         action = PendingAction(
             tenant_id=ctx.tenant_id,
             conversation_id=conversation_id,
             tool_name=tool_name,
             args_hash=hash_arguments(tool_name, arguments),
+            tool_call_id=tool_call_id,
             asking_membership_id=asking_membership_id,
             status=PENDING,
             expires_at=datetime.now(UTC) + expires_in,
@@ -94,6 +98,35 @@ class PendingActionRepository:
         session.add(action)
         await session.flush()
         return action
+
+    async def get_by_tool_call(
+        self,
+        session: AsyncSession,
+        ctx: RequestContext,
+        *,
+        conversation_id: str,
+        tool_call_id: str,
+    ) -> PendingAction | None:
+        """The most recent pending action raised for this exact model tool call, scoped to
+        `ctx.tenant_id` and `conversation_id` -- how a resumed run (and the request that resolves
+        a member's approve/refuse decision) finds the row `create()` wrote down for it, without
+        trusting anything the client sends back for the id itself. None for an unknown
+        tool_call_id, or one belonging to another tenant or conversation."""
+        return (
+            (
+                await session.execute(
+                    select(PendingAction)
+                    .where(
+                        PendingAction.tenant_id == ctx.tenant_id,
+                        PendingAction.conversation_id == conversation_id,
+                        PendingAction.tool_call_id == tool_call_id,
+                    )
+                    .order_by(PendingAction.created_at.desc())
+                )
+            )
+            .scalars()
+            .first()
+        )
 
     async def get(
         self, session: AsyncSession, ctx: RequestContext, *, pending_action_id: UUID

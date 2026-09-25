@@ -106,12 +106,18 @@ def deps(ctx, fake_search, fake_history, fake_save) -> AssistantDeps:
 
 @pytest.fixture
 def test_model():
-    """TestModel calls every tool once and answers deterministically.
+    """TestModel calls every named tool once and answers deterministically.
 
     Overrides both agents (Spec 5 / #36 split) since a test may exercise either the one-shot
-    endpoints or /api/chat without knowing in advance which one it will hit.
+    endpoints or /api/chat without knowing in advance which one it will hit. Restricted to
+    `search_documents` (`call_tools=`, rather than the default `'all'`) so a plain functional test
+    never drives `chat_assistant`'s writing tool, `rename_document` (ADR-0007, #40) -- that tool's
+    own `args_validator` needs a real tenant-bound database session (it writes a pending action),
+    which a test using this fixture is not set up to provide. A test that specifically exercises
+    the writing tool builds its own `TestModel`/`FunctionModel` against a real database instead
+    (see `tests/test_writing_tool_approval_integration.py`).
     """
-    tm = TestModel()
+    tm = TestModel(call_tools=["search_documents"])
     with one_shot_assistant.override(model=tm), chat_assistant.override(model=tm):
         yield tm
 

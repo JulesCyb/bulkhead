@@ -107,7 +107,9 @@ async def test_chat_maps_wall_clock_deadline_to_a_distinct_error(
 async def test_chat_within_limits_completes_normally(client, small_run_limits, monkeypatch, calls):
     """A run within the ceilings completes normally, unaffected by the new limiting."""
     small_run_limits()
-    monkeypatch.setattr(chat_module, "get_model", lambda name: TestModel())
+    monkeypatch.setattr(
+        chat_module, "get_model", lambda name: TestModel(call_tools=["search_documents"])
+    )
     async with client:
         response = await client.post(_chat_path(), json=_submit_message_body(), headers=_headers())
     assert response.status_code == 200, response.text
@@ -329,7 +331,9 @@ async def test_persistence_happens_even_when_the_response_is_not_fully_read(
     monkeypatch.setattr(
         assistant_module.conversation_tools, "load_conversation_history", fake_history
     )
-    monkeypatch.setattr(chat_module, "get_model", lambda name: TestModel())
+    monkeypatch.setattr(
+        chat_module, "get_model", lambda name: TestModel(call_tools=["search_documents"])
+    )
 
     save_done = asyncio.Event()
 
@@ -422,7 +426,9 @@ async def test_agent_run_receives_the_tenant_scoped_conversation_id(client, monk
         return original_run_stream(self, **kwargs)
 
     monkeypatch.setattr(VercelAIAdapter, "run_stream", spy_run_stream)
-    monkeypatch.setattr(chat_module, "get_model", lambda name: TestModel())
+    monkeypatch.setattr(
+        chat_module, "get_model", lambda name: TestModel(call_tools=["search_documents"])
+    )
 
     tenant_id = uuid.uuid4()
     async with client:

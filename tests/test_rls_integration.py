@@ -2809,6 +2809,7 @@ async def test_pending_action_invisible_to_another_tenant(app_settings, database
             conversation_id="conv-1",
             tool_name="delete_document",
             arguments={"document_id": "doc-1"},
+            tool_call_id="call-isolation",
             asking_membership_id=membership_a,
             expires_in=timedelta(minutes=5),
         )
@@ -2852,6 +2853,7 @@ async def test_verify_refuses_when_recomputed_hash_does_not_match(app_settings, 
             conversation_id="conv-1",
             tool_name="delete_document",
             arguments={"document_id": "doc-1"},
+            tool_call_id="call-hash-mismatch",
             asking_membership_id=membership_id,
             expires_in=timedelta(minutes=5),
         )
@@ -2905,6 +2907,7 @@ async def test_verify_refuses_a_pending_action_past_its_expiry(app_settings, dat
             conversation_id="conv-1",
             tool_name="delete_document",
             arguments={"document_id": "doc-1"},
+            tool_call_id="call-expired",
             asking_membership_id=membership_id,
             expires_in=timedelta(seconds=-1),
         )
@@ -2958,6 +2961,7 @@ async def test_resolving_one_pending_action_leaves_anothers_status_untouched(
             conversation_id="conv-1",
             tool_name="delete_document",
             arguments={"document_id": "doc-1"},
+            tool_call_id="call-first",
             asking_membership_id=membership_id,
             expires_in=timedelta(minutes=5),
         )
@@ -2967,6 +2971,7 @@ async def test_resolving_one_pending_action_leaves_anothers_status_untouched(
             conversation_id="conv-2",
             tool_name="delete_document",
             arguments={"document_id": "doc-2"},
+            tool_call_id="call-second",
             asking_membership_id=membership_id,
             expires_in=timedelta(minutes=5),
         )
@@ -3005,6 +3010,7 @@ async def test_expiry_window_is_configuration_not_a_constant(app_settings, datab
             conversation_id="conv-1",
             tool_name="delete_document",
             arguments={"document_id": "doc-short"},
+            tool_call_id="call-short",
             asking_membership_id=membership_id,
             expires_in=timedelta(seconds=30),
         )
@@ -3014,6 +3020,7 @@ async def test_expiry_window_is_configuration_not_a_constant(app_settings, datab
             conversation_id="conv-1",
             tool_name="delete_document",
             arguments={"document_id": "doc-long"},
+            tool_call_id="call-long",
             asking_membership_id=membership_id,
             expires_in=timedelta(seconds=3000),
         )

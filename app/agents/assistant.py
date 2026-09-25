@@ -6,9 +6,11 @@
   it, so those endpoints cannot propose a write by construction — they have no way to carry an
   approval round-trip across requests, so the guarantee has to come from the agent itself, not
   from a convention someone could forget.
-- **chat_assistant**: every reading tool, plus (from a later ticket) the example writing tool.
-  Used exclusively by `/v1/t/{tenant_id}/api/chat`, where a conversation and an approval
-  round-trip both exist.
+- **chat_assistant**: every reading tool, plus the example writing tool (`rename_document`, Spec 5
+  / #40). Used exclusively by `/v1/t/{tenant_id}/api/chat`, where a conversation and an approval
+  round-trip both exist. Its own output type includes `DeferredToolRequests` so a run that pauses
+  on the writing tool's approval completes normally with that as its output, rather than raising —
+  see `app/tools/approvals.py` for the approval mechanism itself.
 
 Kept as two separate `Agent` objects (not one agent with a flag) so that wiring a writing tool
 into the one-shot agent is a change to code that doesn't exist, not a config toggle to flip back.
@@ -24,8 +26,9 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from uuid import UUID
 
-from pydantic_ai import Agent, RunContext
+from pydantic_ai import Agent, DeferredToolRequests, RunContext
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.result import StreamedRunResult
 
@@ -36,6 +39,7 @@ from app.repositories.documents import DocumentHit
 from app.run_limits import RunLimits, build_run_limits, run_deadline
 from app.tools import conversations as conversation_tools
 from app.tools import documents as document_tools
+from app.tools.approvals import ApprovalContext, record_write_outcome, require_approval
 
 SearchFn = Callable[[RequestContext, str, int], Awaitable[list[DocumentHit]]]
 LoadHistoryFn = Callable[[RequestContext, str], Awaitable[list[ModelMessage]]]
@@ -56,6 +60,18 @@ class AssistantDeps:
     # session of its own, independent of the streamed response's own lifecycle.
     save_run: SaveRunFn | None = None
     model_name: str | None = None  # e.g. from tenants.settings["model"]
+    # The bare (non tenant-prefixed) conversation id this run belongs to (ADR-0007, #40): what
+    # `app/tools/approvals.py` scopes a pending action to -- distinct from the tenant-scoped id
+    # `app/api/chat.py` passes as the run's own `conversation_id` for tracing (module docstring
+    # there), which a writing tool's args_validator must never parse back apart itself. `None` for
+    # a run with no conversation (the one-shot agent never registers a writing tool, so it never
+    # needs this).
+    conversation_id: str | None = None
+    # Set by `app.tools.approvals.require_approval` just before it lets a writing tool's body run,
+    # and read (then left for the next call to overwrite) by that tool's own body to record its
+    # `executed`/`failed_to_execute` outcome (`app.tools.approvals.record_write_outcome`). Never
+    # set by anything else.
+    pending_approval: ApprovalContext | None = None
     # Tracing (Spec 8 / #62, ADR-0008): the caller resolves both from the database before
     # building these deps (`app.observability.resolve_tenant_tracing_selection`) and passes them
     # straight through — `None`/`False` here (the defaults) mean "trace this run, if at all, with
@@ -103,6 +119,44 @@ def _register_reading_tools(agent: Agent[AssistantDeps, str]) -> None:
         return await ctx.deps.search(ctx.deps.ctx, query, limit)
 
 
+def _register_writing_tools(agent: Agent[AssistantDeps, str | DeferredToolRequests]) -> None:
+    """Registers the example writing tool (ADR-0007, Spec 5 / #40) -- `chat_assistant` only, per
+    the module docstring: wiring a writing tool into the reading-only one-shot agent is a change
+    to code that does not exist here, not a config toggle to flip back.
+
+    `args_validator=require_approval` is what makes this tool require approval at all: it is the
+    two-pass hook `app/tools/approvals.py` needs to write a pending action down *before* the
+    model's `DeferredToolRequests` output can reach a client, and to re-verify that approval, at
+    execution time, against the database rather than the resumed request itself. A future writing
+    tool copies this shape verbatim -- `args_validator=require_approval`, and a body that reads
+    `ctx.deps.pending_approval`, does its one repository call, then reports the outcome through
+    `record_write_outcome`.
+    """
+
+    @agent.tool(args_validator=require_approval)
+    async def rename_document(ctx: RunContext[AssistantDeps], document_id: str, title: str) -> str:
+        """Renames one of the tenant's documents. Requires an approval from the asking member
+        before it runs (ADR-0007).
+
+        Args:
+            document_id: The id (UUID) of the document to rename.
+            title: The new title.
+        """
+        approval = ctx.deps.pending_approval
+        ctx.deps.pending_approval = None
+        try:
+            renamed = await document_tools.rename_document(
+                ctx.deps.ctx, document_id=UUID(document_id), title=title
+            )
+        except Exception:
+            await record_write_outcome(ctx.deps.ctx, approval, success=False)
+            raise
+        await record_write_outcome(ctx.deps.ctx, approval, success=renamed is not None)
+        if renamed is None:
+            return f"No document {document_id!r} was found to rename."
+        return f"Renamed document {document_id!r} to {title!r}."
+
+
 one_shot_assistant: Agent[AssistantDeps, str] = Agent(
     deps_type=AssistantDeps,
     instructions=INSTRUCTIONS,
@@ -111,13 +165,15 @@ one_shot_assistant: Agent[AssistantDeps, str] = Agent(
 )
 _register_reading_tools(one_shot_assistant)
 
-chat_assistant: Agent[AssistantDeps, str] = Agent(
+chat_assistant: Agent[AssistantDeps, str | DeferredToolRequests] = Agent(
     deps_type=AssistantDeps,
     instructions=INSTRUCTIONS,
     name="assistant-chat",
     retries=2,
+    output_type=[str, DeferredToolRequests],
 )
 _register_reading_tools(chat_assistant)
+_register_writing_tools(chat_assistant)
 
 
 async def run_assistant(prompt: str, deps: AssistantDeps, limits: RunLimits | None = None) -> str:

@@ -74,7 +74,9 @@ async def test_stream_endpoint_carries_request_id_header(client, captured_ctx):
 
 
 async def test_chat_endpoint_carries_request_id_header(monkeypatch, fake_history):
-    monkeypatch.setattr(chat_module, "get_model", lambda name=None: TestModel())
+    monkeypatch.setattr(
+        chat_module, "get_model", lambda name=None: TestModel(call_tools=["search_documents"])
+    )
     monkeypatch.setattr(
         assistant_module.conversation_tools, "load_conversation_history", fake_history
     )

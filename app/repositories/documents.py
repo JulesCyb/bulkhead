@@ -46,6 +46,28 @@ class DocumentRepository:
         await session.flush()
         return doc
 
+    async def rename(
+        self, session: AsyncSession, ctx: RequestContext, *, document_id: UUID, title: str
+    ) -> Document | None:
+        """Renames one of the tenant's documents -- the one write this template's example
+        writing tool makes (ADR-0007, Spec 5 / #40), through the exact same repository layer
+        `search` and `add` already use. None for an unknown document id or one belonging to
+        another tenant (RLS plus the explicit WHERE clause make the two indistinguishable).
+        `documents_set_update_audit` (migration 0010) refreshes `updated_by`/`updated_at` from
+        `app.identity_id` the moment this UPDATE commits -- nothing here sets them explicitly."""
+        doc = (
+            await session.execute(
+                select(Document).where(
+                    Document.tenant_id == ctx.tenant_id, Document.id == document_id
+                )
+            )
+        ).scalar_one_or_none()
+        if doc is None:
+            return None
+        doc.title = title
+        await session.flush()
+        return doc
+
     async def search(
         self,
         session: AsyncSession,
