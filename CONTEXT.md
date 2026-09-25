@@ -1,4 +1,4 @@
-# ai-app-starter
+# bulkhead
 
 Multi-tenant backend for AI agents: several customers share one deployment, each with their own
 users and data, and agents reach that data only through tools.

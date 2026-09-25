@@ -1,7 +1,7 @@
 [project]
-name = "ai-app"
+name = "bulkhead"
 version = "0.1.0"
-description = "Starter: AI-agent backend as an API - FastAPI + PydanticAI + Postgres/pgvector (RLS) + MCP + Langfuse"
+description = "Secure-by-design AI-agent backend: FastAPI + PydanticAI + Postgres RLS + MCP + Langfuse"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115",

@@ -1,4 +1,4 @@
-# ai-app-starter
+# bulkhead
 
 Scaffold for an AI-agent backend as an API: FastAPI + PydanticAI, PostgreSQL 17 + pgvector with
 Row-Level Security, an MCP server for the tools, Langfuse tracing, Docker Compose. Multi-tenant
@@ -243,7 +243,7 @@ app/operator/          operator tool: audited dispatch, tenant lookup, tenant li
 
 ### Issue tracker
 
-Issues live in GitHub Issues of `JulesCyb/ai-app-starter` (via the `gh` CLI). See `docs/agents/issue-tracker.md`.
+Issues live in GitHub Issues of `JulesCyb/bulkhead` (via the `gh` CLI). See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
