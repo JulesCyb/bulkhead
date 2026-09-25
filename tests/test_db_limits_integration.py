@@ -94,7 +94,7 @@ async def test_runaway_query_is_cut_off_inside_the_tenant_transaction(app_settin
         )
     await engine.dispose()
 
-    ctx = RequestContext(tenant_id=tenant_id, user_id=uuid.uuid4())
+    ctx = RequestContext(tenant_id=tenant_id, identity_id=uuid.uuid4())
     with pytest.raises(DBAPIError):
         async with tenant_session(ctx) as session:
             # 200ms statement_timeout above; this sleeps far longer, so it must raise.
@@ -113,7 +113,7 @@ async def test_normal_query_completes_unaffected(app_settings, database_urls):
         )
     await engine.dispose()
 
-    ctx = RequestContext(tenant_id=tenant_id, user_id=uuid.uuid4())
+    ctx = RequestContext(tenant_id=tenant_id, identity_id=uuid.uuid4())
     async with tenant_session(ctx) as session:
         result = await session.execute(text("SELECT 1"))
         assert result.scalar_one() == 1

@@ -1,6 +1,6 @@
 """Per-membership request limit on the agent-facing routes.
 
-A single-process, best-effort backstop keyed on the `(tenant_id, user_id)` pair already
+A single-process, best-effort backstop keyed on the `(tenant_id, identity_id)` pair already
 carried by every `RequestContext` — it exists to stop a stuck client or a scripted retry
 loop from one member before it can dent the tenant's whole budget at the model gateway, not
 to be a precise or distributed rate limiter.
@@ -32,7 +32,7 @@ from app.deps import Context
 
 
 class RequestLimitExceeded(HTTPException):
-    """Raised when a `(tenant_id, user_id)` pair exceeds its request-limit window.
+    """Raised when a `(tenant_id, identity_id)` pair exceeds its request-limit window.
 
     A 429 with a clearly-labeled body (`error: "request_limit_exceeded"`) so a caller can
     distinguish this from a run-limit error or a gateway-budget error, both reported
@@ -92,12 +92,12 @@ async def enforce_request_limit(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> None:
     """FastAPI dependency: raises `RequestLimitExceeded` (429) once the calling
-    `(tenant_id, user_id)` pair exceeds `Settings.request_limit_max` within
+    `(tenant_id, identity_id)` pair exceeds `Settings.request_limit_max` within
     `Settings.request_limit_window_seconds`. A different pair — another member of the same
     tenant, or a member of another tenant — is tracked in its own window and unaffected.
     """
     limiter = _limiter_for(settings.request_limit_max, settings.request_limit_window_seconds)
-    limiter.check((ctx.tenant_id, ctx.user_id))
+    limiter.check((ctx.tenant_id, ctx.identity_id))
 
 
 RequestLimit = Annotated[None, Depends(enforce_request_limit)]

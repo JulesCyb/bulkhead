@@ -20,7 +20,7 @@ This is a working agent backend — FastAPI + PydanticAI behind an HTTP API — 
 
 ## The idea in four sentences
 
-The agent logic runs as its own service with an HTTP API — web, mobile, and Claude Code are just three clients of the same interface. Every request produces a **context object** (`tenant_id`, `user_id`, roles) that is passed through agent, tools, repository, and down into the database transaction; nothing reads global state. In the database, **Row-Level Security** enforces tenant separation — not developer discipline. And the agent never sees a DB connection: it reaches data exclusively through tools that run with the logged-in user's permissions.
+The agent logic runs as its own service with an HTTP API — web, mobile, and Claude Code are just three clients of the same interface. Every request produces a **context object** (`tenant_id`, `identity_id`, roles) that is passed through agent, tools, repository, and down into the database transaction; nothing reads global state. In the database, **Row-Level Security** enforces tenant separation — not developer discipline. And the agent never sees a DB connection: it reaches data exclusively through tools that run with the logged-in user's permissions.
 
 ## Quickstart
 
@@ -38,7 +38,7 @@ First call (dev headers are enough locally):
 ```bash
 curl -X POST localhost:8000/agents/assistant/run \
   -H 'Content-Type: application/json' \
-  -H 'X-Tenant-Id: <TENANT>' -H 'X-User-Id: <USER>' \
+  -H 'X-Tenant-Id: <TENANT>' -H 'X-Identity-Id: <IDENTITY>' \
   -d '{"prompt": "What do my documents say about notice periods?"}'
 ```
 
@@ -48,8 +48,8 @@ Tests: `uv run pytest` — the RLS integration test is skipped when `pgserver` i
 
 | Building block | File | Purpose |
 |---|---|---|
-| Context object | `app/context.py` | `tenant_id`, `user_id`, roles — passed through everywhere |
-| Auth (dev) | `app/deps.py` | `X-Tenant-Id`/`X-User-Id` headers locally; JWT slot prepared |
+| Context object | `app/context.py` | `tenant_id`, `identity_id`, roles — passed through everywhere |
+| Auth (dev) | `app/deps.py` | `X-Tenant-Id`/`X-Identity-Id` headers locally; JWT slot prepared |
 | Tenant session | `app/db/session.py` | `set_config('app.tenant_id', …)` per transaction |
 | Schema + RLS | `migrations/versions/0001_initial.py` | tenants, users, documents (vector 1536), policies, grants |
 | App role | `docker/postgres/01-init.sh` | `app` without superuser/BYPASSRLS — otherwise RLS is void |

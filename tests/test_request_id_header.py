@@ -40,7 +40,7 @@ def client(monkeypatch, captured_ctx, test_model):
 
 
 def _headers() -> dict[str, str]:
-    return {"X-Tenant-Id": str(uuid.uuid4()), "X-User-Id": str(uuid.uuid4())}
+    return {"X-Tenant-Id": str(uuid.uuid4()), "X-Identity-Id": str(uuid.uuid4())}
 
 
 async def test_run_endpoint_carries_request_id_header(client, captured_ctx):

@@ -39,8 +39,8 @@ async def main(tenant_name: str, email: str) -> None:
             {"id": user_id, "tenant_id": tenant_id, "email": email},
         )
     await engine.dispose()
-    print(f"MCP_TENANT_ID={tenant_id}\nMCP_USER_ID={user_id}")
-    print(f"\ncurl -H 'X-Tenant-Id: {tenant_id}' -H 'X-User-Id: {user_id}' ...")
+    print(f"MCP_TENANT_ID={tenant_id}\nMCP_IDENTITY_ID={user_id}")
+    print(f"\ncurl -H 'X-Tenant-Id: {tenant_id}' -H 'X-Identity-Id: {user_id}' ...")
 
 
 if __name__ == "__main__":

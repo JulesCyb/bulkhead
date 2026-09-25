@@ -5,7 +5,7 @@
       "args": ["run", "python", "-m", "app.mcp.server"],
       "env": {
         "MCP_TENANT_ID": "<from scripts/seed.py>",
-        "MCP_USER_ID": "<from scripts/seed.py>"
+        "MCP_IDENTITY_ID": "<from scripts/seed.py>"
       }
     }
   }

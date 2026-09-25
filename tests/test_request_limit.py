@@ -43,7 +43,7 @@ def test_limiter_tracks_each_key_independently():
     limiter.check(key_a, now=0.0)
     with pytest.raises(RequestLimitExceeded):
         limiter.check(key_a, now=0.1)
-    # A different (tenant_id, user_id) pair is unaffected by key_a's limit.
+    # A different (tenant_id, identity_id) pair is unaffected by key_a's limit.
     limiter.check(key_b, now=0.1)
 
 
@@ -76,13 +76,13 @@ def client(monkeypatch, fake_search, test_model, low_limit):
     return httpx.AsyncClient(transport=transport, base_url="http://test")
 
 
-def _headers(tenant_id: uuid.UUID, user_id: uuid.UUID) -> dict[str, str]:
-    return {"X-Tenant-Id": str(tenant_id), "X-User-Id": str(user_id)}
+def _headers(tenant_id: uuid.UUID, identity_id: uuid.UUID) -> dict[str, str]:
+    return {"X-Tenant-Id": str(tenant_id), "X-Identity-Id": str(identity_id)}
 
 
 async def test_run_endpoint_limits_a_flooding_member(client):
-    tenant_id, user_id = uuid.uuid4(), uuid.uuid4()
-    headers = _headers(tenant_id, user_id)
+    tenant_id, identity_id = uuid.uuid4(), uuid.uuid4()
+    headers = _headers(tenant_id, identity_id)
     async with client:
         first = await client.post("/agents/assistant/run", json={"prompt": "hi"}, headers=headers)
         second = await client.post("/agents/assistant/run", json={"prompt": "hi"}, headers=headers)
@@ -95,8 +95,8 @@ async def test_run_endpoint_limits_a_flooding_member(client):
 
 
 async def test_stream_endpoint_limits_a_flooding_member(client):
-    tenant_id, user_id = uuid.uuid4(), uuid.uuid4()
-    headers = _headers(tenant_id, user_id)
+    tenant_id, identity_id = uuid.uuid4(), uuid.uuid4()
+    headers = _headers(tenant_id, identity_id)
     async with client:
         await client.post("/agents/assistant/stream", json={"prompt": "hi"}, headers=headers)
         await client.post("/agents/assistant/stream", json={"prompt": "hi"}, headers=headers)
@@ -108,8 +108,8 @@ async def test_stream_endpoint_limits_a_flooding_member(client):
 
 
 async def test_chat_endpoint_limits_a_flooding_member(client):
-    tenant_id, user_id = uuid.uuid4(), uuid.uuid4()
-    headers = _headers(tenant_id, user_id)
+    tenant_id, identity_id = uuid.uuid4(), uuid.uuid4()
+    headers = _headers(tenant_id, identity_id)
     payload = {"messages": [], "id": "chat-1"}
     async with client:
         await client.post("/api/chat", json=payload, headers=headers)
@@ -120,15 +120,15 @@ async def test_chat_endpoint_limits_a_flooding_member(client):
 
 
 async def test_a_second_membership_is_unaffected(client):
-    tenant_id, user_id = uuid.uuid4(), uuid.uuid4()
-    other_tenant_id, other_user_id = uuid.uuid4(), uuid.uuid4()
-    headers = _headers(tenant_id, user_id)
-    other_headers = _headers(other_tenant_id, other_user_id)
+    tenant_id, identity_id = uuid.uuid4(), uuid.uuid4()
+    other_tenant_id, other_identity_id = uuid.uuid4(), uuid.uuid4()
+    headers = _headers(tenant_id, identity_id)
+    other_headers = _headers(other_tenant_id, other_identity_id)
     async with client:
         await client.post("/agents/assistant/run", json={"prompt": "hi"}, headers=headers)
         await client.post("/agents/assistant/run", json={"prompt": "hi"}, headers=headers)
         limited = await client.post("/agents/assistant/run", json={"prompt": "hi"}, headers=headers)
-        # A different (tenant_id, user_id) pair, same window: unaffected.
+        # A different (tenant_id, identity_id) pair, same window: unaffected.
         unaffected = await client.post(
             "/agents/assistant/run", json={"prompt": "hi"}, headers=other_headers
         )
@@ -138,22 +138,22 @@ async def test_a_second_membership_is_unaffected(client):
 
 async def test_same_tenant_different_user_is_unaffected(client):
     tenant_id = uuid.uuid4()
-    user_id, other_user_id = uuid.uuid4(), uuid.uuid4()
+    identity_id, other_identity_id = uuid.uuid4(), uuid.uuid4()
     async with client:
         await client.post(
-            "/agents/assistant/run", json={"prompt": "hi"}, headers=_headers(tenant_id, user_id)
+            "/agents/assistant/run", json={"prompt": "hi"}, headers=_headers(tenant_id, identity_id)
         )
         await client.post(
-            "/agents/assistant/run", json={"prompt": "hi"}, headers=_headers(tenant_id, user_id)
+            "/agents/assistant/run", json={"prompt": "hi"}, headers=_headers(tenant_id, identity_id)
         )
         limited = await client.post(
-            "/agents/assistant/run", json={"prompt": "hi"}, headers=_headers(tenant_id, user_id)
+            "/agents/assistant/run", json={"prompt": "hi"}, headers=_headers(tenant_id, identity_id)
         )
         # Another member of the SAME tenant, same window: unaffected.
         unaffected = await client.post(
             "/agents/assistant/run",
             json={"prompt": "hi"},
-            headers=_headers(tenant_id, other_user_id),
+            headers=_headers(tenant_id, other_identity_id),
         )
     assert limited.status_code == 429
     assert unaffected.status_code == 200

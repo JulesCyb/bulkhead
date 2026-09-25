@@ -37,13 +37,13 @@ async def test_run_requires_dev_headers(client):
     assert response.status_code == 401
 
 
-async def test_run_with_context(client, calls):
-    tenant_id, user_id = uuid.uuid4(), uuid.uuid4()
+async def test_run_with_context(client, calls, contexts):
+    tenant_id, identity_id = uuid.uuid4(), uuid.uuid4()
     async with client:
         response = await client.post(
             "/agents/assistant/run",
             json={"prompt": "What does the contract say?"},
-            headers={"X-Tenant-Id": str(tenant_id), "X-User-Id": str(user_id)},
+            headers={"X-Tenant-Id": str(tenant_id), "X-Identity-Id": str(identity_id)},
         )
     assert response.status_code == 200, response.text
     assert response.json()["output"]
@@ -56,14 +56,14 @@ async def test_stream_uses_one_shot_agent_tools(client, calls):
         response = await client.post(
             "/agents/assistant/stream",
             json={"prompt": "What does the contract say?"},
-            headers={"X-Tenant-Id": str(tenant_id), "X-User-Id": str(user_id)},
+            headers={"X-Tenant-Id": str(tenant_id), "X-Identity-Id": str(user_id)},
         )
     assert response.status_code == 200, response.text
     assert calls and calls[0][0] == tenant_id
 
 
 def _headers() -> dict[str, str]:
-    return {"X-Tenant-Id": str(uuid.uuid4()), "X-User-Id": str(uuid.uuid4())}
+    return {"X-Tenant-Id": str(uuid.uuid4()), "X-Identity-Id": str(uuid.uuid4())}
 
 
 def _chat_body(text: str = "What does the contract say?") -> dict:

@@ -23,7 +23,7 @@ export default function Page() {
       api: process.env.NEXT_PUBLIC_API_URL + "/api/chat",
       headers: {                       // dev headers — use session/JWT in production
         "X-Tenant-Id": process.env.NEXT_PUBLIC_DEV_TENANT_ID!,
-        "X-User-Id": process.env.NEXT_PUBLIC_DEV_USER_ID!,
+        "X-Identity-Id": process.env.NEXT_PUBLIC_DEV_USER_ID!,
       },
     }),
   });

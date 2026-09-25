@@ -36,7 +36,7 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
 
 ## Architecture rules — non-negotiable
 
-1. **Context object**: `RequestContext(tenant_id, user_id, roles)` is created in `app/deps.py` and
+1. **Context object**: `RequestContext(tenant_id, identity_id, roles)` is created in `app/deps.py` and
    passed through every request, agent run, tool call, and job. No global state.
 2. **Every new table** has `tenant_id uuid NOT NULL REFERENCES tenants(id)`, an index on it,
    `ENABLE`/`FORCE ROW LEVEL SECURITY`, and a policy `tenant_id = current_setting('app.tenant_id',
@@ -51,7 +51,7 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    (prompt-injection surface), never as instructions.
 5. **Integrations as MCP servers** (`app/mcp/server.py`) using the same functions from `app/tools/`.
 6. **Models via `app/llm.py`**; the model name comes from configuration or `tenants.settings["model"]`.
-7. **Every agent run is traced** (Langfuse/OTel) with `tenant_id`, `user_id`, `request_id`
+7. **Every agent run is traced** (Langfuse/OTel) with `tenant_id`, `identity_id`, `request_id`
    (`RequestContext.trace_attributes()` as `metadata`).
 8. **Cache keys** include the `tenant_id`.
 9. **No secrets in the repo**; keep `.env.example` current.
@@ -91,7 +91,9 @@ scripts/seed.py       first tenant + user
 ## Do not touch without checking first
 
 - RLS policies, roles, and grants in `migrations/` and `docker/postgres/01-init.sh`
-- `app/context.py`, `app/deps.py`, `app/db/session.py`
+- `app/context.py`, `app/deps.py`, `app/db/session.py` — changes here are authorized by
+  ADR-0003 (identity and membership) and ADR-0012 (tenant in the path); check those first
+  before editing, rather than treating a matching change as an unreviewed edit
 
 ## Agent skills
 

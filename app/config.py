@@ -98,11 +98,11 @@ class Settings(BaseSettings):
     langfuse_secret_key: str | None = None
 
     mcp_tenant_id: str | None = None
-    mcp_user_id: str | None = None
+    mcp_identity_id: str | None = None
 
     # Per-membership request limit on the agent-facing routes (/agents/assistant/run,
     # /agents/assistant/stream, /api/chat): a single-process, best-effort backstop against a
-    # stuck client or a scripted flood, keyed on (tenant_id, user_id). It is NOT the enforcement
+    # stuck client or a scripted flood, keyed on (tenant_id, identity_id). It is NOT the enforcement
     # of record for spend — that is the model gateway's own per-tenant budget; this only keeps a
     # single member's flood from denting that budget before the gateway ever notices, and only
     # within this one process (a multi-replica deployment needs a shared store for the same
