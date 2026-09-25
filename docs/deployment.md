@@ -108,10 +108,12 @@ Maintain `docker/litellm/config.yaml`; set `LITELLM_MASTER_KEY` in `.env` (rende
 using the same credential-issuance primitives as
 `app.gateway_provisioning.provision_gateway_credential` (Spec 7 / #53) — no manual step.
 `revoke_gateway_credential(tenant_id)` reverses provisioning outside of `create` (revokes the
-key, removes the secret file, clears the control-plane alias); a future `erase` command
-(Spec 9) calls it as part of removing a tenant. Backend: `LITELLM_BASE_URL=http://litellm:4000`,
-`LITELLM_API_KEY=<virtual key>`, `LLM_MODEL=openai:claude`, `EMBEDDING_MODEL=embeddings`
-(the alias names from the config).
+key, removes the secret file, clears the control-plane alias); the operator tool's `erase`
+command calls it as part of removing a tenant. Backend: `LITELLM_BASE_URL=http://litellm:4000`
+(required, checked at startup), `LLM_MODEL=claude-eu`, `EMBEDDING_MODEL=embeddings` -- bare
+gateway aliases from `docker/litellm/config.yaml` that the tenant's residency allows
+(`config/residency.toml`); each tenant calls the gateway with its own virtual key, resolved per
+request from its secret file.
 
 **Networking (#18)**: `litellm` sits on two networks, neither shared with `db` (the network `api`
 and `migrate` use for the application's own connections to postgres): `gatewaydb` carries only the
