@@ -795,3 +795,190 @@ async def test_tenant_auth_settings_does_not_switch_the_callers_tenant_context(
         hits = await DocumentRepository().search(session, query, limit=10)
     assert still_a == str(tenant_a)
     assert [h.title for h in hits] == ["Document A"]
+
+
+async def test_control_tenants_has_suspension_columns_defaulting_unsuspended(database_urls):
+    """`control.tenants` gains a suspension flag and timestamp (#66), both defaulting to
+    not-suspended so every existing and newly inserted tenant starts active."""
+    superuser_engine = create_async_engine(database_urls["superuser"])
+    tenant_id = uuid.uuid4()
+    async with superuser_engine.begin() as conn:
+        await conn.execute(
+            text("INSERT INTO tenants (id, name) VALUES (:id, 'A')"), {"id": tenant_id}
+        )
+        await conn.execute(
+            text("INSERT INTO control.tenants (tenant_id) VALUES (:id)"), {"id": tenant_id}
+        )
+        row = (
+            await conn.execute(
+                text("SELECT suspended, suspended_at FROM control.tenants WHERE tenant_id = :id"),
+                {"id": tenant_id},
+            )
+        ).one()
+    await superuser_engine.dispose()
+    assert row.suspended is False
+    assert row.suspended_at is None
+
+
+async def test_tenant_erasure_record_has_no_fk_and_survives_tenant_deletion(database_urls):
+    """The erasure record (#66) is keyed by `tenant_id` with no foreign key back to the tenant
+    it describes, so its row survives after the tenant row is deleted -- verified two ways:
+    the column carries no FK constraint, and a real delete leaves the erasure row in place."""
+    superuser_engine = create_async_engine(database_urls["superuser"])
+    tenant_id = uuid.uuid4()
+    async with superuser_engine.begin() as conn:
+        fk_count = (
+            await conn.execute(
+                text(
+                    "SELECT count(*) FROM information_schema.table_constraints "
+                    "WHERE table_schema = 'control' AND table_name = 'tenant_erasures' "
+                    "AND constraint_type = 'FOREIGN KEY'"
+                )
+            )
+        ).scalar_one()
+        assert fk_count == 0
+
+        await conn.execute(
+            text("INSERT INTO tenants (id, name) VALUES (:id, 'A')"), {"id": tenant_id}
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO control.tenant_erasures (tenant_id, details) "
+                'VALUES (:id, \'{"removed": ["documents"]}\'::jsonb)'
+            ),
+            {"id": tenant_id},
+        )
+        await conn.execute(text("DELETE FROM tenants WHERE id = :id"), {"id": tenant_id})
+        row = (
+            await conn.execute(
+                text("SELECT tenant_id FROM control.tenant_erasures WHERE tenant_id = :id"),
+                {"id": tenant_id},
+            )
+        ).one()
+    await superuser_engine.dispose()
+    assert row.tenant_id == tenant_id
+
+
+async def test_operator_actions_table_also_has_no_fk_to_tenants(database_urls):
+    """Same reasoning as the erasure record: an `erase` action's own log entry must outlive the
+    tenant it names, so `control.operator_actions` carries no foreign key either (#66)."""
+    superuser_engine = create_async_engine(database_urls["superuser"])
+    async with superuser_engine.begin() as conn:
+        fk_count = (
+            await conn.execute(
+                text(
+                    "SELECT count(*) FROM information_schema.table_constraints "
+                    "WHERE table_schema = 'control' AND table_name = 'operator_actions' "
+                    "AND constraint_type = 'FOREIGN KEY'"
+                )
+            )
+        ).scalar_one()
+    await superuser_engine.dispose()
+    assert fk_count == 0
+
+
+@pytest.mark.parametrize("table", ["tenant_erasures", "operator_actions"])
+async def test_append_only_tables_accept_insert_reject_update_delete_by_owner(database_urls, table):
+    """Both new tables (#66) accept INSERT from `app_owner`, which owns them, but reject UPDATE
+    and DELETE from that same role: table ownership grants privileges exactly as if by GRANT,
+    and migration 0004 explicitly revokes everything but INSERT from `app_owner` -- append-only
+    applies to the owner too, not just to unprivileged roles."""
+    from sqlalchemy.exc import DBAPIError
+
+    superuser_engine = create_async_engine(database_urls["superuser"])
+    tenant_id = uuid.uuid4()
+    async with superuser_engine.begin() as conn:
+        await conn.execute(
+            text("INSERT INTO tenants (id, name) VALUES (:id, 'A')"), {"id": tenant_id}
+        )
+    await superuser_engine.dispose()
+
+    owner_engine = create_async_engine(database_urls["migrations"])
+    if table == "tenant_erasures":
+        insert_sql = "INSERT INTO control.tenant_erasures (tenant_id) VALUES (:id)"
+    else:
+        insert_sql = (
+            "INSERT INTO control.operator_actions (tenant_id, action) VALUES (:id, 'create')"
+        )
+
+    async with owner_engine.begin() as conn:
+        await conn.execute(text(insert_sql), {"id": tenant_id})
+
+    with pytest.raises(DBAPIError):
+        async with owner_engine.begin() as conn:
+            await conn.execute(
+                text(f"UPDATE control.{table} SET tenant_id = tenant_id WHERE tenant_id = :id"),
+                {"id": tenant_id},
+            )
+
+    with pytest.raises(DBAPIError):
+        async with owner_engine.begin() as conn:
+            await conn.execute(
+                text(f"DELETE FROM control.{table} WHERE tenant_id = :id"), {"id": tenant_id}
+            )
+
+    # Owner also lost SELECT: only INSERT remains (ticket #66 grants only that).
+    with pytest.raises(DBAPIError):
+        async with owner_engine.begin() as conn:
+            await conn.execute(
+                text(f"SELECT * FROM control.{table} WHERE tenant_id = :id"), {"id": tenant_id}
+            )
+
+    await owner_engine.dispose()
+
+
+@pytest.mark.parametrize("table", ["tenant_erasures", "operator_actions"])
+async def test_select_on_append_only_tables_is_grantable_to_an_auditor_role(database_urls, table):
+    """SELECT on either table is grantable to a distinct role without handing that role any
+    write access (#66) -- proving the two privileges are independent, not bundled."""
+    from sqlalchemy.exc import DBAPIError
+
+    role = f"test_auditor_{table}"
+    superuser_engine = create_async_engine(database_urls["superuser"])
+    tenant_id = uuid.uuid4()
+    try:
+        async with superuser_engine.begin() as conn:
+            await conn.execute(text(f"CREATE ROLE {role} LOGIN NOSUPERUSER NOBYPASSRLS"))
+            await conn.execute(
+                text("INSERT INTO tenants (id, name) VALUES (:id, 'A')"), {"id": tenant_id}
+            )
+
+        owner_engine = create_async_engine(database_urls["migrations"])
+        insert_sql = (
+            f"INSERT INTO control.{table} (tenant_id) VALUES (:id)"
+            if table == "tenant_erasures"
+            else f"INSERT INTO control.{table} (tenant_id, action) VALUES (:id, 'create')"
+        )
+        async with owner_engine.begin() as conn:
+            await conn.execute(text(insert_sql), {"id": tenant_id})
+            await conn.execute(text(f"GRANT USAGE ON SCHEMA control TO {role}"))
+            await conn.execute(text(f"GRANT SELECT ON control.{table} TO {role}"))
+        await owner_engine.dispose()
+
+        parsed = urlparse(database_urls["app"])
+        sockdir = parse_qs(parsed.query)["host"][0]
+        auditor_engine = create_async_engine(
+            f"postgresql+asyncpg://{role}@/postgres?host={sockdir}"
+        )
+        async with auditor_engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text(f"SELECT tenant_id FROM control.{table} WHERE tenant_id = :id"),
+                    {"id": tenant_id},
+                )
+            ).one()
+            assert row.tenant_id == tenant_id
+
+            with pytest.raises(DBAPIError):
+                await conn.execute(
+                    text(f"DELETE FROM control.{table} WHERE tenant_id = :id"), {"id": tenant_id}
+                )
+        await auditor_engine.dispose()
+    finally:
+        cleanup_engine = create_async_engine(database_urls["superuser"])
+        async with cleanup_engine.begin() as conn:
+            await conn.execute(text("DELETE FROM tenants WHERE id = :id"), {"id": tenant_id})
+            await conn.execute(text(f"REVOKE ALL ON control.{table} FROM {role}"))
+            await conn.execute(text(f"REVOKE ALL ON SCHEMA control FROM {role}"))
+            await conn.execute(text(f"DROP ROLE {role}"))
+        await cleanup_engine.dispose()

@@ -101,6 +101,8 @@ scripts/seed.py       first tenant + user
 - `app/db/engine_registry.py` — the process-wide alias-to-engine cache ADR-0002 (hybrid tenant
   isolation) depends on; a mistake here has the same blast radius as a mistake in the
   tenant-session layer
+- `control.tenant_erasures` and `control.operator_actions` (append-only by grant, see
+  migration 0004) — never grant UPDATE/DELETE on either, to any role, for any reason
 
 ## Agent skills
 
