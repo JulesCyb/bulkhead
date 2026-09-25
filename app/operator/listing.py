@@ -2,9 +2,10 @@
 operator or auditor see every tenant's isolation tier, residency, database alias, and suspension
 state without a direct database query.
 
-Enumerates `control.tenant_directory` (migration 0012) for the set of tenants, then reads each
-one's facts through `control.tenant_lifecycle_info`, a narrow, single-tenant `SECURITY DEFINER`
-read -- never a cross-tenant policy bypass. See that migration's docstring for why.
+Reads `control.enumerate_tenants()` (migration 0012): a narrow, session_user-gated, `SECURITY
+DEFINER` cross-tenant read -- never a plain role-scoped bypass policy on `control.tenants` or
+`public.tenants` directly, which (see that migration's docstring) would leak through
+`control.tenants_view` to the `app` role. Not granted to `app`; only `app_owner` may call it.
 """
 
 from __future__ import annotations
@@ -28,37 +29,19 @@ class TenantSummary:
 
 
 async def list_tenants(conn: AsyncConnection) -> list[TenantSummary]:
-    """Every tenant in `control.tenant_directory`, with its lifecycle facts attached.
-
-    A tenant erased between the directory read and its own lifecycle-info read (a narrow race,
-    since each is its own statement) is skipped rather than raised -- an operator re-running the
-    listing sees it gone, exactly as `erase` intends.
-    """
-    directory = (
-        await conn.execute(
-            text("SELECT tenant_id, name FROM control.tenant_directory ORDER BY name")
-        )
+    """Every tenant in the control plane, with its lifecycle facts."""
+    rows = (
+        await conn.execute(text("SELECT * FROM control.enumerate_tenants() ORDER BY name"))
     ).all()
-
-    summaries: list[TenantSummary] = []
-    for row in directory:
-        info = (
-            await conn.execute(
-                text("SELECT * FROM control.tenant_lifecycle_info(:tid)"),
-                {"tid": str(row.tenant_id)},
-            )
-        ).one_or_none()
-        if info is None:
-            continue
-        summaries.append(
-            TenantSummary(
-                tenant_id=row.tenant_id,
-                name=info.name,
-                isolation_tier=info.isolation_tier,
-                residency=info.residency,
-                database_alias=info.database_alias,
-                suspended=info.suspended,
-                suspended_at=info.suspended_at.isoformat() if info.suspended_at else None,
-            )
+    return [
+        TenantSummary(
+            tenant_id=row.tenant_id,
+            name=row.name,
+            isolation_tier=row.isolation_tier,
+            residency=row.residency,
+            database_alias=row.database_alias,
+            suspended=row.suspended,
+            suspended_at=row.suspended_at.isoformat() if row.suspended_at else None,
         )
-    return summaries
+        for row in rows
+    ]

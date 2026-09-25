@@ -73,9 +73,9 @@ async def _seed_tenant(
     database_alias: str | None = None,
     suspended: bool = False,
 ) -> uuid.UUID:
-    """One tenant across `public.tenants`, `control.tenants`, and `control.tenant_directory` --
-    as the superuser, which bypasses RLS entirely, exactly like `_seed` in
-    `tests/test_rls_integration.py`. Standing in for what a future `create` command will do."""
+    """One tenant across `public.tenants` and `control.tenants` -- as the superuser, which
+    bypasses RLS entirely, exactly like `_seed` in `tests/test_rls_integration.py`. Standing in
+    for what a future `create` command will do."""
     tenant_id = uuid.uuid4()
     engine = create_async_engine(superuser_url)
     async with engine.begin() as conn:
@@ -95,10 +95,6 @@ async def _seed_tenant(
                 text("UPDATE control.tenants SET suspended_at = now() WHERE tenant_id = :id"),
                 {"id": tenant_id},
             )
-        await conn.execute(
-            text("INSERT INTO control.tenant_directory (tenant_id, name) VALUES (:id, :name)"),
-            {"id": tenant_id, "name": name},
-        )
     await engine.dispose()
     return tenant_id
 
@@ -201,6 +197,35 @@ async def test_lookup_raises_not_found_for_unknown_id_and_name(database_urls):
                 await resolve_tenant(conn, "no such tenant")
     finally:
         await engine.dispose()
+
+
+async def test_app_cannot_widen_its_view_with_the_operator_read_flag(database_urls):
+    """Regression (mirrors `test_app_cannot_widen_its_control_plane_view_with_the_migration_read_
+    flag` in `tests/test_rls_integration.py` for 0016's identically-shaped flag): `app` can set
+    any custom setting in its own session, so `control_tenants_operator_read`/`tenants_operator_
+    read` must still require `session_user = 'app_owner'`, not just the flag, or `app` could read
+    every tenant's control-plane row through `control.tenants_view` just by setting
+    `app.control_operator_read` itself."""
+    tenant_a = await _seed_tenant(database_urls["superuser"], name="Flag A")
+    await _seed_tenant(database_urls["superuser"], name="Flag B")
+
+    engine = create_async_engine(database_urls["app"])
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text("SELECT set_config('app.control_operator_read', 'true', true)"))
+            await conn.execute(
+                text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": str(tenant_a)}
+            )
+            visible = (
+                (await conn.execute(text("SELECT tenant_id FROM control.tenants_view")))
+                .scalars()
+                .all()
+            )
+            visible_public = (await conn.execute(text("SELECT id FROM tenants"))).scalars().all()
+    finally:
+        await engine.dispose()
+    assert visible == [tenant_a]
+    assert visible_public == [tenant_a]
 
 
 async def _operator_actions(superuser_url: str, action: str) -> list:

@@ -1,12 +1,13 @@
 """The tenant-lookup helper (Spec 9 / #68): resolves a tenant by id or by an unambiguous name,
 shared by every operator command (`list` today; `suspend`/`erase` in later Spec 9 tickets).
 
-Reads `control.tenant_directory` (migration 0012) -- the one control-plane table that lists
-every tenant's id and name without being bound by `control.tenants`'/`public.tenants`' per-tenant
-`FORCE ROW LEVEL SECURITY` policy (see that migration's docstring for why a role-scoped bypass
-policy on either table is unsafe instead). Neither `public.tenants.name` nor this table enforces
-uniqueness on `name`, so an ambiguous name is a real possibility this helper must catch, not a
-theoretical one a constraint already rules out.
+Calls `control.enumerate_tenants()` (migration 0012) -- the same narrow, session_user-gated,
+`SECURITY DEFINER` cross-tenant read the tenant listing uses (see that migration's docstring for
+why a role-scoped bypass policy needs the `session_user = 'app_owner'` guard) -- and filters its
+result by id or name here, rather than adding a second enumeration mechanism just for lookup.
+Neither `public.tenants.name` nor `control.tenants` enforces uniqueness on name, so an ambiguous
+name is a real possibility this helper must catch, not a theoretical one a constraint already
+rules out.
 """
 
 from __future__ import annotations
@@ -46,7 +47,9 @@ async def resolve_tenant(conn: AsyncConnection, identifier: str) -> TenantRef:
     if tenant_id is not None:
         row = (
             await conn.execute(
-                text("SELECT tenant_id, name FROM control.tenant_directory WHERE tenant_id = :id"),
+                text(
+                    "SELECT tenant_id, name FROM control.enumerate_tenants() WHERE tenant_id = :id"
+                ),
                 {"id": str(tenant_id)},
             )
         ).one_or_none()
@@ -56,7 +59,7 @@ async def resolve_tenant(conn: AsyncConnection, identifier: str) -> TenantRef:
 
     rows = (
         await conn.execute(
-            text("SELECT tenant_id, name FROM control.tenant_directory WHERE name = :name"),
+            text("SELECT tenant_id, name FROM control.enumerate_tenants() WHERE name = :name"),
             {"name": identifier},
         )
     ).all()
