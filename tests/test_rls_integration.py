@@ -339,7 +339,7 @@ async def test_app_can_update_own_settings_but_not_other_tenant_columns(
     from app.db.session import tenant_session
 
     tenant_a, _ = await _seed(database_urls["superuser"])
-    ctx_a = RequestContext(tenant_id=tenant_a, user_id=uuid.uuid4())
+    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
 
     async with tenant_session(ctx_a) as session:
         await session.execute(
