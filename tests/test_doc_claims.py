@@ -287,3 +287,54 @@ def test_claude_md_audit_rule_points_at_documents_columns_not_aspirational() -> 
     assert "0010_document_audit_columns.py" in section
     for aspirational_word in ("will", "would", "eventually", "once implemented"):
         assert aspirational_word not in section
+
+
+ADR_0006 = (REPO_ROOT / "docs" / "adr" / "0006-server-side-conversations.md").read_text(
+    encoding="utf-8"
+)
+
+
+def test_adr_0006_is_accepted_not_proposed() -> None:
+    status_line = next(line for line in ADR_0006.splitlines() if line.startswith("- **Status:**"))
+    assert "accepted" in status_line
+    assert "proposed" not in status_line
+
+
+def test_adr_0006_states_the_default_retention_period_and_the_job_that_enforces_it() -> None:
+    """#35: the ADR now describes the retention period/job as shipped -- with the actual default
+    number, not just "a safe default" left unstated -- and names the job that runs it."""
+    decision_section = " ".join(
+        ADR_0006.split("## Decision", 1)[1].split("## Consequences", 1)[0].split()
+    )
+    assert "90 days" in decision_section
+    assert "app/retention.py" in decision_section
+    assert "scripts/retention.py" in decision_section
+    assert "tenant_session" in decision_section
+
+
+def test_claude_md_per_table_rule_names_conversations_retention_with_no_exception() -> None:
+    """The project's per-table architecture rule (rule 2) states that conversations/messages are
+    governed by the tenant's retention period with no exception -- not only readable from the
+    0020 migration."""
+    rule_2 = next(line for line in CLAUDE_MD.splitlines() if line.strip().startswith("2. **Every"))
+    section_start = CLAUDE_MD.index(rule_2)
+    section_end = CLAUDE_MD.index("\n3. ", section_start)
+    section = " ".join(CLAUDE_MD[section_start:section_end].split())
+
+    assert "conversations" in section
+    assert "messages" in section
+    assert "retention" in section
+    assert "no exception" in section
+    assert "90" in section
+
+
+def test_claude_md_and_readme_document_the_retention_script_command() -> None:
+    assert "scripts/retention.py" in CLAUDE_MD
+    assert "scripts/retention.py" in README
+
+
+def test_readme_table_states_the_default_retention_period() -> None:
+    row = next(line for line in README.splitlines() if line.startswith("| Retention |"))
+    assert "90 days" in row
+    assert "retention_days" in row
+    assert "ADR-0006" in row
