@@ -2,21 +2,13 @@
 dedicated-tenant credential anywhere, so the hybrid-isolation seam (ADR-0002) stays zero-footprint
 until an operator actually provisions a dedicated tenant. Skipped when Docker is unavailable.
 
-Minimal own rendering code (the `_docker_compose_available`/`rendered_config` pair is duplicated
-from `tests/test_compose_config.py` rather than imported — #18 is consolidating these render
-helpers into one place in parallel with this ticket)."""
+Rendering is shared with the other compose tests via tests/compose_helpers.py."""
 
 from __future__ import annotations
 
-import json
-import os
-import shutil
-import subprocess
-from pathlib import Path
-
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+from tests.compose_helpers import docker_compose_available, render_compose, temporary_env_file
 
 # The one file this template ships by default under a secrets-style mount: the Postgres init
 # script (a config file, not a per-tenant credential). Anything else that looks like it lives
@@ -28,47 +20,15 @@ _SHIPPED_SECRET_LIKE_MOUNTS = {"./docker/postgres/01-init.sh"}
 _TENANT_DB_SECRETS_MARKER = "tenant-db"
 
 
-def _docker_compose_available() -> bool:
-    if shutil.which("docker") is None:
-        return False
-    try:
-        subprocess.run(
-            ["docker", "compose", "version"], capture_output=True, check=True, timeout=10
-        )
-    except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired):
-        return False
-    return True
-
-
 pytestmark = pytest.mark.skipif(
-    not _docker_compose_available(), reason="docker compose CLI/daemon not available"
+    not docker_compose_available(), reason="docker compose CLI/daemon not available"
 )
 
 
 @pytest.fixture
-def rendered_config(tmp_path, monkeypatch):
-    """Renders docker-compose.yml with `docker compose config`. `env_file: .env` is a fixed
-    reference in the compose file itself (not resolved by --env-file), so a placeholder .env is
-    supplied only if the repo doesn't already have a real one — never overwritten."""
-    env_path = REPO_ROOT / ".env"
-    created = False
-    if not env_path.exists():
-        shutil.copy(REPO_ROOT / ".env.example", env_path)
-        created = True
-    try:
-        result = subprocess.run(
-            ["docker", "compose", "config", "--format", "json"],
-            cwd=REPO_ROOT,
-            env={**os.environ, "LITELLM_MASTER_KEY": "test-master-key"},
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    finally:
-        if created:
-            env_path.unlink(missing_ok=True)
-    assert result.returncode == 0, result.stderr
-    return json.loads(result.stdout)
+def rendered_config():
+    with temporary_env_file():
+        return render_compose()
 
 
 def _is_postgres_image(image: str | None) -> bool:
