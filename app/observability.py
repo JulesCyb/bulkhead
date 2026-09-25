@@ -40,6 +40,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from uuid import UUID
 
 from opentelemetry.context import Context as OtelContext
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
@@ -290,11 +291,29 @@ async def resolve_tenant_tracing(ctx: RequestContext) -> TenantTracingSelection:
         return await resolve_tenant_tracing_selection(session, ctx)
 
 
+async def delete_tenant_traces(tenant_id: UUID) -> None:
+    """Placeholder per-tenant trace-deletion capability (ADR-0010, Spec 9 / #72).
+
+    Spec 8's own scope note (docs describing this spec's dependency on Spec 8) says erasure "calls
+    a per-tenant trace-deletion capability that Spec 8 must expose" -- no such capability exists
+    yet against any configured tracing backend (Langfuse has no documented per-tenant hard-delete
+    API as of ADR-0008's research), and building one is explicitly Spec 8's job, not this one's.
+
+    This stub is the interface `app.operator.erase.erase_tenant` calls through so that a real
+    implementation, once Spec 8 delivers one, is a one-function replacement here rather than a
+    change to the erase module or any of its call sites. It never raises and never reaches a real
+    tracing backend; a test replaces it with a fake via `erase_tenant`'s `trace_deleter=` seam to
+    observe that erasure actually requested it.
+    """
+    return None
+
+
 __all__ = [
     "ObservabilityInitializationError",
     "TenantTracingSelection",
     "build_tracer_provider",
     "configured_trace_endpoint",
+    "delete_tenant_traces",
     "instrumentation_capabilities",
     "is_tracing_configured",
     "reset_tracer_providers",

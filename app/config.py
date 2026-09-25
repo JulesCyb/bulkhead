@@ -214,6 +214,13 @@ class Settings(BaseSettings):
     gateway_default_requests_per_minute: int = 60
     gateway_default_tokens_per_minute: int = 100_000
 
+    # Backup-retention window (Spec 9 / #72, ADR-0010): how long, in days, the deployment's own
+    # backup system keeps the last copy of a tenant's data after the operator tool's `erase`
+    # command removes it everywhere else. Used only to compute the backup-horizon date written
+    # onto each erasure record -- the tool documents this date, it never acts on it (no automatic
+    # purge), so nobody tells a tenant "your data is gone" while a backup still holds a copy.
+    backup_retention_days: int = 30
+
     @model_validator(mode="after")
     def _require_embedding_config(self) -> "Settings":
         if not self.embedding_provider:

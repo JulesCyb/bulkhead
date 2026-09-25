@@ -62,9 +62,11 @@ _DEFAULT_TENANT_DB_SECRETS_DIR = "/run/secrets/tenant-db"
 
 
 class MissingDedicatedAdminUrlError(ValueError):
-    """Provisioning a *new* dedicated tenant's database needs `--dedicated-db-admin-url`: an
-    admin connection (CREATEDB privilege) to the Postgres server that will host it. Never raised
-    on a re-run against an already-provisioned dedicated tenant -- see module docstring."""
+    """Provisioning a *new* dedicated tenant's database, or dropping an existing one
+    (`drop_dedicated_database`), needs `--dedicated-db-admin-url`: an admin connection (CREATEDB
+    or DROP DATABASE privilege, respectively) to the Postgres server hosting it. Never raised on a
+    re-run against an already-provisioned dedicated tenant, or against one already dropped -- see
+    module docstring."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,6 +209,67 @@ async def ensure_dedicated_database(
     _write_secret(_app_secret_path(alias), app_dsn)
 
     return DedicatedDatabaseResult(alias=alias, owner_dsn=owner_dsn, outcome="provisioned")
+
+
+async def drop_dedicated_database(*, alias: str, admin_url: str | None) -> str:
+    """Idempotently drop `alias`'s own physical database and remove both of its tenant-secret
+    files (Spec 9 / #72, ADR-0010, ADR-0002): the counterpart of `ensure_dedicated_database`, used
+    by `app.operator.erase.erase_tenant` for a dedicated tenant. Returns `"removed"` or
+    `"already absent"`.
+
+    Idempotency is keyed on the same two secret files `ensure_dedicated_database` writes, in
+    reverse: if neither exists, the database is assumed already dropped (or was never
+    provisioned) and this returns immediately without needing `admin_url` -- a re-run after a
+    partial failure, or a second `erase` invocation entirely, never re-raises on what a previous
+    run already removed.
+
+    Otherwise `admin_url` (an admin connection, DROP DATABASE privilege, to the server hosting the
+    database) is required: `app_owner` is created `NOCREATEDB`
+    (`docker/postgres/01-init.sh`/`scripts/provision_roles.py`) and is not this database's owner
+    (the role that ran `CREATE DATABASE` at `create` time is), so it cannot drop its own database.
+    Exactly like `--dedicated-db-admin-url` at `create` time, this is used only for this one call
+    and never stored.
+    """
+    migrations_path = _migrations_secret_path(alias)
+    app_path = _app_secret_path(alias)
+    if not migrations_path.exists() and not app_path.exists():
+        return "already absent"
+
+    if not admin_url:
+        raise MissingDedicatedAdminUrlError(
+            "dropping an existing dedicated tenant's database needs "
+            "--dedicated-db-admin-url: an admin connection (DROP DATABASE privilege) to the "
+            "Postgres server hosting it."
+        )
+
+    admin = make_url(_as_asyncpg_url(admin_url))
+    quoted_db = '"' + alias.replace('"', '""') + '"'
+    # See `_render_dsn`'s docstring (above) for why this goes through it rather than
+    # `URL.render_as_string()`/`str(url)`.
+    admin_dsn = _render_dsn(admin)
+
+    # DROP DATABASE cannot run inside a transaction block either -- AUTOCOMMIT, same as
+    # `ensure_dedicated_database`'s own CREATE DATABASE.
+    admin_engine = create_async_engine(admin_dsn, isolation_level="AUTOCOMMIT")
+    try:
+        async with admin_engine.connect() as conn:
+            # DROP DATABASE fails outright while any session remains connected to it -- terminate
+            # any that are (this process's own prior connections to it, a lingering test fixture,
+            # etc.) before attempting the drop.
+            await conn.execute(
+                text(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE datname = :n AND pid <> pg_backend_pid()"
+                ),
+                {"n": alias},
+            )
+            await conn.execute(text(f"DROP DATABASE IF EXISTS {quoted_db}"))
+    finally:
+        await admin_engine.dispose()
+
+    migrations_path.unlink(missing_ok=True)
+    app_path.unlink(missing_ok=True)
+    return "removed"
 
 
 async def ensure_dedicated_admin_membership(

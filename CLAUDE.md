@@ -34,6 +34,7 @@ uv run python scripts/operator.py create "My Tenant" --residency eu --admin-emai
 uv run python scripts/provision_roles.py <admin-database-url>  # managed Postgres, no init hook
 uv run python scripts/operator.py suspend <tenant-id-or-name>    # suspend a tenant (idempotent)
 uv run python scripts/operator.py unsuspend <tenant-id-or-name>  # restore it, nothing re-provisioned
+uv run python scripts/operator.py erase <tenant-id-or-name>      # irreversible; refuses a non-suspended tenant; --dry-run to preview
 uv run python scripts/retention.py        # delete every tenant's expired conversations (ADR-0006; default 90 days)
 uv run uvicorn app.main:app --reload      # API locally, http://localhost:8000/docs
 uv run pytest                             # tests (must be green before every commit)
@@ -131,7 +132,7 @@ migrations/           Alembic (async), 0001_initial.py as the template
 tests/                pytest; RLS integration test with pgserver
 docker/               Postgres init (app role), LiteLLM config
 docs/                 adr/, agents/ (skill config), frontend.md, mobile.md, deployment.md
-app/operator/          operator tool: audited dispatch, tenant lookup, tenant listing, `create` (scripts/operator.py entry point; replaces scripts/seed.py)
+app/operator/          operator tool: audited dispatch, tenant lookup, tenant listing, `create`, `suspend`/`unsuspend`, `erase` (scripts/operator.py entry point; replaces scripts/seed.py)
 ```
 
 ## Do not touch without checking first

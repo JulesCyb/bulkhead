@@ -1,6 +1,6 @@
 # ADR-0010: Tenant lifecycle is an operator tool now, a control-plane API with the second customer
 
-- **Status:** proposed
+- **Status:** accepted
 - **Date:** 2026-09-12
 - **Deciders:** JulesCyb
 - **Skill version:** ai-app-blueprints v2.0.0 (research 2026-08)

@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 from app.migration_settings import get_migration_settings
 from app.operator.audit import UNSCOPED_TENANT_ID, record_action
 from app.operator.create import create_tenant
+from app.operator.erase import erase_tenant, record_erasure
 from app.operator.listing import list_tenants
 from app.operator.suspend import set_tenant_suspended
 
@@ -117,6 +118,30 @@ async def _run_create(conn: AsyncConnection, args: argparse.Namespace) -> tuple[
     return outcome, result.tenant_id
 
 
+async def _run_erase(conn: AsyncConnection, args: argparse.Namespace) -> tuple[str, UUID]:
+    result = await erase_tenant(
+        conn,
+        args.identifier,
+        dry_run=args.dry_run,
+        dedicated_db_admin_url=args.dedicated_db_admin_url,
+    )
+    for step in result.steps:
+        print(f"{step.step}: {step.outcome}")
+    if result.dry_run:
+        outcome = f"dry-run: {result.name!r} ({result.tenant_id}) -- no changes made"
+    else:
+        assert result.backup_horizon is not None
+        print(f"backup horizon: {result.backup_horizon.isoformat()}")
+        # Written whether or not every step succeeded (see app.operator.erase's module
+        # docstring): a partial failure must still be visible on the erasure record, and a
+        # re-run only needs to retry what this record shows as not yet done.
+        await record_erasure(conn, result)
+        prefix = "partial" if result.any_step_failed else "ok"
+        verb = "partially erased (see steps above)" if result.any_step_failed else "erased"
+        outcome = f"{prefix}: {verb} {result.name!r} ({result.tenant_id})"
+    return outcome, result.tenant_id
+
+
 # Every command's target tenant id for the audit log. `list` has none -- it targets every
 # tenant, not one -- so it uses the documented sentinel (see app.operator.audit). Every other
 # command resolves or mints a real tenant id as part of its own work, so it returns that id here
@@ -126,6 +151,7 @@ _COMMANDS = {
     "suspend": _run_suspend,
     "unsuspend": _run_unsuspend,
     "create": _run_create,
+    "erase": _run_erase,
 }
 
 
@@ -238,6 +264,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--subject",
         default=None,
         help="identity subject to match/create (default: the admin email)",
+    )
+
+    erase_parser = sub.add_parser(
+        "erase",
+        help="Irreversibly erase a suspended tenant everywhere its data lives (ADR-0010). "
+        "Refuses to run against a tenant that is not currently suspended.",
+    )
+    erase_parser.add_argument("identifier", help="tenant id or unambiguous name")
+    erase_parser.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help="report every step erase would take without removing anything",
+    )
+    erase_parser.add_argument(
+        "--dedicated-db-admin-url",
+        dest="dedicated_db_admin_url",
+        default=None,
+        help="required only to actually drop a dedicated tenant's database: an admin connection "
+        "(DROP DATABASE privilege) to the Postgres server hosting it. Used only for this "
+        "invocation, never stored; redacted from the operator-action log.",
     )
     return parser
 

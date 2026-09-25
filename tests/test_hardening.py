@@ -83,6 +83,42 @@ def test_settings_valid_configuration_constructs_cleanly():
     assert other.residency_route != settings.residency_route
 
 
+def test_settings_backup_retention_days_has_a_documented_default(monkeypatch):
+    """Seam 2 (Spec 9 / #72, ADR-0010): the backup-retention window parses from configuration
+    with a documented default -- no database involved. `BACKUP_RETENTION_DAYS` overrides it, same
+    convention as every other env-backed field on `Settings`."""
+    monkeypatch.delenv("BACKUP_RETENTION_DAYS", raising=False)
+    default_settings = Settings(
+        embedding_provider="openai", embedding_model="text-embedding-3-small", residency="eu"
+    )
+    assert default_settings.backup_retention_days == 30
+
+    monkeypatch.setenv("BACKUP_RETENTION_DAYS", "14")
+    overridden = Settings(
+        embedding_provider="openai", embedding_model="text-embedding-3-small", residency="eu"
+    )
+    assert overridden.backup_retention_days == 14
+
+
+def test_erasure_backup_horizon_reflects_the_configured_retention_setting():
+    """Seam 2: an erasure record's computed backup-horizon date reflects
+    `Settings.backup_retention_days` -- a pure function, tested at the Settings level, no
+    database or operator-tool connection involved (`app.operator.erase.compute_backup_horizon`)."""
+    from datetime import UTC, datetime
+
+    from app.operator.erase import compute_backup_horizon
+
+    settings = Settings(
+        embedding_provider="openai",
+        embedding_model="text-embedding-3-small",
+        residency="eu",
+        backup_retention_days=45,
+    )
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    horizon = compute_backup_horizon(settings=settings, now=now)
+    assert horizon == datetime(2026, 2, 15, tzinfo=UTC)
+
+
 # --- Fail-closed configuration: no permissive defaults, secrets never printed (issue #14) ---
 
 
