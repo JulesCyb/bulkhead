@@ -84,7 +84,7 @@ app/llm.py            provider abstraction; app/embeddings.py; app/observability
 migrations/           Alembic (async), 0001_initial.py as the template
 tests/                pytest; RLS integration test with pgserver
 docker/               Postgres init (app role), LiteLLM config
-docs/                 adr/, frontend.md, mobile.md, deployment.md
+docs/                 adr/, agents/ (skill config), frontend.md, mobile.md, deployment.md
 scripts/seed.py       first tenant + user
 ```
 
@@ -92,3 +92,17 @@ scripts/seed.py       first tenant + user
 
 - RLS policies, roles, and grants in `migrations/` and `docker/postgres/01-init.sh`
 - `app/context.py`, `app/deps.py`, `app/db/session.py`
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in GitHub Issues of `JulesCyb/ai-app-starter` (via the `gh` CLI). See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five default triage labels (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` at the repo root and ADRs in `docs/adr/`. See `docs/agents/domain.md`.
