@@ -25,7 +25,8 @@ ADR wins — then update this file.
 ```bash
 uv sync                                   # environment (+ --extra observability, --group dbtest)
 docker compose up -d --wait postgres      # database locally
-uv run alembic upgrade head               # migrations (owner role, DATABASE_URL_MIGRATIONS)
+uv run python scripts/migrate.py          # migrations run once per database alias: every alias to head
+uv run python scripts/migrate.py <alias>  # migrations for just that one alias (owner role)
 uv run python scripts/seed.py "My Tenant" me@example.com   # first tenant + user
 uv run python scripts/provision_roles.py <admin-database-url>  # managed Postgres, no init hook
 uv run uvicorn app.main:app --reload      # API locally, http://localhost:8000/docs
