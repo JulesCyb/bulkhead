@@ -312,10 +312,11 @@ async def test_new_table_gets_no_default_privileges(database_urls):
 
 
 async def test_app_has_no_dml_on_control_schema_only_select_on_the_view(database_urls):
-    """The control-plane schema (#12, extended by #22): `app` gets no INSERT/UPDATE/DELETE
-    anywhere in `control`, only SELECT on the two exposed read-only views (tenant facts,
-    identity lookup) -- plus, separately, EXECUTE on the one narrow function (#22, asserted in
-    its own test), which is not a table privilege at all."""
+    """The control-plane schema (#12, extended by #22, #77): `app` gets no INSERT/UPDATE/DELETE
+    anywhere in `control`, only SELECT on the three exposed read-only views (tenant facts,
+    identity lookup, database-alias enumeration for the runtime guard) -- plus, separately,
+    EXECUTE on the one narrow function (#22, asserted in its own test), which is not a table
+    privilege at all."""
     engine = create_async_engine(database_urls["app"])
     async with engine.connect() as conn:
         table_grants = (
@@ -327,7 +328,11 @@ async def test_app_has_no_dml_on_control_schema_only_select_on_the_view(database
             )
         ).all()
     await engine.dispose()
-    assert set(table_grants) == {("tenants_view", "SELECT"), ("identity_lookup", "SELECT")}
+    assert set(table_grants) == {
+        ("tenants_view", "SELECT"),
+        ("identity_lookup", "SELECT"),
+        ("database_aliases", "SELECT"),
+    }
 
 
 async def test_app_can_update_own_settings_but_not_other_tenant_columns(
@@ -431,7 +436,10 @@ async def test_control_tenants_owned_by_app_owner_never_app(database_urls):
 
 async def test_control_tenants_has_forced_rls_with_using_and_check(database_urls):
     """`control.tenants` carries forced RLS with a policy that both restricts and validates,
-    the same shape as every other tenant-scoped table (#12)."""
+    the same shape as every other tenant-scoped table (#12). Named explicitly:
+    `control_tenants_no_context_enumeration` (0017 / #77) is a second, deliberately narrower
+    policy -- `SELECT`-only, no `WITH CHECK` -- that lets the runtime guard enumerate database
+    aliases over a `control_session()`; it is not this policy and is asserted separately below."""
     engine = create_async_engine(database_urls["migrations"])
     async with engine.connect() as conn:
         row = (
@@ -447,7 +455,17 @@ async def test_control_tenants_has_forced_rls_with_using_and_check(database_urls
             await conn.execute(
                 text(
                     "SELECT qual IS NOT NULL, with_check IS NOT NULL FROM pg_policies "
-                    "WHERE schemaname = 'control' AND tablename = 'tenants'"
+                    "WHERE schemaname = 'control' AND tablename = 'tenants' "
+                    "AND policyname = 'control_tenants_tenant_isolation'"
+                )
+            )
+        ).one()
+        enumeration_policy = (
+            await conn.execute(
+                text(
+                    "SELECT cmd, qual IS NOT NULL, with_check IS NOT NULL FROM pg_policies "
+                    "WHERE schemaname = 'control' AND tablename = 'tenants' "
+                    "AND policyname = 'control_tenants_no_context_enumeration'"
                 )
             )
         ).one()
@@ -456,6 +474,9 @@ async def test_control_tenants_has_forced_rls_with_using_and_check(database_urls
     assert row.relforcerowsecurity is True
     assert policy[0] is True
     assert policy[1] is True
+    assert enumeration_policy[0] == "SELECT"
+    assert enumeration_policy[1] is True
+    assert enumeration_policy[2] is False
 
 
 async def _public_schema_tenant_isolation_violations(conn, exceptions: frozenset[str]) -> dict:
@@ -1120,8 +1141,14 @@ async def test_tenants_view_still_select_only_after_adding_isolation_columns(dat
             .all()
         )
     await engine.dispose()
-    # identity_lookup (0003) is the only other object app may read; nothing but SELECT anywhere.
-    assert set(table_grants) == {("tenants_view", "SELECT"), ("identity_lookup", "SELECT")}
+    # identity_lookup (0003) and database_aliases (0017 / #77, granted so the runtime guard can
+    # enumerate every referenced alias) are the only other objects app may read; nothing but
+    # SELECT anywhere.
+    assert set(table_grants) == {
+        ("tenants_view", "SELECT"),
+        ("identity_lookup", "SELECT"),
+        ("database_aliases", "SELECT"),
+    }
     assert {"isolation_tier", "database_alias"} <= set(columns)
 
 
@@ -1329,13 +1356,27 @@ async def test_role_rls_guard_raises_for_a_table_missing_forced_rls(database_url
         await owner_engine.dispose()
 
 
-async def test_ready_endpoint_succeeds_against_real_postgres_as_the_app_role(app_settings):
+async def test_ready_endpoint_succeeds_against_real_postgres_as_the_app_role(
+    app_settings, database_urls
+):
     """ASGI seam, real backing Postgres (issue #15): the readiness endpoint's default
     dependency — left as-is, not overridden with a fake — succeeds against a real,
-    correctly-configured connection as the unprivileged `app` role."""
+    correctly-configured connection as the unprivileged `app` role. The guard (#77) now also
+    enumerates dedicated aliases; this module-scoped instance is shared with earlier tests that
+    deliberately seed a dedicated tenant with no matching secret file
+    (`test_database_aliases_view_enumerates_distinct_aliases`), so that alias is cleared here
+    first -- this test is only about the pooled path succeeding, not about a dangling alias
+    another test left behind."""
     import httpx
 
     from app.main import app as main_app
+
+    superuser_engine = create_async_engine(database_urls["superuser"])
+    async with superuser_engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE control.tenants SET isolation_tier = 'pooled', database_alias = NULL")
+        )
+    await superuser_engine.dispose()
 
     transport = httpx.ASGITransport(app=main_app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
