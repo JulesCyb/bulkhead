@@ -47,7 +47,10 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    true)::uuid` (USING and WITH CHECK) plus a GRANT to the `app` role, and must be added to the
    tenant-table registry (`app/db/tenant_tables.py`). Template: `migrations/versions/0001_initial.py`.
 3. **DB access only through repositories** (`app/repositories/`) with sessions from
-   `tenant_session(ctx)`. The app connects as `app` (no superuser, `NOBYPASSRLS`); migrations and
+   `tenant_session(ctx)`. `tenant_session(ctx)` resolves which engine to use internally, from the
+   tenant's isolation tier and database alias in the control plane (ADR-0002) — pooled by
+   default — with no change to how callers use it: same signature, same transaction behaviour.
+   The app connects as `app` (no superuser, `NOBYPASSRLS`); migrations and
    seed run as the separate `app_owner` role (no superuser, `NOBYPASSRLS`, owns every object) via
    `DATABASE_URL_MIGRATIONS` — a DSN the API container's own configuration never holds.
 4. **Agents access data only through tools** (`app/tools/`) that check the context and return only

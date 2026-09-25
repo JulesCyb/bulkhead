@@ -1,6 +1,6 @@
 # ADR-0002: Hybrid tenant isolation — pooled by default, dedicated database on demand
 
-- **Status:** proposed (decided on judgement, no contractual demand yet — see "Revisit when")
+- **Status:** accepted (decided on judgement, no contractual demand yet — see "Revisit when")
 - **Date:** 2026-09-12
 - **Deciders:** JulesCyb
 - **Skill version:** ai-app-blueprints v2.0.0 (research 2026-08)
