@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from app.agents.assistant import AssistantDeps, run_assistant, stream_assistant
 from app.deps import Context
+from app.request_limit import RequestLimit
 
 
 def _sse(data: str) -> str:
@@ -35,13 +36,13 @@ class RunResponse(BaseModel):
 
 
 @router.post("/assistant/run", response_model=RunResponse)
-async def run(body: RunRequest, ctx: Context) -> RunResponse:
+async def run(body: RunRequest, ctx: Context, _limit: RequestLimit) -> RunResponse:
     output = await run_assistant(body.prompt, AssistantDeps(ctx=ctx))
     return RunResponse(output=output)
 
 
 @router.post("/assistant/stream")
-async def stream(body: RunRequest, ctx: Context) -> StreamingResponse:
+async def stream(body: RunRequest, ctx: Context, _limit: RequestLimit) -> StreamingResponse:
     async def events() -> AsyncIterator[str]:
         async with stream_assistant(body.prompt, AssistantDeps(ctx=ctx)) as result:
             async for delta in result.stream_text(delta=True):

@@ -13,6 +13,7 @@ from pydantic_ai.ui.vercel_ai import VercelAIAdapter
 from app.agents.assistant import AssistantDeps, assistant
 from app.deps import Context
 from app.llm import get_model
+from app.request_limit import RequestLimit
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
@@ -22,7 +23,7 @@ MAX_BODY_BYTES = 200_000
 
 
 @router.post("/chat")
-async def chat(request: Request, ctx: Context) -> Response:
+async def chat(request: Request, ctx: Context, _limit: RequestLimit) -> Response:
     if int(request.headers.get("content-length") or 0) > MAX_BODY_BYTES:
         raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "Request body too large")
     deps = AssistantDeps(ctx=ctx)

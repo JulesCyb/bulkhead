@@ -100,6 +100,16 @@ class Settings(BaseSettings):
     mcp_tenant_id: str | None = None
     mcp_user_id: str | None = None
 
+    # Per-membership request limit on the agent-facing routes (/agents/assistant/run,
+    # /agents/assistant/stream, /api/chat): a single-process, best-effort backstop against a
+    # stuck client or a scripted flood, keyed on (tenant_id, user_id). It is NOT the enforcement
+    # of record for spend — that is the model gateway's own per-tenant budget; this only keeps a
+    # single member's flood from denting that budget before the gateway ever notices, and only
+    # within this one process (a multi-replica deployment needs a shared store for the same
+    # guarantee — not implemented here).
+    request_limit_max: int = 30
+    request_limit_window_seconds: float = 60.0
+
     @model_validator(mode="after")
     def _require_embedding_config(self) -> "Settings":
         if not self.embedding_provider:
