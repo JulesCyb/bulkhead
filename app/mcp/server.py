@@ -3,8 +3,8 @@
 Payoff: Claude Code / Claude Desktop during development, managed platforms later — without
 rewriting the tools.
 
-Context: in production, the tenant/user context comes from the MCP connection's
-authentication (OAuth/token). For local development, from MCP_TENANT_ID / MCP_USER_ID.
+Context: in production, the tenant/identity context comes from the MCP connection's
+authentication (OAuth/token). For local development, from MCP_TENANT_ID / MCP_IDENTITY_ID.
 
 Start (stdio, e.g. in Claude Code's .mcp.json):
     uv run python -m app.mcp.server
@@ -32,12 +32,12 @@ server = MCPServer(
 
 def _context_from_env() -> RequestContext:
     s = get_settings()
-    if not (s.mcp_tenant_id and s.mcp_user_id):
-        raise RuntimeError("Set MCP_TENANT_ID and MCP_USER_ID (development only).")
-    return RequestContext(tenant_id=UUID(s.mcp_tenant_id), user_id=UUID(s.mcp_user_id))
+    if not (s.mcp_tenant_id and s.mcp_identity_id):
+        raise RuntimeError("Set MCP_TENANT_ID and MCP_IDENTITY_ID (development only).")
+    return RequestContext(tenant_id=UUID(s.mcp_tenant_id), identity_id=UUID(s.mcp_identity_id))
 
 
-# The seam for production: replace this with a function that derives tenant/user from the
+# The seam for production: replace this with a function that derives tenant/identity from the
 # MCP connection's authentication (OAuth/token). Anything but the env fallback MUST be
 # per-connection — a process-wide identity on a shared transport would leak tenants.
 context_provider: Callable[[], RequestContext] = _context_from_env

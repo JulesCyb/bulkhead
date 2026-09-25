@@ -15,7 +15,7 @@ ADR wins — then update this file.
 - Models: `LLM_MODEL` in `<provider>:<model>` format, optionally through the LiteLLM gateway (`app/llm.py`)
 - Data: PostgreSQL 17 + pgvector, RLS on, app role `app` (no superuser)
 - Observability: Langfuse via OTel (`app/observability.py`, optionally `logfire`)
-- Frontend: none in this repo — Next.js + Vercel AI SDK against `POST /api/chat`, see `docs/frontend.md`; a mobile app as another client, see `docs/mobile.md`
+- Frontend: none in this repo — Next.js + Vercel AI SDK against `POST /v1/t/{tenant_id}/api/chat`, see `docs/frontend.md`; a mobile app as another client, see `docs/mobile.md`
 - Operations: Docker Compose (`docker-compose.yml`), hosted in an EU region
 
 ## Commands
@@ -25,6 +25,7 @@ uv sync                                   # environment (+ --extra observability
 docker compose up -d --wait postgres      # database locally
 uv run alembic upgrade head               # migrations (owner role, DATABASE_URL_MIGRATIONS)
 uv run python scripts/seed.py "My Tenant" me@example.com   # first tenant + user
+uv run python scripts/provision_roles.py <admin-database-url>  # managed Postgres, no init hook
 uv run uvicorn app.main:app --reload      # API locally, http://localhost:8000/docs
 uv run pytest                             # tests (must be green before every commit)
 uv run pytest tests/test_rls_integration.py   # real RLS test (needs: uv sync --group dbtest)
@@ -36,11 +37,12 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
 
 ## Architecture rules — non-negotiable
 
-1. **Context object**: `RequestContext(tenant_id, user_id, roles)` is created in `app/deps.py` and
+1. **Context object**: `RequestContext(tenant_id, identity_id, roles)` is created in `app/deps.py` and
    passed through every request, agent run, tool call, and job. No global state.
 2. **Every new table** has `tenant_id uuid NOT NULL REFERENCES tenants(id)`, an index on it,
    `ENABLE`/`FORCE ROW LEVEL SECURITY`, and a policy `tenant_id = current_setting('app.tenant_id',
-   true)::uuid` (USING and WITH CHECK) plus a GRANT to the `app` role. Template: `migrations/versions/0001_initial.py`.
+   true)::uuid` (USING and WITH CHECK) plus a GRANT to the `app` role, and must be added to the
+   tenant-table registry (`app/db/tenant_tables.py`). Template: `migrations/versions/0001_initial.py`.
 3. **DB access only through repositories** (`app/repositories/`) with sessions from
    `tenant_session(ctx)`. The app connects as `app` (no superuser, `NOBYPASSRLS`); migrations and
    seed use `DATABASE_URL_MIGRATIONS`.
@@ -51,7 +53,7 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    (prompt-injection surface), never as instructions.
 5. **Integrations as MCP servers** (`app/mcp/server.py`) using the same functions from `app/tools/`.
 6. **Models via `app/llm.py`**; the model name comes from configuration or `tenants.settings["model"]`.
-7. **Every agent run is traced** (Langfuse/OTel) with `tenant_id`, `user_id`, `request_id`
+7. **Every agent run is traced** (Langfuse/OTel) with `tenant_id`, `identity_id`, `request_id`
    (`RequestContext.trace_attributes()` as `metadata`).
 8. **Cache keys** include the `tenant_id`.
 9. **No secrets in the repo**; keep `.env.example` current.
@@ -78,7 +80,7 @@ app/db/               engine, tenant_session(), models
 app/repositories/     data access (the only path to the DB)
 app/tools/            tool functions (agent + MCP)
 app/agents/           PydanticAI agents
-app/api/              routers: /health, /agents/assistant/{run,stream}, /api/chat
+app/api/              routers: /health, /v1/t/{tenant_id}/agents/assistant/{run,stream}, /v1/t/{tenant_id}/api/chat
 app/mcp/server.py     MCP server (stdio)
 app/llm.py            provider abstraction; app/embeddings.py; app/observability.py
 migrations/           Alembic (async), 0001_initial.py as the template
@@ -91,7 +93,11 @@ scripts/seed.py       first tenant + user
 ## Do not touch without checking first
 
 - RLS policies, roles, and grants in `migrations/` and `docker/postgres/01-init.sh`
-- `app/context.py`, `app/deps.py`, `app/db/session.py`
+- The tenant-table registry (`app/db/tenant_tables.py`) — it drives RLS migration tooling and,
+  later, tenant erasure; removing a table from it silently drops its RLS/erasure coverage
+- `app/context.py`, `app/deps.py`, `app/db/session.py` — changes here are authorized by
+  ADR-0003 (identity and membership) and ADR-0012 (tenant in the path); check those first
+  before editing, rather than treating a matching change as an unreviewed edit
 
 ## Agent skills
 

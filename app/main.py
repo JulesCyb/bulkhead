@@ -9,7 +9,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import APIRouter, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import agents, chat, health
@@ -52,9 +52,29 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.middleware("http")
+    async def add_request_id_header(request: Request, call_next):
+        """Every authenticated response carries the context's own request id back as a header
+        (app/deps.py's get_context stashes it on request.state), so a member's bug report or
+        an on-call engineer's log line can be tied to the exact request without reading any
+        conversation content. A request that fails before a context exists (e.g. missing
+        identity/tenant headers) never reaches this far with request.state.request_id set, so
+        its existing error response is unchanged."""
+        response = await call_next(request)
+        request_id = getattr(request.state, "request_id", None)
+        if request_id:
+            response.headers["X-Request-Id"] = request_id
+        return response
+
+    # ADR-0012: every tenant-scoped route lives under /v1/t/{tenant_id}/ — the path segment is
+    # the request's sole statement of intent. `health` is not tenant-scoped and stays outside it.
+    tenant_router = APIRouter(prefix="/v1/t/{tenant_id}")
+    tenant_router.include_router(agents.router)
+    tenant_router.include_router(chat.router)
+
     app.include_router(health.router)
-    app.include_router(agents.router)
-    app.include_router(chat.router)
+    app.include_router(tenant_router)
     return app
 
 

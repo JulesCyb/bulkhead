@@ -1,8 +1,15 @@
 """FastAPI dependencies: context from the request, a tenant-bound DB session.
 
-AUTH_MODE=dev-headers reads X-Tenant-Id / X-User-Id / X-Roles from the headers — for local
-development ONLY. Implement AUTH_MODE=jwt before production (verify the OIDC token, then
-build the context from its claims).
+Every tenant-scoped route lives under `/v1/t/{tenant_id}/` (ADR-0012) — the tenant id in the
+URL path is the request's sole statement of intent; nothing else may name the tenant, so no
+stray client-supplied header can override it.
+
+AUTH_MODE=dev-headers reads X-Identity-Id / X-Roles from the headers — for local development
+ONLY. Implement AUTH_MODE=jwt before production (verify the OIDC token, then build the context
+from its claims; the token's audience must match the path's tenant id). X-Roles is a
+development-only convenience that lets a caller assert its own roles directly; it has no
+production equivalent — under AUTH_MODE=jwt, roles come from exactly one place, the caller's
+membership row, never from a client-supplied header.
 """
 
 from __future__ import annotations
@@ -11,7 +18,7 @@ from collections.abc import AsyncIterator
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, Path, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings, get_settings
@@ -20,24 +27,31 @@ from app.db.session import tenant_session
 
 
 async def get_context(
+    request: Request,
     settings: Annotated[Settings, Depends(get_settings)],
-    x_tenant_id: Annotated[str | None, Header()] = None,
-    x_user_id: Annotated[str | None, Header()] = None,
+    tenant_id: Annotated[UUID, Path()],
+    x_identity_id: Annotated[str | None, Header()] = None,
     x_roles: Annotated[str | None, Header()] = None,
     authorization: Annotated[str | None, Header()] = None,
 ) -> RequestContext:
     if settings.auth_mode == "dev-headers":
-        if not x_tenant_id or not x_user_id:
+        if not x_identity_id:
             raise HTTPException(
                 status.HTTP_401_UNAUTHORIZED,
-                "X-Tenant-Id and X-User-Id are missing (AUTH_MODE=dev-headers)",
+                "X-Identity-Id is missing (AUTH_MODE=dev-headers)",
             )
         try:
-            tenant_id, user_id = UUID(x_tenant_id), UUID(x_user_id)
+            identity_id = UUID(x_identity_id)
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid UUID in header") from exc
         roles = frozenset(r.strip() for r in (x_roles or "").split(",") if r.strip())
-        return RequestContext(tenant_id=tenant_id, user_id=user_id, roles=roles)
+        ctx = RequestContext(tenant_id=tenant_id, identity_id=identity_id, roles=roles)
+        # Stashed on request.state (not returned as a header here) so the ASGI middleware in
+        # app/main.py can attach it to the response regardless of the route's return type
+        # (JSONResponse, StreamingResponse, or the chat endpoint's Vercel AI stream), and so a
+        # request that fails before a context exists never gets the header at all.
+        request.state.request_id = ctx.request_id
+        return ctx
 
     # AUTH_MODE=jwt: verify the bearer token (signature, issuer, expiry) and read the claims.
     # Deliberately not implemented "somehow" — wrong auth is worse than none.

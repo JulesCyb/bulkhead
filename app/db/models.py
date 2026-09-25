@@ -2,6 +2,13 @@
 
 New table? Four mandatory parts in the migration: tenant_id NOT NULL REFERENCES tenants(id),
 an index on tenant_id, ENABLE + FORCE ROW LEVEL SECURITY, a policy with USING and WITH CHECK.
+
+An embedded-Postgres integration test (`tests/test_rls_integration.py`,
+`test_public_schema_tenant_isolation_invariant`) walks every table actually present in the
+`public` schema and fails the build if one of them is missing forced RLS or a policy that both
+restricts (USING) and validates (WITH CHECK) against `app.tenant_id` — unless that table is
+named in `TENANT_ISOLATION_EXCEPTIONS` below. A legitimately tenant-less table is added to that
+one set, never to a second, separate list that could drift from what the test enforces.
 """
 
 from __future__ import annotations
@@ -16,6 +23,13 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 EMBEDDING_DIMENSIONS = 1536
+
+# Tables in the public schema exempt from the tenant-isolation invariant test. Only the
+# bookkeeping table Alembic itself creates (`alembic_version`, tracking which migrations have
+# run) belongs here: it holds no tenant data, is not created by any migration in this repo, and
+# exists before the first tenant does. Adding a genuinely tenant-less table to the schema means
+# adding it here — nowhere else — so the test and the checklist above can never drift apart.
+TENANT_ISOLATION_EXCEPTIONS: frozenset[str] = frozenset({"alembic_version"})
 
 
 class Base(DeclarativeBase):

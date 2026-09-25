@@ -1,5 +1,5 @@
-"""The Vercel AI SDK chat adapter (/api/chat) picks up the same run limits as the other two
-agent entry points, via ASGI — search and model replaced, no real model call.
+"""The Vercel AI SDK chat adapter (/v1/t/{tenant_id}/api/chat) picks up the same run limits as
+the other two agent entry points, via ASGI — search and model replaced, no real model call.
 """
 
 from __future__ import annotations
@@ -23,7 +23,13 @@ from tests.conftest import (
     make_stalling_stream_model,
 )
 
-AUTH_HEADERS = {"X-Tenant-Id": str(uuid.uuid4()), "X-User-Id": str(uuid.uuid4())}
+
+def _headers() -> dict[str, str]:
+    return {"X-Identity-Id": str(uuid.uuid4())}
+
+
+def _chat_path() -> str:
+    return f"/v1/t/{uuid.uuid4()}/api/chat"
 
 
 def _submit_message_body(text: str = "hi") -> dict:
@@ -61,7 +67,7 @@ async def test_chat_maps_tool_call_ceiling_to_an_error_chunk(client, small_run_l
         lambda name: FunctionModel(looping_tool_calls, stream_function=looping_tool_calls_stream),
     )
     async with client:
-        response = await client.post("/api/chat", json=_submit_message_body(), headers=AUTH_HEADERS)
+        response = await client.post(_chat_path(), json=_submit_message_body(), headers=_headers())
     assert response.status_code == 200, response.text
     assert '"type":"error"' in response.text
     assert response.text.strip().endswith("data: [DONE]")
@@ -81,7 +87,7 @@ async def test_chat_maps_wall_clock_deadline_to_a_distinct_error(
     )
     async with client:
         response = await asyncio.wait_for(
-            client.post("/api/chat", json=_submit_message_body(), headers=AUTH_HEADERS),
+            client.post(_chat_path(), json=_submit_message_body(), headers=_headers()),
             timeout=5,
         )
     assert response.status_code == 200, response.text
@@ -94,6 +100,6 @@ async def test_chat_within_limits_completes_normally(client, small_run_limits, m
     small_run_limits()
     monkeypatch.setattr(chat_module, "get_model", lambda name: TestModel())
     async with client:
-        response = await client.post("/api/chat", json=_submit_message_body(), headers=AUTH_HEADERS)
+        response = await client.post(_chat_path(), json=_submit_message_body(), headers=_headers())
     assert response.status_code == 200, response.text
     assert '"type":"error"' not in response.text

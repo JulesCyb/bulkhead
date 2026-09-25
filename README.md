@@ -20,7 +20,7 @@ This is a working agent backend — FastAPI + PydanticAI behind an HTTP API — 
 
 ## The idea in four sentences
 
-The agent logic runs as its own service with an HTTP API — web, mobile, and Claude Code are just three clients of the same interface. Every request produces a **context object** (`tenant_id`, `user_id`, roles) that is passed through agent, tools, repository, and down into the database transaction; nothing reads global state. In the database, **Row-Level Security** enforces tenant separation — not developer discipline. And the agent never sees a DB connection: it reaches data exclusively through tools that run with the logged-in user's permissions.
+The agent logic runs as its own service with an HTTP API — web, mobile, and Claude Code are just three clients of the same interface. Every request produces a **context object** (`tenant_id`, `identity_id`, roles) that is passed through agent, tools, repository, and down into the database transaction; nothing reads global state. In the database, **Row-Level Security** enforces tenant separation — not developer discipline. And the agent never sees a DB connection: it reaches data exclusively through tools that run with the logged-in user's permissions.
 
 ## Quickstart
 
@@ -36,9 +36,9 @@ uv run uvicorn app.main:app --reload
 First call (dev headers are enough locally):
 
 ```bash
-curl -X POST localhost:8000/agents/assistant/run \
+curl -X POST localhost:8000/v1/t/<TENANT>/agents/assistant/run \
   -H 'Content-Type: application/json' \
-  -H 'X-Tenant-Id: <TENANT>' -H 'X-User-Id: <USER>' \
+  -H 'X-Identity-Id: <IDENTITY>' \
   -d '{"prompt": "What do my documents say about notice periods?"}'
 ```
 
@@ -48,15 +48,15 @@ Tests: `uv run pytest` — the RLS integration test is skipped when `pgserver` i
 
 | Building block | File | Purpose |
 |---|---|---|
-| Context object | `app/context.py` | `tenant_id`, `user_id`, roles — passed through everywhere |
-| Auth (dev) | `app/deps.py` | `X-Tenant-Id`/`X-User-Id` headers locally; JWT slot prepared |
+| Context object | `app/context.py` | `tenant_id`, `identity_id`, roles — passed through everywhere |
+| Auth (dev) | `app/deps.py` | tenant from the URL path, `X-Identity-Id` header locally; JWT slot prepared |
 | Tenant session | `app/db/session.py` | `set_config('app.tenant_id', …)` per transaction |
 | Schema + RLS | `migrations/versions/0001_initial.py` | tenants, users, documents (vector 1536), policies, grants |
 | App role | `docker/postgres/01-init.sh` | `app` without superuser/BYPASSRLS — otherwise RLS is void |
 | Repository | `app/repositories/documents.py` | the only path to the DB, vector search |
 | Tools | `app/tools/documents.py` | context-aware search, shared by agent and MCP |
 | Agent | `app/agents/assistant.py` | PydanticAI agent, model resolved at runtime, tracing metadata |
-| API | `app/api/` | `/agents/assistant/run`, `/agents/assistant/stream` (SSE), `/api/chat` (Vercel AI SDK) |
+| API | `app/api/` | `/v1/t/{tenant_id}/agents/assistant/run`, `/v1/t/{tenant_id}/agents/assistant/stream` (SSE), `/v1/t/{tenant_id}/api/chat` (Vercel AI SDK) |
 | MCP server | `app/mcp/server.py` | the same tools for Claude Code / Claude Desktop |
 | Models | `app/llm.py`, `app/embeddings.py` | provider abstraction, LiteLLM option |
 | Tracing | `app/observability.py` | Langfuse via OTel (optional) |
@@ -92,6 +92,9 @@ In full, with commands and conventions: [`CLAUDE.md`](CLAUDE.md).
    [`docs/mobile.md`](docs/mobile.md) (Android/iOS), [`docs/deployment.md`](docs/deployment.md).
 7. **Implement `AUTH_MODE=jwt` before anything is publicly reachable.** The dev headers are for
    localhost and nowhere else.
+8. **On managed Postgres with no first-boot container hook** (RDS, Neon, Supabase, Cloud SQL),
+   run `uv run python scripts/provision_roles.py <admin-database-url>` once instead of
+   `docker/postgres/01-init.sh` — same `app_owner`/`app` roles and grants, safe to run again.
 
 ## Deliberately not included
 
