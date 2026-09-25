@@ -35,6 +35,8 @@ packages = ["app"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Settings reads /run/secrets (ADR-0011); it does not exist outside a container.
+filterwarnings = ['ignore:directory "/run/secrets" does not exist']
 
 [tool.ruff]
 line-length = 100
