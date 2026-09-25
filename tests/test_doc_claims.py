@@ -15,6 +15,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from app.config import RESIDENCY_ALLOW_LIST, Settings
+from app.tenant_settings import TenantSettings
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 README = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
@@ -69,9 +72,14 @@ def test_readme_states_isolation_is_by_tenant_not_by_member() -> None:
     assert "per-member visibility is not implemented" in README
 
 
-def test_readme_states_residency_is_an_open_decision() -> None:
-    assert "not yet implemented" in README
+def test_readme_states_residency_is_delivered_not_an_open_decision() -> None:
+    # Spec 8's closing ticket (#63): residency routing (#58, #59, #60, #61, #62) landed, so the
+    # README's "not yet implemented" wording from Spec 1 (#19) is now itself a false claim -- the
+    # opposite problem this file exists to catch. It is replaced with a pointer at the real,
+    # testable claim in docs/residency.md, and ADR-0008 is cited as accepted.
+    assert "not yet implemented" not in README
     assert "ADR-0008" in README
+    assert "docs/residency.md" in README
 
 
 def test_deployment_docs_describe_the_actual_env_allow_list() -> None:
@@ -273,6 +281,126 @@ def test_adr_0004_names_all_four_roles_and_cross_references_adr_0005() -> None:
 def test_architecture_svg_caption_matches_tenant_wide_visibility() -> None:
     assert "the logged-in user's permissions" not in ARCHITECTURE_SVG
     assert "Tenant-wide visibility, roles gate actions" in ARCHITECTURE_SVG
+
+
+# Spec 8's closing ticket (#63): the residency/tracing claim in the outward-facing docs, the
+# sub-processor list, and the worked "add a second residency" recipe are checked directly against
+# the Settings/allow-list objects the code actually enforces, not against a second copy of the
+# same prose -- so a change to RESIDENCY_ALLOW_LIST, Settings, or TenantSettings that isn't
+# reflected in docs/residency.md fails this file instead of only being caught by a human review.
+
+RESIDENCY_MD = (REPO_ROOT / "docs" / "residency.md").read_text(encoding="utf-8")
+ADR_0008 = (REPO_ROOT / "docs" / "adr" / "0008-residency-per-tenant.md").read_text(encoding="utf-8")
+MCP_SERVER_SOURCE = (REPO_ROOT / "app" / "mcp" / "server.py").read_text(encoding="utf-8")
+
+
+def test_adr_0008_is_accepted_not_proposed() -> None:
+    status_line = next(line for line in ADR_0008.splitlines() if line.startswith("- **Status:**"))
+    assert "accepted" in status_line
+    assert "proposed" not in status_line
+
+
+def test_residency_doc_claim_names_what_the_code_actually_enforces() -> None:
+    # Each named guarantee cross-checked against the object the running code builds, not just
+    # against itself as a string.
+    assert "per-tenant residency setting" in RESIDENCY_MD
+    assert "control.tenants.residency" in RESIDENCY_MD
+
+    assert "startup allow-list check" in RESIDENCY_MD
+    assert "run_startup_checks" in RESIDENCY_MD
+
+    # "No default embedding provider": the doc's claim is only true if Settings really has no
+    # default for either field.
+    assert Settings.model_fields["embedding_provider"].default is None
+    assert Settings.model_fields["embedding_model"].default is None
+    assert "no default embedding provider" in RESIDENCY_MD.lower()
+
+    # "Content-free tracing by default": true only if TenantSettings really defaults the opt-in
+    # flag to False.
+    assert TenantSettings.model_fields["content_tracing_opt_in"].default is False
+    assert "content_tracing_opt_in" in RESIDENCY_MD
+    assert "default `False`" in RESIDENCY_MD
+
+
+def test_residency_doc_sub_processor_list_matches_the_allow_list_object() -> None:
+    # Every host RESIDENCY_ALLOW_LIST actually contains is named in the doc -- not a hand-copied
+    # second list that could silently drift from it.
+    for residency, route in RESIDENCY_ALLOW_LIST.items():
+        assert residency in RESIDENCY_MD, f"residency {residency!r} not named in docs/residency.md"
+        assert route.trace_sink_host in RESIDENCY_MD, (
+            f"trace sink host {route.trace_sink_host!r} for {residency!r} not named in the doc"
+        )
+        embedding_host = route.embedding_endpoint.split("//", 1)[-1].split("/", 1)[0]
+        assert embedding_host in RESIDENCY_MD, (
+            f"embedding endpoint host {embedding_host!r} for {residency!r} not named in the doc"
+        )
+        for pattern in route.model_host_patterns:
+            bare_domain = pattern.lstrip("*.")
+            assert bare_domain in RESIDENCY_MD, (
+                f"model host domain {bare_domain!r} for {residency!r} not named in the doc"
+            )
+
+
+def test_residency_doc_has_a_worked_second_residency_recipe() -> None:
+    section = RESIDENCY_MD.split("## Worked example: adding a second residency", 1)[1]
+    section = section.split("## The MCP boundary", 1)[0]
+    assert "RESIDENCY_ALLOW_LIST" in section
+    assert "RESIDENCY_MODEL_ALLOW_LIST" in section
+    assert "docker/litellm/config.yaml" in section
+    assert "trace_sink_host" in section
+
+
+def test_mcp_server_docs_state_the_client_model_boundary_and_snippet_cap() -> None:
+    normalized = " ".join(MCP_SERVER_SOURCE.split())
+    assert "outside this application's processor chain" in normalized
+    assert "outside residency enforcement" in normalized
+    assert "own model" in normalized
+    # The existing cap this boundary statement names as the bound that still applies.
+    assert "limit = max(1, min(limit, 20))" in MCP_SERVER_SOURCE
+
+
+def test_residency_doc_names_mcp_over_http_as_still_open() -> None:
+    section = RESIDENCY_MD.split("## The MCP boundary", 1)[1]
+    assert "#49" in section
+    assert "stdio" in section
+
+
+def test_claude_md_tracing_rule_describes_flat_attributes_and_content_off_by_default() -> None:
+    rule_7 = next(line for line in CLAUDE_MD.splitlines() if line.strip().startswith("7. **Every"))
+    section_start = CLAUDE_MD.index(rule_7)
+    section_end = CLAUDE_MD.index("\n8. ", section_start)
+    section = " ".join(CLAUDE_MD[section_start:section_end].split())
+
+    assert "flat" in section
+    assert "content_tracing_opt_in" in section
+    assert "default `False`" in section
+    assert "as `metadata`" not in section or "flat" in section  # flat attributes, not only metadata
+
+
+def test_claude_md_model_rule_describes_residency_resolution() -> None:
+    rule_6 = next(line for line in CLAUDE_MD.splitlines() if line.strip().startswith("6. **Models"))
+    section_start = CLAUDE_MD.index(rule_6)
+    section_end = CLAUDE_MD.index("\n7. ", section_start)
+    section = " ".join(CLAUDE_MD[section_start:section_end].split())
+
+    assert "resolve_residency_route" in section
+    assert "ResidencyUnresolved" in section
+    assert "run_startup_checks" in section
+    assert "no default embedding provider" in section.lower()
+
+
+def test_tenant_settings_catalog_documents_residency_and_content_tracing_opt_in() -> None:
+    import app.tenant_settings as tenant_settings_module
+
+    doc = tenant_settings_module.__doc__ or ""
+    assert "## Catalog" in doc
+    assert "residency" in doc
+    assert "control.tenants.residency" in doc
+    assert "content_tracing_opt_in" in doc
+    # Shape, validation, and default are all named for both entries, not just one.
+    assert "RESIDENCY_ALLOW_LIST" in doc
+    assert "no default" in doc
+    assert "False" in doc
 
 
 def test_claude_md_audit_rule_points_at_documents_columns_not_aspirational() -> None:

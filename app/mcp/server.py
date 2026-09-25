@@ -15,6 +15,17 @@ Start (stdio, e.g. in Claude Code's .mcp.json):
 
 Freshness note: MCP Python SDK 2.x -> `from mcp.server.mcpserver import MCPServer`
 (previously `from mcp.server.fastmcp import FastMCP`). Check on SDK updates.
+
+The residency boundary (ADR-0008, docs/residency.md): a connecting MCP client brings its own
+model. That model sits entirely outside this application's processor chain and outside
+residency enforcement -- `RESIDENCY_ALLOW_LIST`, the gateway, and the per-residency trace sink
+(`app/config.py`, `app/residency.py`, `app/observability.py`) govern the model *this deployment*
+calls on a tenant's behalf, never the model a connecting client happens to be configured with. A
+document snippet `search_documents` returns may leave the tenant's residency the moment that
+client's own model processes it; that is the connecting client's (the customer's) responsibility,
+never something this server can observe or enforce. The one bound that still applies regardless
+of destination is the existing snippet cap: `search_documents` never returns more than 20 hits
+(`app.tools.documents.search_documents`, `limit = max(1, min(limit, 20))`).
 """
 
 from __future__ import annotations

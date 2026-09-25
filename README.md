@@ -62,9 +62,10 @@ Tests: `uv run pytest` — the RLS integration test is skipped when `pgserver` i
 | Tools | `app/tools/documents.py` | context-aware search, shared by agent and MCP |
 | Agent | `app/agents/assistant.py` | PydanticAI agent, model resolved at runtime, tracing metadata |
 | API | `app/api/` | `/v1/t/{tenant_id}/agents/assistant/run`, `/v1/t/{tenant_id}/agents/assistant/stream` (SSE, both one-shot, no memory); `/v1/t/{tenant_id}/api/chat` (Vercel AI SDK) — server-held history: the server loads the stored conversation, trusts only the client's newest member-authored message, and persists the run's new messages back through the repository once it completes, independent of the client's own stream (ADR-0006) |
-| MCP server | `app/mcp/server.py` | the same tools for Claude Code / Claude Desktop |
+| MCP server | `app/mcp/server.py` | the same tools for Claude Code / Claude Desktop, over stdio only today; the connecting client's own model sits outside residency enforcement — see [`docs/residency.md`](docs/residency.md#the-mcp-boundary) |
 | Models | `app/llm.py`, `app/embeddings.py` | provider abstraction; the LiteLLM gateway is mandatory, not an add-on (ADR-0009) |
-| Tracing | `app/observability.py` | Langfuse via OTel (optional) |
+| Residency | `app/residency.py`, `app/startup_checks.py` | per-tenant model/embedding/trace routing, fail-closed at request time and at startup (ADR-0008) — see [`docs/residency.md`](docs/residency.md) |
+| Tracing | `app/observability.py` | Langfuse via OTel, a regular dependency (not optional); content-free by default, per-tenant opt-in, one trace sink per residency (ADR-0008) |
 | Operator tool | `app/operator/`, `scripts/operator.py` | audited `create`/`list` commands, run as `app_owner`; `create` provisions a pooled tenant end to end (control-plane record, gateway credential, first admin membership) — replaces the retired `scripts/seed.py` |
 | Tests | `tests/` | unit (TestModel, no DB) + a real RLS test against embedded Postgres |
 
@@ -137,7 +138,7 @@ What stayed out matters as much as what went in:
 |---|---|
 | **TypeScript full-stack** (Next.js + Mastra/AI SDK as the backend) | The team is Python-strong, and the AI ecosystem (RAG, evals, data pipelines) has a multi-year head start in Python. TypeScript stays at the UI edge — the common production pattern is a Python backend + TS frontend. A pure TS stack only pays off when the chat UI *is* the product and the backend stays thin. |
 | **A managed platform now** (Bedrock AgentCore, Azure AI Foundry) | Overhead and lock-in that a project at this stage does not need. Because the agent logic sits behind its own API and the tools speak MCP, the move there stays open — for client projects on AWS/Azure it is the intended path. |
-| **Self-hosting the models** | Pays off with strict compliance or high, predictable throughput — neither applies here. Break-even vs. APIs comes only at very high volume. Residency and compliance posture (GDPR) are not yet implemented; routing every content-bearing path by a tenant's residency is an open, named decision (ADR-0008), not something already delivered. |
+| **Self-hosting the models** | Pays off with strict compliance or high, predictable throughput — neither applies here. Break-even vs. APIs comes only at very high volume. Residency is now a delivered, per-tenant setting rather than a deployment-wide posture (ADR-0008, accepted) — see [`docs/residency.md`](docs/residency.md) for exactly what is enforced, the sub-processor list, and the MCP boundary. |
 | **A dedicated vector DB** (Pinecone, Weaviate, Qdrant) | pgvector in the same Postgres carries you into the range of 5–50M vectors, and the DB choice is only 5–10% of RAG quality. One database means one RLS story for data *and* embeddings, one backup, one thing to operate. |
 | **LangGraph as the default** | Roughly 40% of "agent" tasks are a single model call with structured output. PydanticAI with tools covers most of the rest; LangGraph joins per agent only when a real state machine is needed (checkpoints, human-in-the-loop) — with an ADR. |
 | **Local models in the product** | Models run behind the API (Claude/GPT/Bedrock/Azure). On-device or local only for development — or if self-hosting ever becomes mandatory. |

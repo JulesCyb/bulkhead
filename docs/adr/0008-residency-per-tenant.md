@@ -1,6 +1,6 @@
 # ADR-0008: Residency is a tenant setting, and every content-bearing path honours it
 
-- **Status:** proposed
+- **Status:** accepted
 - **Date:** 2026-09-12
 - **Deciders:** JulesCyb
 - **Skill version:** ai-app-blueprints v2.0.0 (research 2026-08)

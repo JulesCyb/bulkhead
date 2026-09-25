@@ -20,6 +20,35 @@ Two things are rejected, independent of whether a field name is otherwise known 
 
 `extra="forbid"` catches every other unknown key on top of that — a tenant may only ever set the
 fields this model actually declares.
+
+## Catalog (ADR-0008, ADR-0011): every setting the control-plane schema currently defines
+
+The catalog of `public.tenants.settings`/`control.tenants` fields a request may read or write.
+A new field (tenant-editable or operator-owned) is documented here, in this one place, rather
+than left to whichever module happens to read it first.
+
+- **`residency`** -- home: `control.tenants.residency` (operator-owned, migration
+  `0013_control_plane_residency.py`). Shape: `text`, nullable. Validation: a `CHECK` constraint
+  restricting it to a key of `RESIDENCY_ALLOW_LIST` (`app/config.py`); a tenant's own request can
+  never write it (no `UPDATE` grant on `control.tenants`). Default: **no default** -- a tenant
+  without one fails closed (`app.residency.ResidencyUnresolved`), never inherits another
+  jurisdiction's route.
+- **`model`** -- home: `public.tenants.settings["model"]` (tenant-editable, this module). Shape:
+  `str` or `None`. Validation: validated against
+  `RESIDENCY_MODEL_ALLOW_LIST[<tenant's own residency>]` at the point a chat model is resolved
+  (`app.llm.resolve_tenant_chat_model`), not by this model itself. Default: `None` (the
+  deployment default `Settings.llm_model` applies).
+- **`content_tracing_opt_in`** -- home: `public.tenants.settings["content_tracing_opt_in"]`
+  (tenant-editable, this module). Shape: `bool`. Validation: plain Pydantic bool coercion, no
+  allow-list -- any tenant admin may flip its own tenant's flag. Default: `False` -- content-free
+  tracing (`include_content=False`) until explicitly turned on, see `app.observability`.
+
+`residency` is deliberately never a field on `TenantSettings` below (see the class docstring): it
+lives in `control.tenants`, read through `app.repositories.control.ControlRepository`, not
+through `TenantSettingsRepository`. It is listed in this catalog anyway because it is resolved
+alongside `content_tracing_opt_in` at the exact same call sites
+(`app.observability.resolve_tenant_tracing_selection`, `app.residency.resolve_residency_route`)
+and a reader of one needs to see the other.
 """
 
 from __future__ import annotations
