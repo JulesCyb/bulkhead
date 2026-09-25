@@ -1342,3 +1342,124 @@ async def test_ready_endpoint_succeeds_against_real_postgres_as_the_app_role(app
         response = await client.get("/ready")
     assert response.status_code == 200
     assert response.json() == {"status": "ready"}
+
+
+# --- Residency route resolution (#60, ADR-0008): the resolver end to end, real RLS ---------
+
+
+async def _set_residency(url: str, tenant_id: uuid.UUID, residency: str | None) -> None:
+    """As the superuser, exactly like `_seed` above: writes `tenants.settings["residency"]`
+    directly rather than through the resolver-under-test, so the resolver's own read is what's
+    being verified, not a round trip through itself."""
+    engine = create_async_engine(url)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE tenants SET settings = jsonb_set("
+                "coalesce(settings, '{}'::jsonb), '{residency}', "
+                "to_jsonb(CAST(:residency AS text))) "
+                "WHERE id = :tid"
+            ),
+            {"tid": tenant_id, "residency": residency},
+        )
+    await engine.dispose()
+
+
+async def test_residency_resolves_through_real_rls_and_never_crosses_tenants(
+    app_settings, database_urls, tmp_path
+):
+    """Given two tenants set to different residencies, resolving one tenant's route never
+    returns the other's -- read through the same tenant-scoped session/RLS scaffolding every
+    repository uses, exactly like the document-search isolation test above (#60)."""
+    from app.config import RESIDENCY_ALLOW_LIST, Settings
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.residency import resolve_residency_route
+
+    tenant_eu, tenant_us = await _seed(database_urls["superuser"])
+    await _set_residency(database_urls["superuser"], tenant_eu, "eu")
+    await _set_residency(database_urls["superuser"], tenant_us, "us")
+    await _set_gateway_alias(database_urls["migrations"], tenant_eu, "acme-gateway-key")
+    await _set_gateway_alias(database_urls["migrations"], tenant_us, "globex-gateway-key")
+    (tmp_path / "acme-gateway-key").write_text("sk-acme-secret")
+    (tmp_path / "globex-gateway-key").write_text("sk-globex-secret")
+    settings = Settings(database_url=database_urls["app"], gateway_credentials_dir=str(tmp_path))
+
+    ctx_eu = RequestContext(tenant_id=tenant_eu, identity_id=uuid.uuid4())
+    async with tenant_session(ctx_eu) as session:
+        resolved_eu = await resolve_residency_route(session, ctx_eu, settings=settings)
+
+    ctx_us = RequestContext(tenant_id=tenant_us, identity_id=uuid.uuid4())
+    async with tenant_session(ctx_us) as session:
+        resolved_us = await resolve_residency_route(session, ctx_us, settings=settings)
+
+    assert resolved_eu.residency == "eu"
+    assert resolved_eu.route == RESIDENCY_ALLOW_LIST["eu"]
+    assert resolved_eu.gateway_credential.get_secret_value() == "sk-acme-secret"
+
+    assert resolved_us.residency == "us"
+    assert resolved_us.route == RESIDENCY_ALLOW_LIST["us"]
+    assert resolved_us.gateway_credential.get_secret_value() == "sk-globex-secret"
+
+    # Never each other's route or credential.
+    assert resolved_eu.route != resolved_us.route
+    assert resolved_eu.route.trace_sink_host != resolved_us.route.trace_sink_host
+    assert (
+        resolved_eu.gateway_credential.get_secret_value()
+        != resolved_us.gateway_credential.get_secret_value()
+    )
+
+
+async def test_residency_resolution_is_scoped_by_rls_not_just_the_where_clause(
+    app_settings, database_urls, tmp_path
+):
+    """Even if the resolver's own WHERE clause were removed or broken, RLS on `tenants` (0001)
+    would still stop tenant A's session from ever reading tenant B's row: `tenant_session(ctx)`
+    sets `app.tenant_id` per transaction, and the `tenants_self_only` policy filters on it."""
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+
+    tenant_eu, tenant_us = await _seed(database_urls["superuser"])
+    await _set_residency(database_urls["superuser"], tenant_eu, "eu")
+    await _set_residency(database_urls["superuser"], tenant_us, "us")
+
+    ctx_eu = RequestContext(tenant_id=tenant_eu, identity_id=uuid.uuid4())
+    async with tenant_session(ctx_eu) as session:
+        # Querying tenant B's row from tenant A's session-scoped connection returns nothing:
+        # RLS filters it out before this WHERE clause is even considered.
+        row = (
+            await session.execute(
+                text("SELECT settings ->> 'residency' FROM tenants WHERE id = :tid"),
+                {"tid": tenant_us},
+            )
+        ).first()
+    assert row is None
+
+
+async def test_resolver_fails_closed_for_a_tenant_with_no_residency_set(
+    app_settings, database_urls
+):
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.residency import ResidencyUnresolved, resolve_residency_route
+
+    tenant_a, _ = await _seed(database_urls["superuser"])
+    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
+    with pytest.raises(ResidencyUnresolved):
+        async with tenant_session(ctx_a) as session:
+            await resolve_residency_route(session, ctx_a)
+
+
+async def test_resolver_fails_closed_for_a_tenant_with_an_unknown_residency(
+    app_settings, database_urls
+):
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.residency import ResidencyUnresolved, resolve_residency_route
+
+    tenant_a, _ = await _seed(database_urls["superuser"])
+    await _set_residency(database_urls["superuser"], tenant_a, "mars")
+    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
+    with pytest.raises(ResidencyUnresolved):
+        async with tenant_session(ctx_a) as session:
+            await resolve_residency_route(session, ctx_a)
