@@ -38,6 +38,7 @@ from app.tools import documents as document_tools
 
 SearchFn = Callable[[RequestContext, str, int], Awaitable[list[DocumentHit]]]
 LoadHistoryFn = Callable[[RequestContext, str], Awaitable[list[ModelMessage]]]
+SaveRunFn = Callable[[RequestContext, str, list[ModelMessage]], Awaitable[None]]
 
 
 @dataclass
@@ -49,6 +50,10 @@ class AssistantDeps:
     # server-held message history for it. None = the real ConversationsRepository, scoped to
     # the tenant and to the member who started the conversation.
     load_history: LoadHistoryFn | None = None
+    # Injectable the same way (ADR-0006, #34): given a conversation id and the messages a
+    # completed run produced, persist them. None = the real ConversationsRepository, in a
+    # session of its own, independent of the streamed response's own lifecycle.
+    save_run: SaveRunFn | None = None
     model_name: str | None = None  # e.g. from tenants.settings["model"]
 
     def __post_init__(self) -> None:
@@ -56,6 +61,8 @@ class AssistantDeps:
             self.search = document_tools.search_documents
         if self.load_history is None:
             self.load_history = conversation_tools.load_conversation_history
+        if self.save_run is None:
+            self.save_run = conversation_tools.save_conversation_run
 
 
 # Shared by both agents: every tool's result — a search hit today, a writing tool's outcome once
