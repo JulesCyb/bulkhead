@@ -14,9 +14,9 @@ from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import Response, StreamingResponse
 from pydantic_ai.ui.vercel_ai import VercelAIAdapter
 
-from app.agents.assistant import AssistantDeps, chat_assistant
+from app.agents.assistant import AssistantDeps, chat_assistant, resolve_chat_model
+from app.api.agents import ROUTING_ERRORS, routing_error_detail
 from app.deps import Context
-from app.llm import get_model
 from app.request_limit import RequestLimit
 from app.run_limits import RunDeadlineExceeded, RunLimits, build_run_limits, run_deadline
 
@@ -52,11 +52,15 @@ async def chat(request: Request, ctx: Context, _limit: RequestLimit) -> Response
         raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "Request body too large")
     deps = AssistantDeps(ctx=ctx)
     limits = build_run_limits()
+    try:
+        model = await resolve_chat_model(deps)
+    except ROUTING_ERRORS as exc:
+        raise HTTPException(status_code=503, detail=routing_error_detail(exc)) from exc
     response = await VercelAIAdapter.dispatch_request(
         request,
         agent=chat_assistant,
         deps=deps,
-        model=get_model(deps.model_name),
+        model=model,
         usage_limits=limits.usage_limits,
         metadata=ctx.trace_attributes(),
         sdk_version=6,

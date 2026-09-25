@@ -21,6 +21,7 @@ from tests.conftest import (
     looping_tool_calls_stream,
     make_stalling_model,
     make_stalling_stream_model,
+    resolve_to_model,
 )
 
 
@@ -63,8 +64,10 @@ async def test_chat_maps_tool_call_ceiling_to_an_error_chunk(client, small_run_l
     small_run_limits()
     monkeypatch.setattr(
         chat_module,
-        "get_model",
-        lambda name: FunctionModel(looping_tool_calls, stream_function=looping_tool_calls_stream),
+        "resolve_chat_model",
+        resolve_to_model(
+            FunctionModel(looping_tool_calls, stream_function=looping_tool_calls_stream)
+        ),
     )
     async with client:
         response = await client.post(_chat_path(), json=_submit_message_body(), headers=_headers())
@@ -80,9 +83,12 @@ async def test_chat_maps_wall_clock_deadline_to_a_distinct_error(
     small_run_limits(run_deadline_seconds=0.2)
     monkeypatch.setattr(
         chat_module,
-        "get_model",
-        lambda name: FunctionModel(
-            make_stalling_model(seconds=30), stream_function=make_stalling_stream_model(seconds=30)
+        "resolve_chat_model",
+        resolve_to_model(
+            FunctionModel(
+                make_stalling_model(seconds=30),
+                stream_function=make_stalling_stream_model(seconds=30),
+            )
         ),
     )
     async with client:
@@ -98,7 +104,7 @@ async def test_chat_maps_wall_clock_deadline_to_a_distinct_error(
 async def test_chat_within_limits_completes_normally(client, small_run_limits, monkeypatch, calls):
     """A run within the ceilings completes normally, unaffected by the new limiting."""
     small_run_limits()
-    monkeypatch.setattr(chat_module, "get_model", lambda name: TestModel())
+    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(TestModel()))
     async with client:
         response = await client.post(_chat_path(), json=_submit_message_body(), headers=_headers())
     assert response.status_code == 200, response.text

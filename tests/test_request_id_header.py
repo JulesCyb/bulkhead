@@ -74,7 +74,9 @@ async def test_stream_endpoint_carries_request_id_header(client, captured_ctx):
 
 
 async def test_chat_endpoint_carries_request_id_header(monkeypatch):
-    monkeypatch.setattr(chat_module, "get_model", lambda name=None: TestModel())
+    from tests.conftest import resolve_to_model
+
+    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(TestModel()))
     transport = httpx.ASGITransport(app=app)
     body = {
         "id": "conv-1",
