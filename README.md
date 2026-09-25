@@ -54,7 +54,7 @@ Tests: `uv run pytest` — the RLS integration test is skipped when `pgserver` i
 | Building block | File | Purpose |
 |---|---|---|
 | Context object | `app/context.py` | `tenant_id`, `identity_id`, roles — passed through everywhere |
-| Auth (dev) | `app/deps.py` | tenant from the URL path, `X-Identity-Id` header locally; JWT slot prepared |
+| Auth | `app/deps.py` | tenant from the URL path; `X-Identity-Id` header locally (dev-headers) or a verified bearer token (`AUTH_MODE=jwt`) |
 | Tenant session | `app/db/session.py` | `set_config('app.tenant_id', …)` per transaction |
 | Schema + RLS | `migrations/versions/0001_initial.py` | tenants, users, documents (vector 1536), policies, grants |
 | Roles | `docker/postgres/01-init.sh` | `app` (no superuser/BYPASSRLS, the long-running API's own role) and `app_owner` (no superuser/BYPASSRLS, owns every object, runs migrations only) |
@@ -100,8 +100,11 @@ In full, with commands and conventions: [`CLAUDE.md`](CLAUDE.md).
 5. Add tools in `app/tools/`, extend the MCP server, adjust the agent instructions.
 6. Attach clients: [`docs/frontend.md`](docs/frontend.md) (Next.js),
    [`docs/mobile.md`](docs/mobile.md) (Android/iOS), [`docs/deployment.md`](docs/deployment.md).
-7. **Implement `AUTH_MODE=jwt` before anything is publicly reachable.** The dev headers are for
-   localhost and nowhere else.
+7. **Set `AUTH_MODE=jwt` before anything is publicly reachable.** The dev headers are for
+   localhost and nowhere else. JWT mode (`app/deps.py`) is implemented: configure
+   `JWT_VERIFICATION_KEY`/`JWT_ALGORITHM` and, per tenant, `control.tenants.identity_issuer`
+   (or `DEFAULT_IDENTITY_ISSUER` for the interim one-operator-run-provider case) — see
+   `.env.example` and issue #24.
 8. **On managed Postgres with no first-boot container hook** (RDS, Neon, Supabase, Cloud SQL),
    run `uv run python scripts/provision_roles.py <admin-database-url>` once instead of
    `docker/postgres/01-init.sh` — same `app_owner`/`app` roles and grants, safe to run again.

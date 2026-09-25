@@ -15,8 +15,10 @@ and ADR template `adr-0005-mobile.md`.
 
 ## Backend duties before the first app release
 
-- Implement `AUTH_MODE=jwt` in `app/deps.py`: OIDC + PKCE with an identity provider,
-  short-lived access tokens, refresh tokens, revocation. The dev headers are off-limits on a device.
+- Set `AUTH_MODE=jwt` (implemented in `app/deps.py`, issue #24): OIDC + PKCE with an identity
+  provider, short-lived access tokens per tenant (the token's audience must name the tenant in
+  the URL path — ADR-0012), refresh tokens, revocation. The dev headers are off-limits on a
+  device.
 - Freeze API contracts: `/v1/t/{tenant_id}/` prefix (ADR-0012 — the tenant lives in the path, a
   single `X-Identity-Id`/token identifies the caller, never a tenant header), no breaking
   changes, `/openapi.json` as the contract, generate a client (e.g. `openapi-typescript`), keep

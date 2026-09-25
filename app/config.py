@@ -137,6 +137,17 @@ class Settings(BaseSettings):
     # tenant's own context.
     default_identity_issuer: str | None = None
 
+    # JWT verification (issue #24 / ADR-0003 / ADR-0012): the interim "one operator-run identity
+    # provider" case (same scope as `default_identity_issuer` above) -- a single process-wide
+    # verification key/algorithm, not a per-tenant or per-issuer JWKS lookup. A customer-owned
+    # identity provider (still an open question per ADR-0003) needs a real JWKS-backed key
+    # source; swap `app.deps.get_key_source`, never edit `app/jwt_verifier.py`, whose one job is
+    # verifying a token against whatever key that dependency hands it. No default: AUTH_MODE=jwt
+    # with no key configured fails every request as unauthenticated (app/deps.py) rather than
+    # silently accepting unverifiable tokens.
+    jwt_verification_key: SecretStr | None = None
+    jwt_algorithm: str = "RS256"
+
     # Per-membership request limit on the agent-facing routes
     # (/v1/t/{tenant_id}/agents/assistant/run, /v1/t/{tenant_id}/agents/assistant/stream,
     # /v1/t/{tenant_id}/api/chat): a single-process, best-effort backstop against a
