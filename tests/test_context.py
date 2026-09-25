@@ -2,7 +2,7 @@ import uuid
 
 import pytest
 
-from app.context import ROLES, Means, RequestContext
+from app.context import ROLES, Means, RequestContext, RoleRequired
 
 
 def test_roles_are_the_four_legal_values():
@@ -21,6 +21,20 @@ def test_context_is_immutable_and_checks_roles():
         ctx.require_role("owner")
     with pytest.raises(AttributeError):  # frozen dataclass
         ctx.tenant_id = uuid.uuid4()  # type: ignore[misc]
+
+
+def test_require_role_raises_role_required_with_the_missing_role():
+    """`RoleRequired` is a `PermissionError` (existing `except PermissionError` sites keep
+    working) that also carries the missing role as a typed attribute, so a caller like
+    `app.main.handle_permission_error` never has to re-derive it from the exception's message."""
+    ctx = RequestContext(
+        tenant_id=uuid.uuid4(), identity_id=uuid.uuid4(), roles=frozenset({"member"})
+    )
+    with pytest.raises(RoleRequired) as exc_info:
+        ctx.require_role("admin")
+    assert isinstance(exc_info.value, PermissionError)
+    assert exc_info.value.required_role == "admin"
+    assert exc_info.value.actual_roles == frozenset({"member"})
 
 
 def test_trace_attributes_contain_only_identifiers():

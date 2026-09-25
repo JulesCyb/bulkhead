@@ -85,6 +85,30 @@ async def test_missing_role_ends_in_a_clean_rejection_not_a_crash(monkeypatch):
     assert body["error"] == "forbidden"
 
 
+async def test_403_names_the_required_role_from_the_typed_attribute_not_the_message(monkeypatch):
+    """The handler reads `exc.required_role` (`RoleRequired`, `app/context.py`) rather than
+    parsing the exception's message with a regex -- proven by using a `RoleRequired` whose message
+    text has nothing in common with the old `role '...' required` shape the regex expected."""
+    from app.context import RoleRequired
+
+    async def _forbidden(prompt: str, deps) -> str:
+        raise RoleRequired("admin", frozenset({"member"}))
+
+    monkeypatch.setattr(agents_module, "run_assistant", _forbidden)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            _tenant_path("/agents/assistant/run"),
+            json={"prompt": "Hi"},
+            headers={**_headers(), "X-Roles": "member"},
+        )
+
+    assert response.status_code == 403
+    body = response.json()
+    assert body["error"] == "forbidden"
+    assert "admin" in body["message"]
+
+
 # --- The chat endpoint's size cap holds against a chunked body with no declared length ---
 
 
