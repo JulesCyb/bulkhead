@@ -58,16 +58,25 @@ async def _run_create(conn: AsyncConnection, args: argparse.Namespace) -> str:
         residency=args.residency,
         admin_email=args.admin_email,
         model=args.model,
+        isolation_tier=args.isolation_tier,
+        dedicated_db_admin_url=args.dedicated_db_admin_url,
         issuer=args.issuer,
         subject=args.subject,
     )
     print(f"MCP_TENANT_ID={result.tenant_id}")
     print(f"MCP_IDENTITY_ID={result.identity_id}")
     print(f"Gateway credential alias: {result.gateway_credential_alias}")
+    if result.isolation_tier == "dedicated":
+        print(f"Database alias: {result.database_alias}")
     print(
         f"control-plane record: {result.control_plane}; "
         f"gateway credential: {result.gateway_credential}; "
         f"admin membership: {result.admin_membership}"
+        + (
+            f"; dedicated database: {result.dedicated_database}"
+            if result.isolation_tier == "dedicated"
+            else ""
+        )
     )
     print(
         f"\ncurl -H 'X-Identity-Id: {result.identity_id}' "
@@ -76,6 +85,7 @@ async def _run_create(conn: AsyncConnection, args: argparse.Namespace) -> str:
     return (
         f"ok: tenant {result.tenant_id} "
         f"(control-plane: {result.control_plane}, "
+        f"isolation tier: {result.isolation_tier}, "
         f"gateway: {result.gateway_credential}, "
         f"membership: {result.admin_membership})"
     )
@@ -156,6 +166,24 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="optional tenants.settings['model'] override, validated against the residency's "
         "model allow-list before anything is written",
+    )
+    create_parser.add_argument(
+        "--isolation-tier",
+        dest="isolation_tier",
+        default="pooled",
+        choices=["pooled", "dedicated"],
+        help="'pooled' (default) shares the deployment's one database; 'dedicated' provisions "
+        "this tenant its own physical database (#71, ADR-0002) -- needs "
+        "--dedicated-db-admin-url the first time",
+    )
+    create_parser.add_argument(
+        "--dedicated-db-admin-url",
+        dest="dedicated_db_admin_url",
+        default=None,
+        help="required only when --isolation-tier=dedicated and this tenant's database has not "
+        "already been provisioned: an admin connection string (CREATEDB privilege) to the "
+        "Postgres server that will host it. Used only for this invocation, never stored; "
+        "redacted from the operator-action log.",
     )
     create_parser.add_argument(
         "--issuer",
