@@ -240,3 +240,50 @@ def test_adr_0009_is_accepted_not_proposed() -> None:
     status_line = next(line for line in ADR_0009.splitlines() if line.startswith("- **Status:**"))
     assert "accepted" in status_line
     assert "proposed" not in status_line
+
+
+# Spec 3's closing ticket (#30 / S3-T5): the claim that roles only gate actions and never hide
+# content is now backed by a test (tests/test_rls_integration.py), and ADR-0004 -- the decision
+# record for this authorization model -- is corrected from "exactly three roles" to the real
+# four-role model and moves from proposed to accepted.
+
+ADR_0004 = (
+    REPO_ROOT / "docs" / "adr" / "0004-authorization-tenant-in-db-roles-in-app.md"
+).read_text(encoding="utf-8")
+ADR_0005 = (REPO_ROOT / "docs" / "adr" / "0005-agent-identities.md").read_text(encoding="utf-8")
+ARCHITECTURE_SVG = (REPO_ROOT / "docs" / "architecture.svg").read_text(encoding="utf-8")
+
+
+def test_adr_0004_is_accepted_not_proposed() -> None:
+    status_line = next(line for line in ADR_0004.splitlines() if line.startswith("- **Status:**"))
+    assert "accepted" in status_line
+    assert "proposed" not in status_line
+
+
+def test_adr_0004_names_all_four_roles_and_cross_references_adr_0005() -> None:
+    assert "exactly three roles" not in ADR_0004
+    decision_section = " ".join(
+        ADR_0004.split("## Decision", 1)[1].split("## Consequences", 1)[0].split()
+    )
+    for role in ("admin", "member", "support", "agent"):
+        assert f"`{role}`" in decision_section
+    assert "ADR-0005" in decision_section
+
+
+def test_architecture_svg_caption_matches_tenant_wide_visibility() -> None:
+    assert "the logged-in user's permissions" not in ARCHITECTURE_SVG
+    assert "Tenant-wide visibility, roles gate actions" in ARCHITECTURE_SVG
+
+
+def test_claude_md_audit_rule_points_at_documents_columns_not_aspirational() -> None:
+    rule_1b = next(line for line in CLAUDE_MD.splitlines() if line.strip().startswith("1b. **The"))
+    section_start = CLAUDE_MD.index(rule_1b)
+    section_end = CLAUDE_MD.index("\n2. ", section_start)
+    section = " ".join(CLAUDE_MD[section_start:section_end].split())
+
+    assert "app.identity_id" in section
+    assert "documents.created_by" in section
+    assert "documents.updated_by" in section
+    assert "0010_document_audit_columns.py" in section
+    for aspirational_word in ("will", "would", "eventually", "once implemented"):
+        assert aspirational_word not in section
