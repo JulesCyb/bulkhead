@@ -80,7 +80,7 @@ app/db/               engine, tenant_session(), models
 app/repositories/     data access (the only path to the DB)
 app/tools/            tool functions (agent + MCP)
 app/agents/           PydanticAI agents
-app/api/              routers: /health, /v1/t/{tenant_id}/agents/assistant/{run,stream}, /v1/t/{tenant_id}/api/chat
+app/api/              routers: /health, /ready, /v1/t/{tenant_id}/agents/assistant/{run,stream}, /v1/t/{tenant_id}/api/chat
 app/mcp/server.py     MCP server (stdio)
 app/llm.py            provider abstraction; app/embeddings.py; app/observability.py
 migrations/           Alembic (async), 0001_initial.py as the template

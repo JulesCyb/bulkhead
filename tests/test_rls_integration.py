@@ -1272,3 +1272,73 @@ async def test_resolver_raises_typed_error_when_the_secret_file_is_missing(
     with pytest.raises(GatewayCredentialUnavailable):
         async with tenant_session(ctx_a) as session:
             await resolve_gateway_credential(session, ctx_a, settings=settings)
+
+
+# --- Live role/RLS guard (issue #15 / ADR-0011): the same exception list as the ---
+# --- schema-invariant test above, exercised through the actual runtime check. ---
+
+
+async def test_role_rls_guard_passes_for_the_unprivileged_app_role(database_urls):
+    """Acceptance: the live guard does not raise for a correctly configured, unprivileged
+    connection — proving the earlier failure tests below are not tautologies."""
+    from app.db.guard import check_role_and_rls
+
+    engine = create_async_engine(database_urls["app"])
+    async with engine.connect() as conn:
+        await check_role_and_rls(conn)  # must not raise
+    await engine.dispose()
+
+
+async def test_role_rls_guard_raises_for_a_superuser_or_bypassrls_role(database_urls):
+    """Acceptance: the live check raises when connected as a role that is a superuser or holds
+    BYPASSRLS — pgserver's own bootstrap `postgres` role, mirroring the cluster's real
+    bootstrap superuser."""
+    from app.db.guard import PrivilegedRoleOrMissingRLSError, check_role_and_rls
+
+    engine = create_async_engine(database_urls["superuser"])
+    async with engine.connect() as conn:
+        with pytest.raises(PrivilegedRoleOrMissingRLSError):
+            await check_role_and_rls(conn)
+    await engine.dispose()
+
+
+async def test_role_rls_guard_raises_for_a_table_missing_forced_rls(database_urls):
+    """Acceptance: a table in `public` outside `TENANT_ISOLATION_EXCEPTIONS` that lacks forced
+    Row-Level Security makes the live guard raise, even when connected as the unprivileged
+    `app` role — the same exception list the schema-invariant test enforces, checked here
+    through the actual runtime guard rather than the test-only catalog walk."""
+    from app.db.guard import PrivilegedRoleOrMissingRLSError, check_role_and_rls
+    from app.db.models import TENANT_ISOLATION_EXCEPTIONS
+
+    assert "scratch_unforced" not in TENANT_ISOLATION_EXCEPTIONS
+    owner_engine = create_async_engine(database_urls["migrations"])
+    try:
+        async with owner_engine.begin() as conn:
+            await conn.execute(text("CREATE TABLE scratch_unforced (id int)"))
+
+        app_engine = create_async_engine(database_urls["app"])
+        try:
+            async with app_engine.connect() as conn:
+                with pytest.raises(PrivilegedRoleOrMissingRLSError):
+                    await check_role_and_rls(conn)
+        finally:
+            await app_engine.dispose()
+    finally:
+        async with owner_engine.begin() as conn:
+            await conn.execute(text("DROP TABLE IF EXISTS scratch_unforced"))
+        await owner_engine.dispose()
+
+
+async def test_ready_endpoint_succeeds_against_real_postgres_as_the_app_role(app_settings):
+    """ASGI seam, real backing Postgres (issue #15): the readiness endpoint's default
+    dependency — left as-is, not overridden with a fake — succeeds against a real,
+    correctly-configured connection as the unprivileged `app` role."""
+    import httpx
+
+    from app.main import app as main_app
+
+    transport = httpx.ASGITransport(app=main_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/ready")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ready"}
