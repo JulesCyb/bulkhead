@@ -130,13 +130,19 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    credential.
 6. **Models via `app/llm.py`**; the model name comes from configuration or `tenants.settings["model"]`.
    The per-tenant entry point, `resolve_tenant_chat_model()`, validates that name against the
-   allow-list for the tenant's own residency (`RESIDENCY_MODEL_ALLOW_LIST`, `app/config.py`)
-   before building any client (ADR-0009); a name outside the list is rejected with
-   `ModelNotAllowedForResidency`, never silently passed through to the gateway. More generally
-   (ADR-0008): every content-bearing path — model, embeddings, and tracing — resolves its route
-   from the tenant's own `control.tenants.residency` through `app.residency.resolve_residency_route`
-   or the same `RESIDENCY_ALLOW_LIST` it reads (`app/config.py`); an unset or unlisted residency
-   fails closed (`ResidencyUnresolved`), never a fallback to another jurisdiction's route. At
+   allow-list for the tenant's own residency (`RESIDENCY_MODEL_ALLOW_LIST`) before building any
+   client (ADR-0009); a name outside the list is rejected with `ModelNotAllowedForResidency`,
+   never silently passed through to the gateway. More generally (ADR-0008): every content-bearing
+   path — model, embeddings, and tracing — resolves its route from the tenant's own
+   `control.tenants.residency` through `app.residency.resolve_residency_route` or the same
+   `RESIDENCY_ALLOW_LIST` it reads; an unset or unlisted residency fails closed
+   (`ResidencyUnresolved`), never a fallback to another jurisdiction's route. Both allow-lists are
+   loaded and validated once at startup by `app/config.py` from
+   [`config/residency.toml`](config/residency.toml) (path overridable with
+   `RESIDENCY_CONFIG_PATH`) — data, not a Python literal, and each residency's
+   `model_host_patterns`/`embedding_endpoint` must be that residency's own gateway host(s), never
+   a globally-reachable provider domain (`*.anthropic.com`/`*.openai.com`) another residency could
+   also reach; the loader itself refuses to load a file where two residencies share a host. At
    startup, `app.startup_checks.run_startup_checks` refuses to let the process accept a request or
    tool call if any configured endpoint (model/gateway host, embedding endpoint, trace sink) sits
    outside its residency's allow-list; there is no default embedding provider
@@ -184,6 +190,7 @@ app/retention.py      conversation retention job (ADR-0006); scripts/retention.p
 migrations/           Alembic (async), 0001_initial.py as the template
 tests/                pytest; RLS integration test with pgserver
 docker/               Postgres init (app role), LiteLLM config
+config/               residency.toml -- the residency allow-list (ADR-0008), loaded by app/config.py
 docs/                 adr/, agents/ (skill config), frontend.md, mobile.md, deployment.md, residency.md, mcp-connection.md
 app/operator/          operator tool: audited dispatch, tenant lookup, tenant listing, `create`, `suspend`/`unsuspend`, `erase` (scripts/operator.py entry point; replaces scripts/seed.py)
 ```

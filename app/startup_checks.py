@@ -1,23 +1,32 @@
-"""Fail-closed residency and model-allow-list startup checks (ADR-0008, Spec 8 / #59).
+"""Fail-closed residency and model-allow-list startup checks (ADR-0008, Spec 8 / #59, #63).
 
 `run_startup_checks` is the one function both the HTTP API's construction/lifespan path
 (`app.main.create_app` / `app.main.lifespan`) and the MCP server's own startup path
 (`app.mcp.server.main`) call before either process ever accepts a request or a tool call. It
 walks every content-bearing endpoint this deployment is actually configured to reach --
-the model/gateway host (`Settings.litellm_base_url`), the embedding endpoint (the same host in
-gateway mode, otherwise the embedding client's own default), and the trace sink
+the model/gateway host (`Settings.litellm_base_url`), the embedding endpoint (the same gateway
+host -- embeddings are only ever reachable through it, `app/embeddings.py`), and the trace sink
 (`Settings.langfuse_host`) -- and checks each one against the allow-list for this deployment's
-own residency (`RESIDENCY_ALLOW_LIST[settings.residency]`, app/config.py). It also runs the model
-allow-list check a tenant's chosen model is validated against at request time
-(`app.llm.validate_model_for_residency`, S7-T4 / #54) against the deployment's own default model,
-in this same pass -- an operator fixing a residency mismatch and a model mismatch is one error to
-read, not two validations to reconcile by hand.
+own residency (`RESIDENCY_ALLOW_LIST[settings.residency]`, loaded by `app.config` from
+`config/residency.toml`). It also runs the model allow-list check a tenant's chosen model is
+validated against at request time (`app.llm.validate_model_for_residency`, S7-T4 / #54) against
+the deployment's own default model, in this same pass -- an operator fixing a residency mismatch
+and a model mismatch is one error to read, not two validations to reconcile by hand.
 
 Every failure is a `ResidencyConfigurationError` naming both the offending residency and the
 offending endpoint, so an operator can fix the deployment's configuration without reading source.
 This never touches a tenant's own `control.tenants.residency` (that is resolved per request by
 `app.residency.resolve_residency_route`, fails closed there with `ResidencyUnresolved`) -- this
 module only checks what the deployment itself is configured to reach.
+
+Deliberately no fallback to a hard-coded "default" embedding/model host (there used to be one,
+`https://api.openai.com/v1`, checked when no gateway was configured -- removed in #63): a
+provider's global endpoint is reachable from every jurisdiction, so allowing it under every
+residency's allow-list made this check unable to ever reject a genuinely out-of-residency host.
+With no gateway configured there is nothing this deployment is actually configured to reach on
+the model/embedding path, so there is nothing to check here -- `app.embeddings` itself refuses to
+build an embedding client without a gateway configured (ADR-0009), so that path fails closed at
+call time instead.
 """
 
 from __future__ import annotations
@@ -27,10 +36,6 @@ from urllib.parse import urlparse
 
 from app.config import RESIDENCY_ALLOW_LIST, Settings
 from app.llm import ModelNotAllowedForResidency, validate_model_for_residency
-
-# The embedding client's own default endpoint when no gateway is configured
-# (`openai.AsyncOpenAI()` with no `base_url`, see app/embeddings.py's `_client`).
-_DEFAULT_OPENAI_EMBEDDING_ENDPOINT = "https://api.openai.com/v1"
 
 
 class ResidencyConfigurationError(RuntimeError):
@@ -65,14 +70,16 @@ def run_startup_checks(settings: Settings) -> None:
       allow-list (`RESIDENCY_MODEL_ALLOW_LIST`, checked only when a gateway is configured -- a
       bare gateway alias is only ever meaningful against the gateway's own `model_list`, never
       against a direct-provider `<provider>:<model>` id);
-    - the embedding endpoint this deployment will actually reach (the gateway host in gateway
-      mode, otherwise the embedding client's own default) is not that residency's allow-listed
+    - a gateway is configured and the embedding endpoint it will actually reach (the same gateway
+      host, the only path `app.embeddings` ever calls) is not that residency's allow-listed
       embedding endpoint, and not otherwise covered by its model host patterns;
     - a configured trace sink (`settings.langfuse_host`) is not that residency's allow-listed
       trace sink host.
 
     A fully valid, allow-listed configuration (including the common case of no gateway and no
-    tracing configured at all) returns without raising.
+    tracing configured at all) returns without raising. With no gateway configured there is no
+    model/embedding host for this deployment to actually reach, so neither check runs -- see the
+    module docstring for why this is deliberate, not a gap.
     """
     residency = settings.residency
     route = RESIDENCY_ALLOW_LIST.get(residency)
@@ -99,17 +106,19 @@ def run_startup_checks(settings: Settings) -> None:
                 f"residency {residency!r}: default model {settings.llm_model!r} is not on its "
                 f"model allow-list -- {exc}"
             ) from exc
-        embedding_host = gateway_host
-    else:
-        embedding_host = _host(_DEFAULT_OPENAI_EMBEDDING_ENDPOINT)
 
-    if embedding_host != _host(route.embedding_endpoint) and not _host_matches_any(
-        embedding_host, route.model_host_patterns
-    ):
-        raise ResidencyConfigurationError(
-            f"residency {residency!r}: embedding endpoint host {embedding_host!r} is not its "
-            f"allow-listed embedding endpoint {route.embedding_endpoint!r}"
-        )
+        # Embeddings are only ever reachable through this same gateway host (ADR-0009,
+        # app/embeddings.py refuses to build a client with no gateway configured) -- so this
+        # check only ever runs once we know that host, never against some other, unconfigured
+        # "default" endpoint.
+        embedding_host = gateway_host
+        if embedding_host != _host(route.embedding_endpoint) and not _host_matches_any(
+            embedding_host, route.model_host_patterns
+        ):
+            raise ResidencyConfigurationError(
+                f"residency {residency!r}: embedding endpoint host {embedding_host!r} is not "
+                f"its allow-listed embedding endpoint {route.embedding_endpoint!r}"
+            )
 
     if settings.langfuse_host:
         trace_host = _host(settings.langfuse_host)

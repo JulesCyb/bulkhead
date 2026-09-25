@@ -52,6 +52,50 @@ def test_mismatched_gateway_host_raises_naming_residency_and_endpoint():
     assert "gateway.us.litellm.internal" in message
 
 
+def test_us_gateway_host_is_rejected_under_eu_residency():
+    """The original finding (#63): a residency's allow-list must be able to reject the *other*
+    residency's own gateway host, not just an unrelated made-up one."""
+    us_route = Settings(residency="us", **_VALID_KWARGS).residency_route
+    settings = Settings(
+        residency="eu",
+        litellm_base_url=f"https://{us_route.model_host_patterns[0].lstrip('*.')}",
+        **_VALID_KWARGS,
+    )
+    with pytest.raises(ResidencyConfigurationError, match="eu"):
+        run_startup_checks(settings)
+
+
+def test_eu_gateway_host_is_rejected_under_us_residency():
+    eu_route = Settings(residency="eu", **_VALID_KWARGS).residency_route
+    # "litellm" (the compose default eu host) is bare, not a glob -- use one of the eu-specific
+    # glob hosts instead so this exercises a real hostname, not the pattern itself.
+    eu_host_pattern = next(p for p in eu_route.model_host_patterns if p.startswith("*."))
+    settings = Settings(
+        residency="us",
+        litellm_base_url=f"https://{eu_host_pattern.lstrip('*.')}",
+        **_VALID_KWARGS,
+    )
+    with pytest.raises(ResidencyConfigurationError, match="us"):
+        run_startup_checks(settings)
+
+
+def test_a_global_provider_host_is_rejected_under_eu_residency():
+    """A host reachable from every jurisdiction (an Anthropic/OpenAI direct endpoint) must never
+    pass a residency's allow-list check -- this is exactly the original finding: `eu`'s
+    model_host_patterns must not also cover a global provider domain."""
+    settings = Settings(
+        residency="eu", litellm_base_url="https://api.anthropic.com", **_VALID_KWARGS
+    )
+    with pytest.raises(ResidencyConfigurationError, match="eu"):
+        run_startup_checks(settings)
+
+
+def test_a_global_provider_host_is_rejected_under_us_residency():
+    settings = Settings(residency="us", litellm_base_url="https://api.openai.com", **_VALID_KWARGS)
+    with pytest.raises(ResidencyConfigurationError, match="us"):
+        run_startup_checks(settings)
+
+
 def test_mismatched_trace_sink_raises_naming_residency_and_endpoint():
     settings = Settings(residency="eu", langfuse_host="us.cloud.langfuse.com", **_VALID_KWARGS)
     with pytest.raises(ResidencyConfigurationError) as exc_info:
