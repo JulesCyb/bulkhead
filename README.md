@@ -55,7 +55,7 @@ Tests: `uv run pytest` — the RLS integration test is skipped when `pgserver` i
 |---|---|---|
 | Context object | `app/context.py` | `tenant_id`, `identity_id`, roles — passed through everywhere |
 | Auth (dev) | `app/deps.py` | tenant from the URL path, `X-Identity-Id` header locally; JWT slot prepared |
-| Tenant session | `app/db/session.py` | `set_config('app.tenant_id', …)` per transaction |
+| Tenant session | `app/db/session.py` | `set_config('app.tenant_id', …)` per transaction; also resolves which database answers a tenant's request — pooled by default, dedicated on demand (ADR-0002, whose "Revisit when" list is the one place that names the triggers) |
 | Schema + RLS | `migrations/versions/0001_initial.py` | tenants, users, documents (vector 1536), policies, grants |
 | Roles | `docker/postgres/01-init.sh` | `app` (no superuser/BYPASSRLS, the long-running API's own role) and `app_owner` (no superuser/BYPASSRLS, owns every object, runs migrations only) |
 | Repository | `app/repositories/documents.py` | the only path to the DB, vector search |
