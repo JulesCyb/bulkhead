@@ -6,6 +6,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: app
       APP_DB_PASSWORD: ${APP_DB_PASSWORD:-app}
+      APP_OWNER_DB_PASSWORD: ${APP_OWNER_DB_PASSWORD:-app_owner}
     volumes:
       - ./docker/postgres/01-init.sh:/docker-entrypoint-initdb.d/01-init.sh:ro
       - pgdata:/var/lib/postgresql/data
@@ -21,13 +22,13 @@ services:
       retries: 10
       start_period: 10s
 
-  # One-shot: runs migrations with the owner role, then exits. Keeps the superuser DSN
+  # One-shot: runs migrations with the owner role, then exits. Keeps the owner role's DSN
   # out of the long-running api container.
   migrate:
     build: .
     env_file: .env
     environment:
-      DATABASE_URL_MIGRATIONS: postgresql+asyncpg://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/app
+      DATABASE_URL_MIGRATIONS: postgresql+asyncpg://app_owner:${APP_OWNER_DB_PASSWORD:-app_owner}@postgres:5432/app
     depends_on:
       postgres:
         condition: service_healthy

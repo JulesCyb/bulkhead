@@ -1,7 +1,11 @@
 """Real isolation test against PostgreSQL + pgvector (`pgserver`, via `uv sync --group dbtest`).
 
 Verifies what the unit tests cannot: that the RLS policies from the migration apply when the
-app works as the `app` role (no superuser, NOBYPASSRLS).
+app works as the `app` role (no superuser, NOBYPASSRLS), and that the role bootstrap itself
+(docker/postgres/01-init.sh) shapes `app_owner`/`app` the way it claims to: neither role is a
+superuser or holds BYPASSRLS, `app_owner` owns the schema and runs the whole migration suite,
+a freshly created table grants `app` nothing until a migration says so explicitly, and `app`'s
+statement timeout matches the role-level setting the bootstrap script configures.
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 pgserver = pytest.importorskip("pgserver")
 
 DIM = 1536
+APP_STATEMENT_TIMEOUT = "30s"
 
 
 def _vec(seed: float) -> str:
@@ -43,19 +48,32 @@ def _psql(server, command: str) -> None:
 
 @pytest.fixture(scope="module")
 def database_urls():
+    """Mirrors docker/postgres/01-init.sh: the cluster's own bootstrap superuser (here,
+    pgserver's default `postgres` role) creates the extension once, then `app_owner` (owns the
+    schema, runs every migration) and `app` (unchanged: no superuser, NOBYPASSRLS, a statement
+    timeout), with no default privileges on future tables for either.
+    """
     pgdata = tempfile.mkdtemp(prefix="pgdata-")
     server = pgserver.get_server(pgdata)
     sockdir = parse_qs(urlparse(server.get_uri()).query)["host"][0]
     _psql(
         server,
-        "CREATE ROLE app LOGIN NOSUPERUSER NOBYPASSRLS; "
+        "CREATE EXTENSION IF NOT EXISTS vector; "
+        "CREATE ROLE app_owner LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE; "
+        "ALTER SCHEMA public OWNER TO app_owner; "
+        "CREATE ROLE app LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE; "
         "GRANT USAGE ON SCHEMA public TO app; "
-        "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE "
-        "ON TABLES TO app;",
+        f"ALTER ROLE app SET statement_timeout = '{APP_STATEMENT_TIMEOUT}';",
     )
     urls = {
-        "migrations": f"postgresql+asyncpg://postgres@/postgres?host={sockdir}",
+        # The owner role: the only one migrations, seeding, and this fixture's own schema
+        # setup connect as — never the cluster superuser.
+        "migrations": f"postgresql+asyncpg://app_owner@/postgres?host={sockdir}",
         "app": f"postgresql+asyncpg://app@/postgres?host={sockdir}",
+        # Test-only: `app_owner` does not bypass RLS (FORCE ROW LEVEL SECURITY applies to it
+        # like any other non-superuser), so seeding test fixtures without a tenant context
+        # needs the real superuser, exactly like production never would.
+        "superuser": f"postgresql+asyncpg://postgres@/postgres?host={sockdir}",
     }
     env = {**os.environ, "DATABASE_URL_MIGRATIONS": urls["migrations"], "DATABASE_URL": urls["app"]}
     subprocess.run(
@@ -112,7 +130,7 @@ async def test_search_sees_only_own_tenant(app_settings, database_urls):
     from app.db.session import tenant_session
     from app.repositories.documents import DocumentRepository
 
-    tenant_a, tenant_b = await _seed(database_urls["migrations"])
+    tenant_a, tenant_b = await _seed(database_urls["superuser"])
     query = [0.0] * DIM
     query[0] = 1.0
 
@@ -133,7 +151,7 @@ async def test_insert_for_other_tenant_is_rejected(app_settings, database_urls):
     from app.context import RequestContext
     from app.db.session import tenant_session
 
-    tenant_a, tenant_b = await _seed(database_urls["migrations"])
+    tenant_a, tenant_b = await _seed(database_urls["superuser"])
     ctx_a = RequestContext(tenant_id=tenant_a, user_id=uuid.uuid4())
     with pytest.raises(DBAPIError):
         async with tenant_session(ctx_a) as session:
@@ -154,7 +172,7 @@ async def test_app_role_cannot_delete_tenants(app_settings, database_urls):
     from app.context import RequestContext
     from app.db.session import tenant_session
 
-    tenant_a, _ = await _seed(database_urls["migrations"])
+    tenant_a, _ = await _seed(database_urls["superuser"])
     ctx_a = RequestContext(tenant_id=tenant_a, user_id=uuid.uuid4())
     with pytest.raises((DBAPIError, ProgrammingError)):
         async with tenant_session(ctx_a) as session:
@@ -163,9 +181,95 @@ async def test_app_role_cannot_delete_tenants(app_settings, database_urls):
 
 async def test_no_context_means_no_rows(app_settings, database_urls):
     """Without set_config, current_setting is NULL -> the policy blocks all (app role)."""
-    await _seed(database_urls["migrations"])
+    await _seed(database_urls["superuser"])
     engine = create_async_engine(database_urls["app"])
     async with engine.connect() as conn:
         count = (await conn.execute(text("SELECT count(*) FROM documents"))).scalar_one()
     await engine.dispose()
     assert count == 0
+
+
+async def test_neither_role_is_superuser_or_bypasses_rls(database_urls):
+    """docker/postgres/01-init.sh's whole point: `app_owner` and `app` must both be ordinary,
+    non-privileged roles — only the cluster's own bootstrap superuser, used once, may bypass
+    Row-Level Security."""
+    engine = create_async_engine(database_urls["app"])
+    async with engine.connect() as conn:
+        rows = (
+            await conn.execute(
+                text(
+                    "SELECT rolname, rolsuper, rolbypassrls FROM pg_roles "
+                    "WHERE rolname IN ('app_owner', 'app')"
+                )
+            )
+        ).all()
+    await engine.dispose()
+    by_name = {row.rolname: row for row in rows}
+    assert set(by_name) == {"app_owner", "app"}
+    for role in ("app_owner", "app"):
+        assert by_name[role].rolsuper is False
+        assert by_name[role].rolbypassrls is False
+
+
+async def test_owner_owns_public_schema_and_ran_the_migrations(database_urls):
+    """`app_owner` owns `public`, and — since the fixture points DATABASE_URL_MIGRATIONS at it
+    and the whole migration suite already ran against it to get here — every table it created is
+    owned by it too, not by the cluster superuser."""
+    engine = create_async_engine(database_urls["migrations"])
+    async with engine.connect() as conn:
+        schema_owner = (
+            await conn.execute(
+                text(
+                    "SELECT r.rolname FROM pg_namespace n "
+                    "JOIN pg_roles r ON r.oid = n.nspowner WHERE n.nspname = 'public'"
+                )
+            )
+        ).scalar_one()
+        table_owners = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT tableowner FROM pg_tables WHERE schemaname = 'public' "
+                        "AND tablename IN ('tenants', 'users', 'documents')"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    await engine.dispose()
+    assert schema_owner == "app_owner"
+    assert table_owners == ["app_owner", "app_owner", "app_owner"]
+
+
+async def test_new_table_gets_no_default_privileges(database_urls):
+    """The blanket ALTER DEFAULT PRIVILEGES grant is gone: a freshly created table is
+    unreadable and unwritable by `app` until a migration explicitly grants it."""
+    engine = create_async_engine(database_urls["migrations"])
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text("CREATE TABLE scratch_no_default_grants (id int)"))
+        async with engine.connect() as conn:
+            grants = (
+                await conn.execute(
+                    text(
+                        "SELECT privilege_type FROM information_schema.table_privileges "
+                        "WHERE table_name = 'scratch_no_default_grants' AND grantee = 'app'"
+                    )
+                )
+            ).all()
+    finally:
+        async with engine.begin() as conn:
+            await conn.execute(text("DROP TABLE IF EXISTS scratch_no_default_grants"))
+        await engine.dispose()
+    assert grants == []
+
+
+async def test_app_statement_timeout_matches_bootstrap(database_urls):
+    """The role-level statement_timeout the bootstrap script sets for `app` is the one that
+    actually applies to its connections."""
+    engine = create_async_engine(database_urls["app"])
+    async with engine.connect() as conn:
+        timeout = (await conn.execute(text("SHOW statement_timeout"))).scalar_one()
+    await engine.dispose()
+    assert timeout == APP_STATEMENT_TIMEOUT
