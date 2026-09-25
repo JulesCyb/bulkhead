@@ -312,8 +312,10 @@ async def test_new_table_gets_no_default_privileges(database_urls):
 
 
 async def test_app_has_no_dml_on_control_schema_only_select_on_the_view(database_urls):
-    """The control-plane schema (#12): `app` gets no INSERT/UPDATE/DELETE anywhere in
-    `control`, only SELECT on the exposed read-only view."""
+    """The control-plane schema (#12, extended by #22): `app` gets no INSERT/UPDATE/DELETE
+    anywhere in `control`, only SELECT on the two exposed read-only views (tenant facts,
+    identity lookup) -- plus, separately, EXECUTE on the one narrow function (#22, asserted in
+    its own test), which is not a table privilege at all."""
     engine = create_async_engine(database_urls["app"])
     async with engine.connect() as conn:
         table_grants = (
@@ -325,7 +327,7 @@ async def test_app_has_no_dml_on_control_schema_only_select_on_the_view(database
             )
         ).all()
     await engine.dispose()
-    assert set(table_grants) == {("tenants_view", "SELECT")}
+    assert set(table_grants) == {("tenants_view", "SELECT"), ("identity_lookup", "SELECT")}
 
 
 async def test_app_can_update_own_settings_but_not_other_tenant_columns(
@@ -454,6 +456,189 @@ async def test_control_tenants_has_forced_rls_with_using_and_check(database_urls
     assert row.relforcerowsecurity is True
     assert policy[0] is True
     assert policy[1] is True
+
+
+async def test_control_session_sets_no_tenant_or_identity_context(app_settings):
+    """The control-plane session mode (#22): no app.tenant_id / app.identity_id at all -- never
+    the same thing as a tenant_session() with an empty context."""
+    from app.db.session import control_session
+
+    async with control_session() as session:
+        tenant_setting = (
+            await session.execute(text("SELECT current_setting('app.tenant_id', true)"))
+        ).scalar_one()
+        identity_setting = (
+            await session.execute(text("SELECT current_setting('app.identity_id', true)"))
+        ).scalar_one()
+    assert tenant_setting in (None, "")
+    assert identity_setting in (None, "")
+
+
+async def test_control_session_sees_no_rows_of_a_tenants_own_tables(app_settings, database_urls):
+    """Documents the "never used against a tenant's own tables" rule (#22) as an observable
+    property: with no tenant context, RLS blocks every row of a tenant-scoped table exactly as
+    it does for any other contextless session."""
+    from app.db.session import control_session
+
+    await _seed(database_urls["superuser"])
+    async with control_session() as session:
+        count = (await session.execute(text("SELECT count(*) FROM documents"))).scalar_one()
+    assert count == 0
+
+
+async def test_identity_lookup_finds_a_known_identity_and_nothing_for_an_unknown_one(
+    app_settings, database_urls
+):
+    """The identity-lookup component (#22): a known issuer+subject returns the matching row
+    over the control-plane session; an unknown pair returns None rather than raising."""
+    from app.db.session import control_session
+    from app.repositories.control import IdentityRepository
+
+    superuser_engine = create_async_engine(database_urls["superuser"])
+    async with superuser_engine.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO control.identities (issuer, subject, display_name, email) "
+                "VALUES (:issuer, :subject, 'Ada Lovelace', 'ada@example.com')"
+            ),
+            {"issuer": "https://idp.example.com", "subject": "sub-123"},
+        )
+    await superuser_engine.dispose()
+
+    async with control_session() as session:
+        found = await IdentityRepository().find_by_issuer_and_subject(
+            session, issuer="https://idp.example.com", subject="sub-123"
+        )
+        missing = await IdentityRepository().find_by_issuer_and_subject(
+            session, issuer="https://idp.example.com", subject="no-such-subject"
+        )
+    assert found is not None
+    assert found.issuer == "https://idp.example.com"
+    assert found.subject == "sub-123"
+    assert missing is None
+
+
+async def test_identity_lookup_view_exposes_only_id_issuer_subject(database_urls):
+    """(#22) control.identity_lookup never leaks display_name/email, even though
+    control.identities carries those columns."""
+    engine = create_async_engine(database_urls["migrations"])
+    async with engine.connect() as conn:
+        columns = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = 'control' AND table_name = 'identity_lookup'"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    await engine.dispose()
+    assert set(columns) == {"id", "issuer", "subject"}
+
+
+async def test_app_cannot_write_identities_only_read_the_lookup(app_settings, database_urls):
+    """(#22) `app` may SELECT through control.identity_lookup and nothing else: INSERT/UPDATE/
+    DELETE against either the base table or the lookup view fail on privileges."""
+    from sqlalchemy.exc import DBAPIError
+
+    from app.db.session import control_session
+
+    async with control_session() as session:
+        result = await session.execute(text("SELECT count(*) FROM control.identity_lookup"))
+        assert result.scalar_one() >= 0  # SELECT succeeds
+
+    engine = create_async_engine(database_urls["app"])
+    statements = [
+        "INSERT INTO control.identities (issuer, subject) VALUES ('x', 'y')",
+        "UPDATE control.identities SET subject = 'z'",
+        "DELETE FROM control.identities",
+        "INSERT INTO control.identity_lookup (id, issuer, subject) "
+        "VALUES (gen_random_uuid(), 'x', 'y')",
+        "UPDATE control.identity_lookup SET subject = 'z'",
+        "DELETE FROM control.identity_lookup",
+    ]
+    for statement in statements:
+        async with engine.connect() as conn:
+            with pytest.raises(DBAPIError):
+                await conn.execute(text(statement))
+    await engine.dispose()
+
+
+async def test_tenant_auth_settings_falls_back_to_default_and_reports_suspension(
+    app_settings, database_urls
+):
+    """(#22) the per-tenant read helper: the tenant's configured issuer when set, the
+    process-wide default when unset, and the suspension flag either way."""
+    from app.db.session import control_session
+    from app.repositories.control import TenantAuthSettingsRepository
+
+    tenant_id = uuid.uuid4()
+    superuser_engine = create_async_engine(database_urls["superuser"])
+    async with superuser_engine.begin() as conn:
+        await conn.execute(
+            text("INSERT INTO tenants (id, name) VALUES (:id, 'Tenant with defaults')"),
+            {"id": tenant_id},
+        )
+        await conn.execute(
+            text("INSERT INTO control.tenants (tenant_id) VALUES (:id)"), {"id": tenant_id}
+        )
+    await superuser_engine.dispose()
+
+    repo = TenantAuthSettingsRepository()
+    async with control_session() as session:
+        settings = await repo.get(
+            session, tenant_id=tenant_id, default_issuer="https://default.example.com"
+        )
+    assert settings is not None
+    assert settings.issuer == "https://default.example.com"
+    assert settings.suspended is False
+
+    superuser_engine = create_async_engine(database_urls["superuser"])
+    async with superuser_engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE control.tenants SET identity_issuer = :issuer, "
+                "suspended_at = now() WHERE tenant_id = :id"
+            ),
+            {"issuer": "https://tenant-own-idp.example.com", "id": tenant_id},
+        )
+    await superuser_engine.dispose()
+
+    async with control_session() as session:
+        settings = await repo.get(
+            session, tenant_id=tenant_id, default_issuer="https://default.example.com"
+        )
+    assert settings is not None
+    assert settings.issuer == "https://tenant-own-idp.example.com"
+    assert settings.suspended is True
+
+
+async def test_tenant_auth_settings_returns_none_for_unknown_tenant(app_settings):
+    from app.db.session import control_session
+    from app.repositories.control import TenantAuthSettingsRepository
+
+    async with control_session() as session:
+        settings = await TenantAuthSettingsRepository().get(
+            session, tenant_id=uuid.uuid4(), default_issuer="https://default.example.com"
+        )
+    assert settings is None
+
+
+async def test_app_cannot_write_tenant_auth_settings_columns(app_settings, database_urls):
+    """(#22) only app_owner may write identity_issuer/suspended_at -- app has no grant on
+    control.tenants at all beyond what tenant_auth_settings()/identity_lookup expose."""
+    from sqlalchemy.exc import DBAPIError
+
+    engine = create_async_engine(database_urls["app"])
+    async with engine.connect() as conn:
+        with pytest.raises(DBAPIError):
+            await conn.execute(
+                text("UPDATE control.tenants SET identity_issuer = 'https://evil.example.com'")
+            )
+    await engine.dispose()
 
 
 async def test_app_statement_timeout_matches_bootstrap(database_urls):

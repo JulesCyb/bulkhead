@@ -119,6 +119,13 @@ class Settings(BaseSettings):
     mcp_tenant_id: str | None = None
     mcp_identity_id: str | None = None
 
+    # The process-wide token issuer used for every tenant whose control-plane
+    # `identity_issuer` column is unset (issue #22 / ADR-0003): the interim "one operator-run
+    # identity provider" case, open until a tenant brings its own. Read by
+    # TenantAuthSettingsRepository.get() as the fallback default, never by anything under a
+    # tenant's own context.
+    default_identity_issuer: str | None = None
+
     # Per-membership request limit on the agent-facing routes
     # (/v1/t/{tenant_id}/agents/assistant/run, /v1/t/{tenant_id}/agents/assistant/stream,
     # /v1/t/{tenant_id}/api/chat): a single-process, best-effort backstop against a

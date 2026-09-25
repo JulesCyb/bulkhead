@@ -14,6 +14,14 @@ It also sets a per-transaction `statement_timeout` (SET LOCAL, Spec 7 / #55): a 
 raises inside that transaction instead of holding the connection open past a configured deadline,
 so it degrades only the tenant that issued it. The engine's pool size, overflow, timeout, and
 recycle are explicit settings (app/config.py) rather than driver defaults.
+
+control_session() (issue #22 / ADR-0003 / ADR-0011) opens a session with no app.tenant_id or
+app.identity_id set at all -- the control-plane session mode. It is reserved for exactly the
+narrow, cross-tenant control-plane reads the `app` role is granted (control.identity_lookup,
+control.tenant_auth_settings()) and must never be used against a tenant's own tables: with no
+tenant context set, current_setting(..., true) is NULL there too, so every tenant-scoped RLS
+policy blocks all rows anyway -- but the point of this session mode is to make that the *only*
+thing it can ever do, not to rely on RLS to save a misuse of it.
 """
 
 from __future__ import annotations
@@ -85,6 +93,21 @@ async def tenant_session(ctx: RequestContext) -> AsyncIterator[AsyncSession]:
             )
             # SET does not accept bind parameters in Postgres; the value is a validated int from
             # config, never user input, so interpolation here is safe.
+            timeout_ms = int(get_settings().db_statement_timeout_ms)
+            await session.execute(text(f"SET LOCAL statement_timeout = '{timeout_ms}ms'"))
+            yield session
+
+
+@asynccontextmanager
+async def control_session() -> AsyncIterator[AsyncSession]:
+    """One transaction, no tenant context: the control-plane session mode.
+
+    Reserved for exactly the narrow control-plane reads app/repositories/control.py makes
+    (the identity lookup by issuer+subject, a named tenant's auth settings). Never used against
+    a tenant's own tables -- see module docstring.
+    """
+    async with get_session_factory()() as session:
+        async with session.begin():
             timeout_ms = int(get_settings().db_statement_timeout_ms)
             await session.execute(text(f"SET LOCAL statement_timeout = '{timeout_ms}ms'"))
             yield session
