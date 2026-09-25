@@ -34,7 +34,7 @@ def bootstrapped():
     from pgserver.postgres_server import POSTGRES_BIN_PATH
 
     pgdata = tempfile.mkdtemp(prefix="pgdata-")
-    server = pgserver.get_server(pgdata)
+    server = pgserver.get_server(pgdata, cleanup_mode="delete")
     sockdir = parse_qs(urlparse(server.get_uri()).query)["host"][0]
 
     env = {

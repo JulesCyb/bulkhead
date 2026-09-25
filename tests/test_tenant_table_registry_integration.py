@@ -41,7 +41,7 @@ def _psql(server, command: str) -> None:
 def database_urls():
     """Same bootstrap as `tests/test_rls_integration.py`: `app_owner` runs the migrations."""
     pgdata = tempfile.mkdtemp(prefix="pgdata-")
-    server = pgserver.get_server(pgdata)
+    server = pgserver.get_server(pgdata, cleanup_mode="delete")
     sockdir = parse_qs(urlparse(server.get_uri()).query)["host"][0]
     _psql(
         server,

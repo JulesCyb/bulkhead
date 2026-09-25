@@ -55,7 +55,7 @@ def database_urls():
     timeout), with no default privileges on future tables for either.
     """
     pgdata = tempfile.mkdtemp(prefix="pgdata-")
-    server = pgserver.get_server(pgdata)
+    server = pgserver.get_server(pgdata, cleanup_mode="delete")
     sockdir = parse_qs(urlparse(server.get_uri()).query)["host"][0]
     _psql(
         server,

@@ -28,7 +28,7 @@ def two_servers():
     urls = []
     for _ in range(2):
         pgdata = tempfile.mkdtemp(prefix="pgdata-engine-registry-")
-        server = pgserver.get_server(pgdata)
+        server = pgserver.get_server(pgdata, cleanup_mode="delete")
         sockdir = parse_qs(urlparse(server.get_uri()).query)["host"][0]
         urls.append(f"postgresql+asyncpg://postgres@/postgres?host={sockdir}")
         servers.append(server)

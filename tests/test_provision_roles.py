@@ -22,7 +22,7 @@ pgserver = pytest.importorskip("pgserver")
 @pytest.fixture
 def admin_url():
     pgdata = tempfile.mkdtemp(prefix="pgdata-provision-")
-    server = pgserver.get_server(pgdata)
+    server = pgserver.get_server(pgdata, cleanup_mode="delete")
     sockdir = parse_qs(urlparse(server.get_uri()).query)["host"][0]
     yield f"postgresql://postgres@/postgres?host={sockdir}"
     server.cleanup()

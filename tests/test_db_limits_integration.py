@@ -36,7 +36,7 @@ def _psql(server, command: str) -> None:
 @pytest.fixture(scope="module")
 def database_urls():
     pgdata = tempfile.mkdtemp(prefix="pgdata-")
-    server = pgserver.get_server(pgdata)
+    server = pgserver.get_server(pgdata, cleanup_mode="delete")
     sockdir = parse_qs(urlparse(server.get_uri()).query)["host"][0]
     # Mirrors docker/postgres/01-init.sh: role-level statement_timeout and CONNECTION LIMIT are
     # deployment settings, not something pgserver's default bootstrap sets up for us.
