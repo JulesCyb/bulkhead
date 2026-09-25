@@ -2,10 +2,12 @@
 (`scripts/operator.py` is the thin wrapper) connecting only as the owner database role.
 
 Every invocation reads its connection string from `app.migration_settings.get_migration_settings`
--- the same owner DSN migrations and `scripts/seed.py` use -- and nothing else: there is no flag
-or environment variable here that accepts a different connection string, so this module can never
+-- the same owner DSN Alembic's migrations use -- and nothing else: there is no flag or
+environment variable here that accepts a different connection string, so this module can never
 fall back to, or be pointed at, the cluster superuser. `app.config.Settings` (the long-running
-API's settings object) is never imported here either.
+API's settings object) is never imported here either -- `create` (Spec 9 / #70) needs it (model
+allow-list validation, gateway defaults), so that work lives in `app.operator.create`, imported
+by name here rather than reached through `app.config` directly.
 
 Command dispatch and audit recording are deliberately two separate transactions on two separate
 connections (see `_run` below): if a command's own transaction rolls back on failure, the audit
@@ -24,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
 from app.migration_settings import get_migration_settings
 from app.operator.audit import UNSCOPED_TENANT_ID, record_action
+from app.operator.create import create_tenant
 from app.operator.listing import list_tenants
 from app.operator.suspend import set_tenant_suspended
 
@@ -73,12 +76,46 @@ async def _run_unsuspend(conn: AsyncConnection, args: argparse.Namespace) -> tup
     return await _run_suspend_or_unsuspend(conn, args, suspended=False)
 
 
+async def _run_create(conn: AsyncConnection, args: argparse.Namespace) -> tuple[str, UUID]:
+    result = await create_tenant(
+        conn,
+        tenant_name=args.tenant_name,
+        residency=args.residency,
+        admin_email=args.admin_email,
+        model=args.model,
+        issuer=args.issuer,
+        subject=args.subject,
+    )
+    print(f"MCP_TENANT_ID={result.tenant_id}")
+    print(f"MCP_IDENTITY_ID={result.identity_id}")
+    print(f"Gateway credential alias: {result.gateway_credential_alias}")
+    print(
+        f"control-plane record: {result.control_plane}; "
+        f"gateway credential: {result.gateway_credential}; "
+        f"admin membership: {result.admin_membership}"
+    )
+    print(
+        f"\ncurl -H 'X-Identity-Id: {result.identity_id}' "
+        f"http://localhost:8000/v1/t/{result.tenant_id}/agents/assistant/run ..."
+    )
+    outcome = (
+        f"ok: tenant {result.tenant_id} "
+        f"(control-plane: {result.control_plane}, "
+        f"gateway: {result.gateway_credential}, "
+        f"membership: {result.admin_membership})"
+    )
+    return outcome, result.tenant_id
+
+
 # Every command's target tenant id for the audit log. `list` has none -- it targets every
-# tenant, not one -- so it uses the documented sentinel (see app.operator.audit).
+# tenant, not one -- so it uses the documented sentinel (see app.operator.audit). Every other
+# command resolves or mints a real tenant id as part of its own work, so it returns that id here
+# rather than the sentinel.
 _COMMANDS = {
     "list": _run_list,
     "suspend": _run_suspend,
     "unsuspend": _run_unsuspend,
+    "create": _run_create,
 }
 
 
@@ -142,6 +179,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="Un-suspend a tenant (id or unambiguous name); a no-op if already active.",
     )
     unsuspend_parser.add_argument("identifier", help="tenant id or unambiguous name")
+
+    create_parser = sub.add_parser(
+        "create",
+        help="Create (idempotently) a pooled tenant: control-plane record, gateway credential, "
+        "and first admin membership. See app.operator.create for the full contract.",
+    )
+    create_parser.add_argument("tenant_name")
+    create_parser.add_argument(
+        "--residency",
+        required=True,
+        help="e.g. eu, us -- validated against this deployment's residency allow-list before "
+        "anything is written",
+    )
+    create_parser.add_argument(
+        "--admin-email", dest="admin_email", required=True, help="the first admin's email"
+    )
+    create_parser.add_argument(
+        "--model",
+        default=None,
+        help="optional tenants.settings['model'] override, validated against the residency's "
+        "model allow-list before anything is written",
+    )
+    create_parser.add_argument(
+        "--issuer",
+        default="dev-seed",
+        help="identity issuer to match/create for the admin identity (default: dev-seed)",
+    )
+    create_parser.add_argument(
+        "--subject",
+        default=None,
+        help="identity subject to match/create (default: the admin email)",
+    )
     return parser
 
 

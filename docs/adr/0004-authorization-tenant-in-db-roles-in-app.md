@@ -1,6 +1,6 @@
 # ADR-0004: Tenant isolation in the database, roles in the application, documents visible tenant-wide
 
-- **Status:** proposed
+- **Status:** accepted
 - **Date:** 2026-09-12
 - **Deciders:** JulesCyb
 - **Skill version:** ai-app-blueprints v2.0.0 (research 2026-08)
@@ -27,8 +27,11 @@ derived project to invent its own model.
 
 We choose **option 1** for the template.
 
-- Exactly three roles on a membership: `admin`, `member`, `support` (see `CONTEXT.md`). Roles
-  decide what a member can do, never what it can see.
+- Four roles on a membership: `admin`, `member`, `support`, and `agent` (see `CONTEXT.md`). The
+  first three were the original decision here; `agent` is the fourth, added by ADR-0005 the same
+  day for the identity an autonomous agent run authenticates as, and folded into this decision's
+  role list rather than left as a fork of it. Roles decide what a member can do, never what it
+  can see.
 - Roles are checked in the application with `RequestContext.require_role` at tools and routes; a
   failed check answers 403, never 500.
 - `app.user_id` stays set per transaction and gets a real consumer: audit columns such as

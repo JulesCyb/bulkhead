@@ -1,5 +1,6 @@
-"""The MCP server's development-only context provider: identity_id naming, env-based, and its
-suspension check (Spec 9 / #69, ADR-0010)."""
+"""The MCP server's development-only context provider (identity_id naming, env-based), its
+suspension check (Spec 9 / #69, ADR-0010), and its startup transport guard (issue #48 /
+ADR-0005)."""
 
 from __future__ import annotations
 
@@ -13,6 +14,8 @@ import app.tenant_suspension as tenant_suspension_module
 from app.config import Settings
 from app.mcp import server as mcp_server
 from app.tenant_suspension import TenantSuspendedError
+
+_VALID_KWARGS = {"embedding_provider": "openai", "embedding_model": "text-embedding-3-small"}
 
 
 def test_context_from_env_uses_renamed_identity_setting(monkeypatch):
@@ -74,3 +77,94 @@ async def test_resolve_context_rejects_a_suspended_tenant_before_any_tool_runs(m
     monkeypatch.setattr(mcp_server.document_tools, "search_documents", _boom)
     with pytest.raises(TenantSuspendedError):
         await mcp_server.search_documents("query")
+
+
+# --- MCP transport setting (issue #48 / ADR-0005) ---
+
+
+def test_mcp_transport_defaults_to_stdio():
+    settings = Settings(_env_file=None, environment="dev", auth_mode="dev-headers", **_VALID_KWARGS)
+    assert settings.mcp_transport == "stdio"
+
+
+def test_mcp_transport_accepts_each_explicit_value():
+    for value in ("stdio", "streamable-http"):
+        settings = Settings(
+            _env_file=None,
+            environment="dev",
+            auth_mode="dev-headers",
+            mcp_transport=value,
+            **_VALID_KWARGS,
+        )
+        assert settings.mcp_transport == value
+
+
+def test_mcp_transport_rejects_unknown_value():
+    with pytest.raises(ValueError):
+        Settings(
+            _env_file=None,
+            environment="dev",
+            auth_mode="dev-headers",
+            mcp_transport="sse",
+            **_VALID_KWARGS,
+        )
+
+
+# --- check_mcp_mode: the startup transport guard (issue #48 / ADR-0005) ---
+
+
+def test_check_mcp_mode_raises_for_stdio_outside_dev_and_test():
+    with pytest.raises(RuntimeError, match="stdio"):
+        mcp_server.check_mcp_mode(
+            Settings(
+                _env_file=None,
+                environment="prod",
+                auth_mode="jwt",
+                mcp_transport="stdio",
+                **_VALID_KWARGS,
+            )
+        )
+
+
+def test_check_mcp_mode_raises_for_streamable_http_without_a_configured_verifier():
+    # Regardless of environment -- even dev/test must not silently accept a networked transport
+    # with nothing to check connections against.
+    for environment in ("dev", "test", "prod"):
+        with pytest.raises(RuntimeError, match="streamable-http"):
+            mcp_server.check_mcp_mode(
+                Settings(
+                    _env_file=None,
+                    environment=environment,
+                    auth_mode="jwt",
+                    mcp_transport="streamable-http",
+                    jwt_verification_key=None,
+                    **_VALID_KWARGS,
+                )
+            )
+
+
+def test_check_mcp_mode_does_not_raise_for_stdio_in_dev_or_test():
+    for environment in ("dev", "test"):
+        mcp_server.check_mcp_mode(
+            Settings(
+                _env_file=None,
+                environment=environment,
+                auth_mode="dev-headers",
+                mcp_transport="stdio",
+                **_VALID_KWARGS,
+            )
+        )  # no raise
+
+
+def test_check_mcp_mode_does_not_raise_for_streamable_http_with_a_verifier_configured():
+    for environment in ("dev", "test", "prod"):
+        mcp_server.check_mcp_mode(
+            Settings(
+                _env_file=None,
+                environment=environment,
+                auth_mode="jwt",
+                mcp_transport="streamable-http",
+                jwt_verification_key="a-verification-key",
+                **_VALID_KWARGS,
+            )
+        )  # no raise

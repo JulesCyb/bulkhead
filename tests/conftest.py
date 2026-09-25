@@ -91,8 +91,26 @@ def fake_search(calls, contexts):
 
 
 @pytest.fixture
-def deps(ctx, fake_search) -> AssistantDeps:
-    return AssistantDeps(ctx=ctx, search=fake_search)
+def history_calls() -> list[tuple[uuid.UUID, str]]:
+    """Every (tenant_id, conversation_id) a fake `load_history` was actually asked for."""
+    return []
+
+
+@pytest.fixture
+def fake_history(history_calls):
+    """No stored history, by default (ADR-0006, #33) — a test that cares about a specific
+    stored history writes its own fake instead of using this one."""
+
+    async def _load(ctx: RequestContext, conversation_id: str) -> list[ModelMessage]:
+        history_calls.append((ctx.tenant_id, conversation_id))
+        return []
+
+    return _load
+
+
+@pytest.fixture
+def deps(ctx, fake_search, fake_history) -> AssistantDeps:
+    return AssistantDeps(ctx=ctx, search=fake_search, load_history=fake_history)
 
 
 @pytest.fixture

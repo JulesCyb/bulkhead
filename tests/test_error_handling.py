@@ -133,13 +133,16 @@ async def test_chunked_body_over_the_cap_is_rejected_before_full_read():
     assert len(chunks_yielded) < total_chunks
 
 
-async def test_chunked_body_under_the_cap_still_succeeds(monkeypatch, fake_search):
+async def test_chunked_body_under_the_cap_still_succeeds(monkeypatch, fake_search, fake_history):
     from pydantic_ai.models.test import TestModel
 
     from app.agents import assistant as assistant_module
     from app.api import chat as chat_module
 
     monkeypatch.setattr(assistant_module.document_tools, "search_documents", fake_search)
+    monkeypatch.setattr(
+        assistant_module.conversation_tools, "load_conversation_history", fake_history
+    )
     monkeypatch.setattr(chat_module, "get_model", lambda name=None: TestModel())
     payload = _chat_body_json(text_len=100)
 
