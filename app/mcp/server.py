@@ -28,10 +28,14 @@ from app.config import Settings, get_settings
 from app.context import RequestContext
 from app.startup_checks import run_startup_checks
 from app.tools import documents as document_tools
+from app.tools import memberships as membership_tools
 
 server = MCPServer(
     name="ai-app-tools",
-    instructions="This application's tools: semantic search in the tenant's documents.",
+    instructions=(
+        "This application's tools: semantic search in the tenant's documents, "
+        "and (admin-only) listing the tenant's memberships."
+    ),
 )
 
 
@@ -53,6 +57,22 @@ async def search_documents(query: str, limit: int = 5) -> list[dict]:
     """Semantic search in the current tenant's documents."""
     hits = await document_tools.search_documents(context_provider(), query, limit)
     return [hit.model_dump(mode="json") for hit in hits]
+
+
+@server.tool()
+async def list_memberships() -> list[dict]:
+    """List the current tenant's memberships (identity, role, joined-at). Admin-only.
+
+    #27: a caller without the `admin` role raises `PermissionError` from
+    `app.tools.memberships.list_memberships` -> `RequestContext.require_role`. This is never
+    caught here: the MCP SDK's own tool-invocation dispatch (`MCPServer._handle_call_tool`, the
+    single path every transport calls to run any tool) already catches it and answers with a
+    structured `CallToolResult(is_error=True)` naming the missing role, instead of letting the
+    exception cross the invocation boundary and take the connection down -- the same wrapper
+    every other tool call goes through, not a special case added here for this one tool.
+    """
+    records = await membership_tools.list_memberships(context_provider())
+    return [record.model_dump(mode="json") for record in records]
 
 
 def check_mcp_mode(settings: Settings) -> None:
