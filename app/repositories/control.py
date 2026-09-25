@@ -85,6 +85,27 @@ class TenantAuthSettingsRepository:
         )
 
 
+class DatabaseAliasRepository:
+    """Enumerates the database aliases the control plane currently references (Spec 10 / #77):
+    the pooled default plus every dedicated alias at least one tenant is assigned to. Backs the
+    fail-closed runtime guard's extension to every open engine (`app/db/guard.py`) -- the guard
+    always checks the pooled alias itself, and adds whatever this repository reports on top of
+    it, so an empty control plane (zero tenants) still guards the one engine every deployment
+    actually opens.
+
+    Calls `control.enumerate_database_aliases()` (migrations 0016/0017), a SECURITY DEFINER
+    function that returns alias strings only -- `app` never gains a cross-tenant view of
+    `control.tenants` itself. Enumerating aliases is a startup/readiness concern, never something
+    a tenant's own request needs.
+    """
+
+    async def list_referenced_aliases(self, session: AsyncSession) -> list[str]:
+        rows = await session.execute(
+            text("SELECT database_alias FROM control.enumerate_database_aliases()")
+        )
+        return [row[0] for row in rows]
+
+
 class ControlRepository:
     async def get_gateway_credential_alias(
         self, session: AsyncSession, ctx: RequestContext

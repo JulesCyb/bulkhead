@@ -47,12 +47,13 @@ def upgrade() -> None:
         """
         CREATE POLICY control_tenants_migration_read ON control.tenants
             FOR SELECT
-            -- session_user, not current_user: any role may set a custom setting, and
+            -- current_user, and only app_owner: any role may set a custom setting, and
             -- control.tenants_view runs with its owner's rights, so the flag alone would let
-            -- `app` read every tenant's row through the view. Only a login as app_owner (the
-            -- migration runner) can ever satisfy this policy.
+            -- `app` read every tenant's row through the view. A view does not change
+            -- current_user; only a SECURITY DEFINER function owned by app_owner (such as
+            -- enumerate_database_aliases below) or an app_owner login can satisfy this.
             USING (
-                session_user = 'app_owner'
+                current_user = 'app_owner'
                 AND current_setting('app.control_migration_read', true) = 'true'
             )
         """

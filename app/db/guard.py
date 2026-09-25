@@ -1,10 +1,22 @@
-"""Fail-closed role/RLS guard (ADR-0011, issue #15).
+"""Fail-closed role/RLS guard (ADR-0011, issue #15; extended to every open engine by Spec 10 /
+#77).
 
-The application refuses to ever start, and refuses to ever report itself ready, while it is
-connected as a database superuser, as a role that bypasses Row-Level Security, or while any
-table in the `public` schema lacks forced Row-Level Security. This is the same live check run
-once at ASGI lifespan startup (a failure there prevents the process from ever accepting traffic)
-and again, live, on every call to the `/ready` endpoint — never cached from the boot-time result.
+The application refuses to ever start, and refuses to ever report itself ready, while any
+database engine it might open is connected as a database superuser, as a role that bypasses Row-
+Level Security, or while any table in the `public` schema of that engine's database lacks forced
+Row-Level Security. This is the same live check run once at ASGI lifespan startup (a failure
+there prevents the process from ever accepting traffic) and again, live, on every call to the
+`/ready` endpoint — never cached from the boot-time result.
+
+`run_role_rls_guard` no longer checks only the one pooled `DATABASE_URL`: it first asks the control
+plane (`control.enumerate_database_aliases()`, via `DatabaseAliasRepository`) which database aliases
+are currently referenced -- the pooled default, always, plus every dedicated alias at least one
+tenant is assigned to (ADR-0002's hybrid-isolation seam, `app/db/engine_registry.py`) -- and then
+runs the identical check against each one's engine in turn. A dangling or misconfigured
+dedicated database (a privileged role, or a table missing forced RLS) fails startup exactly as a
+misconfigured pooled database would, even though nothing has routed a real request to it yet;
+iterating every alias, rather than stopping at the first one checked, is the point of the
+extension.
 
 Reuses `app.db.models.TENANT_ISOLATION_EXCEPTIONS`, the same exception list the schema-invariant
 test (`tests/test_rls_integration.py::test_public_schema_tenant_isolation_invariant`) enforces,
@@ -76,13 +88,33 @@ async def check_role_and_rls(conn: AsyncConnection) -> None:
         )
 
 
-async def run_role_rls_guard() -> None:
-    """Opens a connection from the application's own engine and runs `check_role_and_rls` on
-    it. This is the entry point both the ASGI lifespan (startup) and the readiness endpoint
-    (every call) use, so there is exactly one live implementation of the guard, not two that
-    could drift apart."""
-    from app.db.session import get_engine
+async def _referenced_aliases() -> list[str]:
+    """Every database alias the guard must check: the pooled default, unconditionally, plus
+    whatever `control.enumerate_database_aliases()` reports (the pooled default again, mirrored
+    back for every pooled tenant, plus one entry per distinct dedicated alias). The pooled alias
+    is included even before any tenant has been seeded, so a deployment with an empty control
+    plane still guards the one engine it actually opens."""
+    from app.db.engine_registry import POOLED_ALIAS
+    from app.db.session import control_session
+    from app.repositories.control import DatabaseAliasRepository
 
-    engine = get_engine()
-    async with engine.connect() as conn:
-        await check_role_and_rls(conn)
+    async with control_session() as session:
+        referenced = await DatabaseAliasRepository().list_referenced_aliases(session)
+    return sorted({POOLED_ALIAS, *referenced})
+
+
+async def run_role_rls_guard() -> None:
+    """Runs `check_role_and_rls` against every database engine the process might open: the
+    pooled one always, plus every dedicated alias `control.enumerate_database_aliases()` currently
+    references. Each alias's engine comes from `app.db.engine_registry.get_engine_for_alias`
+    (built lazily and cached, or `UnknownDatabaseAliasError` if a referenced alias has no
+    matching secret file -- itself a fail-closed condition this function does not catch). This
+    is the entry point both the ASGI lifespan (startup) and the readiness endpoint (every call)
+    use, so there is exactly one live implementation of the guard, not two that could drift
+    apart."""
+    from app.db.engine_registry import get_engine_for_alias
+
+    for alias in await _referenced_aliases():
+        engine = await get_engine_for_alias(alias)
+        async with engine.connect() as conn:
+            await check_role_and_rls(conn)
