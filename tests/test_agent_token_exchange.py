@@ -25,8 +25,12 @@ import app.token_verifier as token_verifier_module
 from app.config import Settings, get_settings
 from app.context import RequestContext
 from app.main import app
+from app.token_verifier import AGENT_IDENTITY_ISSUER
 
 SIGNING_KEY = "agent-token-exchange-test-shared-secret-32-bytes"
+# The tenant's own human-IdP issuer -- deliberately distinct from AGENT_IDENTITY_ISSUER below, to
+# prove the gap fix: an agent token's issuer is the identity's own (fixed) issuer, never the
+# tenant's, even when both happen to be configured.
 ISSUER = "https://idp.example.com"
 
 
@@ -64,9 +68,11 @@ def _install_fakes(
     identities: dict[uuid.UUID, tuple[str, str]],
     auth_settings: dict[uuid.UUID, str | None],
 ):
-    """`identities`: identity_id -> (issuer, subject). `auth_settings`: tenant_id -> issuer (or
-    None for "no control-plane row", falling back to the default issuer, mirroring the real
-    repository)."""
+    """`identities`: identity_id -> (issuer, subject). `auth_settings` is accepted for parity with
+    every call site (it documents the tenant's own, deliberately-unrelated configured issuer,
+    ISSUER) but is never consulted by the exchange itself -- the gap fix means only the agent
+    identity's own issuer (`identity.issuer`, i.e. AGENT_IDENTITY_ISSUER) decides what this mints
+    under, never a tenant's human-IdP setting."""
 
     class FakeAgentCredentialRepository:
         def __call__(self):
@@ -83,12 +89,7 @@ def _install_fakes(
             issuer, subject = pair
             return SimpleNamespace(id=identity_id, issuer=issuer, subject=subject)
 
-    class FakeTenantAuthSettingsRepository:
-        async def get(self, session, *, tenant_id, default_issuer=None):
-            if tenant_id not in auth_settings:
-                return None
-            issuer = auth_settings[tenant_id] or default_issuer
-            return SimpleNamespace(issuer=issuer, suspended=False)
+    del auth_settings  # documented above; unused by design
 
     monkeypatch.setattr(exchange_module, "tenant_session", lambda ctx: _fake_session())
     monkeypatch.setattr(exchange_module, "control_session", _fake_session)
@@ -96,9 +97,6 @@ def _install_fakes(
         exchange_module, "AgentCredentialRepository", FakeAgentCredentialRepository()
     )
     monkeypatch.setattr(exchange_module, "IdentityRepository", FakeIdentityRepository)
-    monkeypatch.setattr(
-        exchange_module, "TenantAuthSettingsRepository", FakeTenantAuthSettingsRepository
-    )
 
 
 def _settings(**overrides) -> Settings:
@@ -156,7 +154,7 @@ async def test_valid_credential_yields_a_token_scoped_to_its_own_tenant(
     _install_fakes(
         monkeypatch,
         store=store,
-        identities={identity_id: (ISSUER, "agent-sub-1")},
+        identities={identity_id: (AGENT_IDENTITY_ISSUER, "agent-sub-1")},
         auth_settings={tenant_id: ISSUER},
     )
 
@@ -170,12 +168,15 @@ async def test_valid_credential_yields_a_token_scoped_to_its_own_tenant(
         body["access_token"],
         SIGNING_KEY,
         algorithms=["HS256"],
-        issuer=ISSUER,
+        issuer=AGENT_IDENTITY_ISSUER,
         audience=str(tenant_id),
     )
     assert claims["sub"] == "agent-sub-1"
     assert claims["aud"] == str(tenant_id)
-    assert claims["iss"] == ISSUER
+    # Gap fix: the agent identity's own issuer, never the tenant's own configured one (ISSUER
+    # above) -- see module docstring in app/agent_credential_exchange.py.
+    assert claims["iss"] == AGENT_IDENTITY_ISSUER
+    assert claims["cred"] == "agt_abc"
 
 
 # --- AC2: unknown identifier, wrong secret, and revoked all fail exactly the same way ---
@@ -216,7 +217,7 @@ async def test_every_failure_kind_produces_the_identical_response(
     _install_fakes(
         monkeypatch,
         store=store,
-        identities={identity_id: (ISSUER, "agent-sub-1")},
+        identities={identity_id: (AGENT_IDENTITY_ISSUER, "agent-sub-1")},
         auth_settings={tenant_id: ISSUER},
     )
 
@@ -254,7 +255,7 @@ async def test_all_three_failure_responses_are_byte_identical_to_each_other(
     _install_fakes(
         monkeypatch,
         store=store,
-        identities={identity_id: (ISSUER, "agent-sub-1")},
+        identities={identity_id: (AGENT_IDENTITY_ISSUER, "agent-sub-1")},
         auth_settings={tenant_id: ISSUER},
     )
 
@@ -287,7 +288,7 @@ async def test_last_used_advances_only_on_success(monkeypatch, client_settings):
     _install_fakes(
         monkeypatch,
         store=store,
-        identities={identity_id: (ISSUER, "agent-sub-1")},
+        identities={identity_id: (AGENT_IDENTITY_ISSUER, "agent-sub-1")},
         auth_settings={tenant_id: ISSUER},
     )
 
@@ -320,7 +321,7 @@ async def test_issued_token_round_trips_through_the_shared_verifier(monkeypatch,
     _install_fakes(
         monkeypatch,
         store=store,
-        identities={identity_id: (ISSUER, "agent-sub-1")},
+        identities={identity_id: (AGENT_IDENTITY_ISSUER, "agent-sub-1")},
         auth_settings={tenant_id: ISSUER},
     )
 
@@ -335,7 +336,7 @@ async def test_issued_token_round_trips_through_the_shared_verifier(monkeypatch,
 
     class FakeIdentityRepositoryForVerify:
         async def find_by_issuer_and_subject(self, session, *, issuer, subject):
-            if (issuer, subject) != (ISSUER, "agent-sub-1"):
+            if (issuer, subject) != (AGENT_IDENTITY_ISSUER, "agent-sub-1"):
                 return None
             return SimpleNamespace(id=identity_id, issuer=issuer, subject=subject)
 
@@ -345,7 +346,11 @@ async def test_issued_token_round_trips_through_the_shared_verifier(monkeypatch,
 
     class FakeTenantAuthSettingsRepositoryForVerify:
         async def get(self, session, *, tenant_id, default_issuer=None):
-            return SimpleNamespace(issuer=ISSUER, suspended=False)
+            # Never called for an agent-issuer token (see module docstring in
+            # app/token_verifier.py) -- present only to prove that: if this were consulted, it
+            # would return the tenant's own (different) issuer, which would fail signature
+            # verification against SIGNING_KEY under the wrong `iss`.
+            raise AssertionError("tenant auth settings must not be consulted for an agent token")
 
     monkeypatch.setattr(token_verifier_module, "control_session", _fake_session)
     monkeypatch.setattr(token_verifier_module, "tenant_session", lambda ctx: _fake_session())
@@ -369,6 +374,8 @@ async def test_issued_token_round_trips_through_the_shared_verifier(monkeypatch,
 
     assert resolved.identity_id == identity_id
     assert resolved.role == "agent"
+    assert resolved.issuer == AGENT_IDENTITY_ISSUER
+    assert resolved.credential_public_id == "agt_abc"
 
 
 # --- Misconfiguration fails closed rather than minting an unusable or unsigned token ---
@@ -391,7 +398,7 @@ async def test_missing_signing_key_fails_the_exchange(monkeypatch):
     _install_fakes(
         monkeypatch,
         store=store,
-        identities={identity_id: (ISSUER, "agent-sub-1")},
+        identities={identity_id: (AGENT_IDENTITY_ISSUER, "agent-sub-1")},
         auth_settings={tenant_id: ISSUER},
     )
     settings = _settings(agent_token_signing_key=None)

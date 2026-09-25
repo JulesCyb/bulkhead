@@ -175,6 +175,13 @@ def _settings(environment: str) -> Settings:
         auth_mode="dev-headers" if environment != "prod" else "jwt",
         embedding_provider="openai",
         embedding_model="text-embedding-3-small",
+        # A prod-like environment must configure the networked MCP transport (issue #48 / #49) --
+        # the stdio transport's process-wide identity fallback is dev/test-only, guarded by
+        # check_mcp_mode the same way AUTH_MODE=dev-headers is.
+        mcp_transport="streamable-http" if environment == "prod" else "stdio",
+        jwt_verification_key="prod-like-settings-test-verification-key"
+        if environment == "prod"
+        else None,
     )
 
 
