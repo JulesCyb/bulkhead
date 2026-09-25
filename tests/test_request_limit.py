@@ -71,8 +71,11 @@ def low_limit(monkeypatch):
 
 
 @pytest.fixture
-def client(monkeypatch, fake_search, test_model, low_limit):
+def client(monkeypatch, fake_search, fake_history, test_model, low_limit):
     monkeypatch.setattr(assistant_module.document_tools, "search_documents", fake_search)
+    monkeypatch.setattr(
+        assistant_module.conversation_tools, "load_conversation_history", fake_history
+    )
     transport = httpx.ASGITransport(app=app)
     return httpx.AsyncClient(transport=transport, base_url="http://test")
 
