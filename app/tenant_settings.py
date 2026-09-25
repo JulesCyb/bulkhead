@@ -3,8 +3,11 @@
 Also the home of the tenant-editable retention period (ADR-0006, Spec 4 / #35): how long a
 tenant's conversations and messages live, measured from `conversations.last_activity_at`, before
 the retention job (`app/retention.py`, `scripts/retention.py`) deletes them. A tenant's admin sets
-`settings["retention_days"]` like any other tenant-editable setting; `DEFAULT_RETENTION_DAYS`
-below is the documented, conservative fallback used for every tenant that never sets one.
+`settings["retention_days"]` like any other tenant-editable setting, read back out through
+`app.repositories.tenant_settings.TenantSettingsRepository` -- the one place any caller resolves
+this JSONB column, exactly like `app.observability` already does for `content_tracing_opt_in`.
+`DEFAULT_RETENTION_DAYS` below is the documented, conservative fallback used for every tenant that
+never sets one.
 
 `tenants.settings` is a free-form JSONB column the `app` role may write on the tenant's own row
 (the one column-level write grant a tenant's own request has, per #12/ADR-0011 — every other
@@ -34,10 +37,6 @@ import re
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, PositiveInt, model_validator
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.context import RequestContext
 
 # The conservative default retention period (days) for a tenant's conversations and messages
 # (ADR-0006) when the tenant has never set `settings["retention_days"]` itself: long enough to
@@ -101,6 +100,16 @@ class TenantSettings(BaseModel):
     # tenant can only ever make its own retention *shorter or longer*, never disable the job.
     retention_days: PositiveInt | None = None
 
+    # `tenants.settings["content_tracing_opt_in"]` (Spec 8 / #62, ADR-0008): whether this
+    # tenant's agent runs may include prompts, tool arguments, and document text in the spans
+    # sent to the trace sink. Off by default -- tracing always carries identifiers, timings, and
+    # errors, never content, until the tenant admin explicitly opts in. Deliberately a tenant
+    # preference (not an operator-owned control-plane fact like residency): ADR-0008's user
+    # stories describe it as something "a tenant admin" turns on for their own tenant, scoped to
+    # the whole tenant, not a per-run toggle -- see `app.observability`, which is the one place
+    # this value is turned into an actual `InstrumentationSettings.include_content`.
+    content_tracing_opt_in: bool = False
+
     @model_validator(mode="before")
     @classmethod
     def _reject_alias_isolation_and_dsn_shaped_input(cls, data: Any) -> Any:
@@ -120,19 +129,3 @@ class TenantSettings(BaseModel):
                     "never hold a DSN, hostname, or credential."
                 )
         return data
-
-
-async def get_retention_days(session: AsyncSession, ctx: RequestContext) -> int:
-    """`ctx.tenant_id`'s own retention period in days (ADR-0006): its `settings["retention_days"]`
-    if it has set one, otherwise `DEFAULT_RETENTION_DAYS`. Reads `tenants.settings` through the
-    same tenant-bound, RLS-scoped session every other read of that column uses (the
-    `tenants_self_only` policy already restricts this to the caller's own row) -- no separate,
-    cross-tenant path.
-    """
-    from app.db.models import Tenant  # local import: avoids a cycle at module import time
-
-    row = (
-        await session.execute(select(Tenant.settings).where(Tenant.id == ctx.tenant_id))
-    ).scalar_one_or_none()
-    settings = TenantSettings.model_validate(row or {})
-    return settings.retention_days or DEFAULT_RETENTION_DAYS

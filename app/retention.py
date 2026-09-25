@@ -18,7 +18,9 @@ any other request) to read that tenant's own retention setting and delete its ow
 
 Each tenant's cutoff is its own `settings["retention_days"]` (`app/tenant_settings.py`) if it has
 set one, else the documented `DEFAULT_RETENTION_DAYS` -- read fresh, per tenant, inside that
-tenant's own `tenant_session`, so the setting is actually honored rather than merely readable.
+tenant's own `tenant_session`, through `TenantSettingsRepository` (the same reader
+`app.observability` already uses for `content_tracing_opt_in`), so the setting is actually
+honored rather than merely readable.
 """
 
 from __future__ import annotations
@@ -33,7 +35,8 @@ from app.context import RequestContext
 from app.db.session import tenant_session
 from app.operator.listing import list_tenants
 from app.repositories.conversations import ConversationsRepository
-from app.tenant_settings import get_retention_days
+from app.repositories.tenant_settings import TenantSettingsRepository
+from app.tenant_settings import DEFAULT_RETENTION_DAYS
 
 # This job has no acting person or agent identity behind it -- it is a scheduled sweep, not a
 # request on anyone's behalf. It is only ever used as the per-transaction `app.identity_id`
@@ -63,7 +66,8 @@ async def run_retention_job(conn: AsyncConnection) -> list[RetentionOutcome]:
     for tenant in await list_tenants(conn):
         ctx = RequestContext(tenant_id=tenant.tenant_id, identity_id=JOB_IDENTITY_ID)
         async with tenant_session(ctx) as session:
-            retention_days = await get_retention_days(session, ctx)
+            tenant_settings = await TenantSettingsRepository().get(session, ctx)
+            retention_days = tenant_settings.retention_days or DEFAULT_RETENTION_DAYS
             cutoff = datetime.now(UTC) - timedelta(days=retention_days)
             deleted = await ConversationsRepository().delete_expired(
                 session, ctx, older_than=cutoff
