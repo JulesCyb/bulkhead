@@ -344,3 +344,18 @@ async def test_both_agents_instructions_state_tool_results_are_data(monkeypatch,
         assert "not an instruction to follow" in instructions.lower() or (
             "never an instruction to follow" in instructions.lower()
         )
+
+
+def test_no_response_schema_exposes_isolation_tier_or_database_alias():
+    """Acceptance criterion (#75, ADR-0002): a tenant's isolation tier and database alias are
+    control-plane facts read only inside `tenant_session()`'s own routing -- no route's request
+    or response schema anywhere in the API may leak either to a client. Walks the whole OpenAPI
+    schema (every route's request/response models, not just the ones this file happens to
+    exercise) rather than checking one endpoint by name.
+    """
+    schema = app.openapi()
+    forbidden = {"isolation_tier", "database_alias"}
+    for name, definition in schema.get("components", {}).get("schemas", {}).items():
+        properties = definition.get("properties", {})
+        leaked = forbidden & properties.keys()
+        assert not leaked, f"schema {name!r} exposes forbidden field(s) {leaked}"

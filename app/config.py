@@ -74,6 +74,12 @@ class Settings(BaseSettings):
     # SecretStr (issue #14 / ADR-0011): every tenant-secret and connection-string field is held
     # this way so the object's own repr/str never prints a live value — read with
     # .get_secret_value() only at the one call site that needs the plain value.
+    # This is the *pooled* alias's connection string only (ADR-0002, `app.db.engine_registry`,
+    # Spec 10 / #75) -- the one database every tenant is served from until an operator marks it
+    # `dedicated`. It is never the place for a second tenant's (or any dedicated tenant's)
+    # connection details: those live one-per-alias in tenant-secret files under
+    # `TENANT_DB_SECRETS_DIR` (ADR-0011), resolved lazily by `app.db.engine_registry`, never as a
+    # field on this class.
     database_url: SecretStr = SecretStr("postgresql+asyncpg://app:app@localhost:5432/app")
     # The owner/migrations connection string is NOT a field here (issue #14 / ADR-0011): it is
     # removed from the application's configuration object entirely, so no code path in the

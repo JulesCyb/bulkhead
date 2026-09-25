@@ -22,6 +22,17 @@ control.tenant_auth_settings()) and must never be used against a tenant's own ta
 tenant context set, current_setting(..., true) is NULL there too, so every tenant-scoped RLS
 policy blocks all rows anyway -- but the point of this session mode is to make that the *only*
 thing it can ever do, not to rely on RLS to save a misuse of it.
+
+tenant_session() also resolves, on every call, which physical database serves `ctx.tenant_id`
+(ADR-0002, Spec 10 / #75): it reads that tenant's isolation tier and database alias from the
+control plane (`control.tenants_view`, always read against the pooled database -- the control
+plane is never itself a dedicated tenant's data) and asks `app.db.engine_registry` for the
+engine that alias names. A pooled tenant (the default; also any tenant control.tenants has no
+row for at all, since ADR-0002 defaults every tenant to pooled) is served from the exact same
+process-wide pooled engine and session factory as before this ticket; a dedicated tenant is
+served from its own engine, built and cached by the registry from its alias's tenant-secret
+file. Every caller keeps the exact same signature and transaction behaviour either way -- no
+repository, tool, or agent run needs to know or change anything.
 """
 
 from __future__ import annotations
@@ -78,10 +89,59 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
     return _session_factory
 
 
+async def _resolve_tenant_alias(ctx: RequestContext) -> str:
+    """The database alias that serves `ctx.tenant_id`, read fresh from the control plane on
+    every call (ADR-0002, Spec 10 / #75).
+
+    Always reads `control.tenants_view` against the pooled engine: the control plane itself is
+    never sharded across dedicated databases. No control-plane row for the tenant, or an
+    `isolation_tier` of `'pooled'`, both resolve to the pooled alias -- ADR-0002 defaults every
+    tenant to pooled until an operator marks it dedicated, and the current test suite's tenants
+    (seeded only in `public.tenants`, not `control.tenants`) rely on exactly that default.
+    """
+    from app.db.engine_registry import POOLED_ALIAS  # local import: avoids a circular import
+
+    async with get_session_factory()() as session:
+        async with session.begin():
+            await session.execute(
+                text("SELECT set_config('app.tenant_id', :tid, true)"),
+                {"tid": str(ctx.tenant_id)},
+            )
+            row = (
+                (
+                    await session.execute(
+                        text(
+                            "SELECT isolation_tier, database_alias FROM control.tenants_view "
+                            "WHERE tenant_id = :tid"
+                        ),
+                        {"tid": str(ctx.tenant_id)},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+
+    if row is None or row["isolation_tier"] == "pooled":
+        return POOLED_ALIAS
+    return row["database_alias"]
+
+
 @asynccontextmanager
 async def tenant_session(ctx: RequestContext) -> AsyncIterator[AsyncSession]:
-    """One transaction in the tenant's context. Commit at the end, rollback on error."""
-    async with get_session_factory()() as session:
+    """One transaction in the tenant's context, against whichever database the control plane
+    currently assigns `ctx.tenant_id` to (ADR-0002, Spec 10 / #75; see module docstring).
+    Commit at the end, rollback on error."""
+    from app.db.engine_registry import POOLED_ALIAS, get_engine_for_alias  # avoids a cycle
+
+    alias = await _resolve_tenant_alias(ctx)
+    engine = await get_engine_for_alias(alias)
+    factory = (
+        get_session_factory()
+        if alias == POOLED_ALIAS
+        else async_sessionmaker(engine, expire_on_commit=False)
+    )
+
+    async with factory() as session:
         async with session.begin():
             await session.execute(
                 text("SELECT set_config('app.tenant_id', :tid, true)"),
