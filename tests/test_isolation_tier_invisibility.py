@@ -84,6 +84,26 @@ def test_tenant_settings_accepts_known_tenant_preferences():
     assert settings.model == "anthropic:claude-sonnet-4-5"
 
 
+def test_tenant_settings_accepts_a_positive_retention_days_override():
+    """A tenant admin's own retention period (ADR-0006, #35): a tenant-editable setting, not an
+    operator-owned control-plane fact -- unlike residency/isolation tier/database alias above."""
+    settings = TenantSettings.model_validate({"retention_days": 30})
+    assert settings.retention_days == 30
+
+
+def test_tenant_settings_defaults_retention_days_to_none():
+    """None (never set) is the signal `app.tenant_settings.get_retention_days` reads as "use
+    DEFAULT_RETENTION_DAYS" -- not the default value baked into this model itself."""
+    assert TenantSettings.model_validate({}).retention_days is None
+
+
+def test_tenant_settings_rejects_a_non_positive_retention_days():
+    with pytest.raises(ValidationError):
+        TenantSettings.model_validate({"retention_days": 0})
+    with pytest.raises(ValidationError):
+        TenantSettings.model_validate({"retention_days": -5})
+
+
 def test_tenant_settings_rejects_residency():
     """Residency is an operator-owned control-plane fact (ADR-0008), never a tenant setting."""
     with pytest.raises(ValidationError):

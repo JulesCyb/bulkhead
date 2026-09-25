@@ -59,6 +59,7 @@ Tests: `uv run pytest` — the RLS integration test is skipped when `pgserver` i
 | Schema + RLS | `migrations/versions/0001_initial.py` | tenants, users, documents (vector 1536), policies, grants |
 | Roles | `docker/postgres/01-init.sh` | `app` (no superuser/BYPASSRLS, the long-running API's own role) and `app_owner` (no superuser/BYPASSRLS, owns every object, runs migrations only) |
 | Repository | `app/repositories/documents.py`, `app/repositories/conversations.py` | the only path to the DB — vector search, and server-held conversation history under RLS (ADR-0006) |
+| Retention | `app/retention.py`, `scripts/retention.py` | deletes each tenant's expired conversations (and their messages) through the same tenant-bound session every request uses — default 90 days, overridable per tenant via `tenants.settings["retention_days"]` (ADR-0006) |
 | Tools | `app/tools/documents.py` | context-aware search, shared by agent and MCP |
 | Agent | `app/agents/assistant.py` | PydanticAI agent, model resolved at runtime, tracing metadata |
 | API | `app/api/` | `/v1/t/{tenant_id}/agents/assistant/run`, `/v1/t/{tenant_id}/agents/assistant/stream` (SSE, both one-shot, no memory); `/v1/t/{tenant_id}/api/chat` (Vercel AI SDK) — server-held history: the server loads the stored conversation, trusts only the client's newest member-authored message, and persists the run's new messages back through the repository once it completes, independent of the client's own stream (ADR-0006) |

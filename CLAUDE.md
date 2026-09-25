@@ -30,6 +30,7 @@ uv run python scripts/migrate.py          # migrations run once per database ali
 uv run python scripts/migrate.py <alias>  # migrations for just that one alias (owner role)
 uv run python scripts/operator.py create "My Tenant" --residency eu --admin-email me@example.com  # first tenant + admin
 uv run python scripts/provision_roles.py <admin-database-url>  # managed Postgres, no init hook
+uv run python scripts/retention.py        # delete every tenant's expired conversations (ADR-0006; default 90 days)
 uv run uvicorn app.main:app --reload      # API locally, http://localhost:8000/docs
 uv run pytest                             # tests (must be green before every commit)
 uv run pytest tests/test_rls_integration.py   # real RLS test (needs: uv sync --group dbtest)
@@ -65,6 +66,13 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    `ENABLE`/`FORCE ROW LEVEL SECURITY`, and a policy `tenant_id = current_setting('app.tenant_id',
    true)::uuid` (USING and WITH CHECK) plus a GRANT to the `app` role, and must be added to the
    tenant-table registry (`app/db/tenant_tables.py`). Template: `migrations/versions/0001_initial.py`.
+   `conversations` and `messages` (migration `0020_conversations_and_messages.py`) are additionally
+   governed, with no exception, by the tenant's own retention period (ADR-0006): a tenant's own
+   `settings["retention_days"]`, or the documented default of `DEFAULT_RETENTION_DAYS` (90 days,
+   `app/tenant_settings.py`) when it has never set one, measured from `last_activity_at`. The
+   retention job (`app/retention.py`, run via `scripts/retention.py`) deletes what that period
+   expires, one tenant at a time, through the same `tenant_session(ctx)` every other request uses
+   — never a superuser or bypass-RLS statement against either table.
 3. **DB access only through repositories** (`app/repositories/`) with sessions from
    `tenant_session(ctx)`. `tenant_session(ctx)` resolves which engine to use internally, from the
    tenant's isolation tier and database alias in the control plane (ADR-0002) — pooled by
@@ -114,6 +122,7 @@ app/agents/           PydanticAI agents
 app/api/              routers: /health, /ready, /v1/t/{tenant_id}/agents/assistant/{run,stream}, /v1/t/{tenant_id}/api/chat
 app/mcp/server.py     MCP server (stdio)
 app/llm.py            provider abstraction; app/embeddings.py; app/observability.py
+app/retention.py      conversation retention job (ADR-0006); scripts/retention.py is its entry point
 migrations/           Alembic (async), 0001_initial.py as the template
 tests/                pytest; RLS integration test with pgserver
 docker/               Postgres init (app role), LiteLLM config

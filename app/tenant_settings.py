@@ -1,5 +1,11 @@
 """The schema for `public.tenants.settings` (Spec 10 / #78, ADR-0002, ADR-0011).
 
+Also the home of the tenant-editable retention period (ADR-0006, Spec 4 / #35): how long a
+tenant's conversations and messages live, measured from `conversations.last_activity_at`, before
+the retention job (`app/retention.py`, `scripts/retention.py`) deletes them. A tenant's admin sets
+`settings["retention_days"]` like any other tenant-editable setting; `DEFAULT_RETENTION_DAYS`
+below is the documented, conservative fallback used for every tenant that never sets one.
+
 `tenants.settings` is a free-form JSONB column the `app` role may write on the tenant's own row
 (the one column-level write grant a tenant's own request has, per #12/ADR-0011 — every other
 column of `control.tenants`/`public.tenants` is read-only to a tenant). Isolation tier and
@@ -27,7 +33,19 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, PositiveInt, model_validator
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.context import RequestContext
+
+# The conservative default retention period (days) for a tenant's conversations and messages
+# (ADR-0006) when the tenant has never set `settings["retention_days"]` itself: long enough to
+# support a review of a recent exchange or an approval dispute, short enough that the pooled
+# tenants table does not grow into an unbounded, indefinite record of everyone's conversations.
+# Stated here (not only readable from a migration) so it is the one place both the job and the
+# project's own docs cite.
+DEFAULT_RETENTION_DAYS = 90
 
 # Substrings that mark a settings key as naming a database alias, isolation tier, or credential/
 # connection-string field rather than a genuine tenant preference — checked against the
@@ -77,6 +95,12 @@ class TenantSettings(BaseModel):
     # ADR-0008), so a tenant cannot move itself to another jurisdiction.
     model: str | None = None
 
+    # `tenants.settings["retention_days"]` (ADR-0006, `app/retention.py`): how many days of no
+    # activity (`conversations.last_activity_at`) a conversation may go before the retention job
+    # deletes it and its messages. `None` (never set) means "use DEFAULT_RETENTION_DAYS" -- a
+    # tenant can only ever make its own retention *shorter or longer*, never disable the job.
+    retention_days: PositiveInt | None = None
+
     @model_validator(mode="before")
     @classmethod
     def _reject_alias_isolation_and_dsn_shaped_input(cls, data: Any) -> Any:
@@ -96,3 +120,19 @@ class TenantSettings(BaseModel):
                     "never hold a DSN, hostname, or credential."
                 )
         return data
+
+
+async def get_retention_days(session: AsyncSession, ctx: RequestContext) -> int:
+    """`ctx.tenant_id`'s own retention period in days (ADR-0006): its `settings["retention_days"]`
+    if it has set one, otherwise `DEFAULT_RETENTION_DAYS`. Reads `tenants.settings` through the
+    same tenant-bound, RLS-scoped session every other read of that column uses (the
+    `tenants_self_only` policy already restricts this to the caller's own row) -- no separate,
+    cross-tenant path.
+    """
+    from app.db.models import Tenant  # local import: avoids a cycle at module import time
+
+    row = (
+        await session.execute(select(Tenant.settings).where(Tenant.id == ctx.tenant_id))
+    ).scalar_one_or_none()
+    settings = TenantSettings.model_validate(row or {})
+    return settings.retention_days or DEFAULT_RETENTION_DAYS
