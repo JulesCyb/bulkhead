@@ -5,7 +5,7 @@ Two ephemeral `pgserver` instances stand in for the pooled default database and 
 tenant's own database. Both get the full migration suite (so `control.tenants`, `tenants`, and
 RLS all exist for real). A dedicated tenant's control-plane bookkeeping row necessarily lives in
 the pooled database too (`control.tenants` FK-references `public.tenants`) -- what these tests
-prove absent from the pooled database is the tenant's own *data* (a row in `users`), not that
+prove absent from the pooled database is the tenant's own *data* (a row in `memberships`), not that
 bookkeeping stub.
 """
 
@@ -142,16 +142,32 @@ async def _seed_tenant(
 
 
 async def _seed_user(migrations_url: str, tenant_id: uuid.UUID, email: str) -> None:
+    """A global identity (subject = email) plus its membership in `tenant_id` -- the tenant's own
+    row of data these tests look for."""
     engine = create_async_engine(migrations_url)
+    identity_id = uuid.uuid4()
     async with engine.begin() as conn:
+        await conn.execute(
+            text("INSERT INTO control.identities (id, issuer, subject) VALUES (:id, :iss, :sub)"),
+            # A fresh issuer per call: the databases are module-scoped, the emails repeat.
+            {"id": identity_id, "iss": f"test-{identity_id}", "sub": email},
+        )
         await conn.execute(
             text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": str(tenant_id)}
         )
         await conn.execute(
-            text("INSERT INTO users (tenant_id, email) VALUES (:tid, :email)"),
-            {"tid": tenant_id, "email": email},
+            text(
+                "INSERT INTO memberships (tenant_id, identity_id, role) "
+                "VALUES (:tid, :iid, 'member')"
+            ),
+            {"tid": tenant_id, "iid": identity_id},
         )
     await engine.dispose()
+
+
+_MEMBER_EMAILS = (
+    "SELECT l.subject FROM memberships m JOIN control.identity_lookup l ON l.id = m.identity_id"
+)
 
 
 async def test_pooled_tenant_is_served_from_the_default_instance_and_sees_only_its_own_rows(
@@ -171,7 +187,7 @@ async def test_pooled_tenant_is_served_from_the_default_instance_and_sees_only_i
     ctx = RequestContext(tenant_id=tenant, identity_id=uuid.uuid4())
     async with tenant_session(ctx) as session:
         assert session.get_bind() is get_engine().sync_engine
-        emails = (await session.execute(text("SELECT email FROM users"))).scalars().all()
+        emails = (await session.execute(text(_MEMBER_EMAILS))).scalars().all()
         assert emails == ["pooled@example.com"]
 
 
@@ -197,7 +213,7 @@ async def test_dedicated_tenant_is_served_from_its_own_instance_and_sees_only_it
     ctx = RequestContext(tenant_id=tenant, identity_id=uuid.uuid4())
     async with tenant_session(ctx) as session:
         assert session.get_bind() is not get_engine().sync_engine
-        emails = (await session.execute(text("SELECT email FROM users"))).scalars().all()
+        emails = (await session.execute(text(_MEMBER_EMAILS))).scalars().all()
         assert emails == ["dedicated@example.com"]
 
 
@@ -229,7 +245,7 @@ async def test_dedicated_tenants_data_is_physically_absent_from_the_pooled_datab
             await conn.execute(
                 text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": str(tenant)}
             )
-            emails = (await conn.execute(text("SELECT email FROM users"))).scalars().all()
+            emails = (await conn.execute(text(_MEMBER_EMAILS))).scalars().all()
     assert emails == []
 
 
@@ -248,5 +264,5 @@ async def test_tenant_with_no_control_plane_row_defaults_to_pooled(routing_env):
     ctx = RequestContext(tenant_id=tenant, identity_id=uuid.uuid4())
     async with tenant_session(ctx) as session:
         assert session.get_bind() is get_engine().sync_engine
-        emails = (await session.execute(text("SELECT email FROM users"))).scalars().all()
+        emails = (await session.execute(text(_MEMBER_EMAILS))).scalars().all()
         assert emails == ["no-control-row@example.com"]

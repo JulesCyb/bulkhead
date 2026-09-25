@@ -71,19 +71,25 @@ class Tenant(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
-class User(Base):
-    __tablename__ = "users"
-    # Mirrors migration 0001 exactly (constraint + index names included), so that a later
+class Membership(Base):
+    """A tenant's roster of who belongs to it (ADR-0003, Spec 2 / #23): tenant, a cross-schema
+    reference to the global `control.identities` row, and that identity's role in the tenant.
+    Replaces the retired `users` table -- an identity is global, a membership is per tenant."""
+
+    __tablename__ = "memberships"
+    # Mirrors migration 0009 exactly (constraint + index names included), so that a later
     # `alembic revision --autogenerate` does not emit destructive drift.
     __table_args__ = (
-        UniqueConstraint("tenant_id", "email"),
-        Index("users_tenant_idx", "tenant_id"),
+        UniqueConstraint("tenant_id", "identity_id"),
+        Index("memberships_tenant_idx", "tenant_id"),
     )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[UUID] = mapped_column(ForeignKey("tenants.id"))
-    email: Mapped[str] = mapped_column(String(320))
-    role: Mapped[str] = mapped_column(String(50), default="member")
+    # control.identities lives outside the public schema and carries no RLS policy of its own
+    # (ADR-0003) -- this is a plain FK, not a tenant-isolated relation.
+    identity_id: Mapped[UUID] = mapped_column(ForeignKey("control.identities.id"))
+    role: Mapped[str] = mapped_column(String(50))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
