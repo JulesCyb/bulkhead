@@ -9,6 +9,13 @@ from functools import lru_cache
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Role-level settings for the `app` role (Spec 7 / #55): applied once in
+# docker/postgres/01-init.sh, mirrored here so the embedded-Postgres integration test can assert
+# them without duplicating literals. Independent of Settings.db_statement_timeout_ms below, which
+# is the per-transaction timeout the application sets on every tenant_session().
+ROLE_STATEMENT_TIMEOUT_MS = 60_000
+ROLE_CONNECTION_LIMIT = 50
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -19,6 +26,17 @@ class Settings(BaseSettings):
 
     database_url: str = "postgresql+asyncpg://app:app@localhost:5432/app"
     database_url_migrations: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/app"
+
+    # Explicit pool sizing (Spec 7 / #55) — named configuration instead of SQLAlchemy/driver
+    # defaults, so the deployment's real concurrency ceiling (pool_size + max_overflow, per
+    # worker process) is visible in one place instead of guessed.
+    db_pool_size: int = 5
+    db_max_overflow: int = 10
+    db_pool_timeout: int = 30  # seconds a checkout waits for a free connection
+    db_pool_recycle: int = 1800  # seconds before a pooled connection is recycled
+    # Per-transaction statement timeout (ms), set with SET LOCAL in tenant_session() so a
+    # runaway query is cut off inside that tenant's transaction and the connection is freed.
+    db_statement_timeout_ms: int = 30_000
 
     llm_model: str = "anthropic:claude-sonnet-4-5"
     litellm_base_url: str | None = None

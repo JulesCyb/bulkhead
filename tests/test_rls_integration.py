@@ -29,16 +29,29 @@ def _vec(seed: float) -> str:
     return "[" + ",".join(f"{v:.3f}" for v in values) + "]"
 
 
+def _psql(server, command: str) -> None:
+    """`server.psql` without a shell: pgserver's own version breaks on paths with spaces."""
+    from pgserver.postgres_server import POSTGRES_BIN_PATH
+
+    subprocess.run(
+        [str(POSTGRES_BIN_PATH / "psql"), server.get_uri()],
+        input=command.encode(),
+        check=True,
+        capture_output=True,
+    )
+
+
 @pytest.fixture(scope="module")
 def database_urls():
     pgdata = tempfile.mkdtemp(prefix="pgdata-")
     server = pgserver.get_server(pgdata)
     sockdir = parse_qs(urlparse(server.get_uri()).query)["host"][0]
-    server.psql(
+    _psql(
+        server,
         "CREATE ROLE app LOGIN NOSUPERUSER NOBYPASSRLS; "
         "GRANT USAGE ON SCHEMA public TO app; "
         "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE "
-        "ON TABLES TO app;"
+        "ON TABLES TO app;",
     )
     urls = {
         "migrations": f"postgresql+asyncpg://postgres@/postgres?host={sockdir}",
