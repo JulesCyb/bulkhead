@@ -138,12 +138,13 @@ async def test_chunked_body_under_the_cap_still_succeeds(monkeypatch, fake_searc
 
     from app.agents import assistant as assistant_module
     from app.api import chat as chat_module
+    from tests.conftest import resolve_to_model
 
     monkeypatch.setattr(assistant_module.document_tools, "search_documents", fake_search)
     monkeypatch.setattr(
         assistant_module.conversation_tools, "load_conversation_history", fake_history
     )
-    monkeypatch.setattr(chat_module, "get_model", lambda name=None: TestModel())
+    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(TestModel()))
     payload = _chat_body_json(text_len=100)
 
     async def chunked_body() -> AsyncIterator[bytes]:

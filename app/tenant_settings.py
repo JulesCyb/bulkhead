@@ -1,5 +1,14 @@
 """The schema for `public.tenants.settings` (Spec 10 / #78, ADR-0002, ADR-0011).
 
+Also the home of the tenant-editable retention period (ADR-0006, Spec 4 / #35): how long a
+tenant's conversations and messages live, measured from `conversations.last_activity_at`, before
+the retention job (`app/retention.py`, `scripts/retention.py`) deletes them. A tenant's admin sets
+`settings["retention_days"]` like any other tenant-editable setting, read back out through
+`app.repositories.tenant_settings.TenantSettingsRepository` -- the one place any caller resolves
+this JSONB column, exactly like `app.observability` already does for `content_tracing_opt_in`.
+`DEFAULT_RETENTION_DAYS` below is the documented, conservative fallback used for every tenant that
+never sets one.
+
 `tenants.settings` is a free-form JSONB column the `app` role may write on the tenant's own row
 (the one column-level write grant a tenant's own request has, per #12/ADR-0011 — every other
 column of `control.tenants`/`public.tenants` is read-only to a tenant). Isolation tier and
@@ -27,7 +36,15 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, PositiveInt, model_validator
+
+# The conservative default retention period (days) for a tenant's conversations and messages
+# (ADR-0006) when the tenant has never set `settings["retention_days"]` itself: long enough to
+# support a review of a recent exchange or an approval dispute, short enough that the pooled
+# tenants table does not grow into an unbounded, indefinite record of everyone's conversations.
+# Stated here (not only readable from a migration) so it is the one place both the job and the
+# project's own docs cite.
+DEFAULT_RETENTION_DAYS = 90
 
 # Substrings that mark a settings key as naming a database alias, isolation tier, or credential/
 # connection-string field rather than a genuine tenant preference — checked against the
@@ -76,6 +93,22 @@ class TenantSettings(BaseModel):
     # here on purpose: it is an operator-owned control-plane fact (`control.tenants.residency`,
     # ADR-0008), so a tenant cannot move itself to another jurisdiction.
     model: str | None = None
+
+    # `tenants.settings["retention_days"]` (ADR-0006, `app/retention.py`): how many days of no
+    # activity (`conversations.last_activity_at`) a conversation may go before the retention job
+    # deletes it and its messages. `None` (never set) means "use DEFAULT_RETENTION_DAYS" -- a
+    # tenant can only ever make its own retention *shorter or longer*, never disable the job.
+    retention_days: PositiveInt | None = None
+
+    # `tenants.settings["content_tracing_opt_in"]` (Spec 8 / #62, ADR-0008): whether this
+    # tenant's agent runs may include prompts, tool arguments, and document text in the spans
+    # sent to the trace sink. Off by default -- tracing always carries identifiers, timings, and
+    # errors, never content, until the tenant admin explicitly opts in. Deliberately a tenant
+    # preference (not an operator-owned control-plane fact like residency): ADR-0008's user
+    # stories describe it as something "a tenant admin" turns on for their own tenant, scoped to
+    # the whole tenant, not a per-run toggle -- see `app.observability`, which is the one place
+    # this value is turned into an actual `InstrumentationSettings.include_content`.
+    content_tracing_opt_in: bool = False
 
     @model_validator(mode="before")
     @classmethod

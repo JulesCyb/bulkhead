@@ -1,0 +1,272 @@
+"""Provision a dedicated tenant's own physical database, idempotently (#71, ADR-0002, ADR-0010,
+ADR-0011).
+
+`app.operator.create.create_tenant` calls the two functions here when `isolation_tier="dedicated"`.
+They are kept separate from `create_tenant`'s own single owner-role transaction (a `CREATE
+DATABASE` cannot run inside a transaction block at all, and provisioning a fresh Postgres
+instance is disk/network I/O, not a database write) but follow the same idempotency discipline:
+re-running `create` against an already-provisioned dedicated tenant must not attempt to recreate
+its database or reapply its migrations, and must not even require `--dedicated-db-admin-url` to
+be supplied again.
+
+`ensure_dedicated_database` does everything a managed-Postgres-with-no-init-hook bootstrap needs,
+reusing the exact code paths the standalone tools for each step already use rather than
+duplicating their logic:
+
+1. `CREATE DATABASE` on the target server, named exactly by the tenant's alias, unless a database
+   of that name already exists there.
+2. `scripts.provision_roles.provision()` -- the same idempotent `app_owner`/`app` role and grant
+   bootstrap `docker/postgres/01-init.sh` performs locally and the standalone script performs
+   against a managed provider (Spec 9 / #67) -- run against the freshly created database.
+3. Writes the owner-role DSN to this alias's migration-secret file
+   (`TENANT_DB_MIGRATIONS_SECRETS_DIR`, the file `scripts/migrate.py` reads, Spec 10 / #76), then
+   calls `scripts.migrate.migrate_alias(alias)` -- the exact same call a standalone
+   `uv run python scripts/migrate.py <alias>` makes -- to bring it to the current migration head.
+4. Writes the `app`-role DSN to this alias's tenant-secret file (`TENANT_DB_SECRETS_DIR`, the
+   file `app/db/engine_registry.py` reads at request time, ADR-0002/ADR-0011).
+
+Idempotency is keyed on step 3's migration-secret file: if it already exists, every step above is
+assumed already done, and this function returns immediately without opening `admin_url` (which
+may not even have been supplied on a re-run).
+
+`ensure_dedicated_admin_membership` writes the tenant's own bookkeeping stub row and first admin
+membership *into that dedicated database* -- unlike a pooled tenant, whose membership lives in
+the same database as the control plane, a dedicated tenant's membership can only ever live in its
+own database (`tests/test_tenant_session_routing_integration.py` proves a dedicated tenant's data
+is physically absent from the pooled database). It also mirrors the admin identity row into the
+dedicated database's own (otherwise unused) `control.identities` table: `memberships.identity_id`
+foreign-keys to it in every database migrations create it in, even though identity resolution at
+request time always reads the pooled database's copy (`app/repositories/control.py`) -- the
+dedicated database's copy exists only to satisfy that per-database foreign key.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import secrets
+from dataclasses import dataclass
+from pathlib import Path
+from uuid import UUID
+
+from sqlalchemy import text
+from sqlalchemy.engine import URL, make_url
+from sqlalchemy.ext.asyncio import create_async_engine
+
+import scripts.migrate as migrate_module
+import scripts.provision_roles as provision_roles_module
+
+# Mirrors app/db/engine_registry.py's own default exactly -- this is the first code path that
+# *writes* to that directory rather than only reading it.
+_DEFAULT_TENANT_DB_SECRETS_DIR = "/run/secrets/tenant-db"
+
+
+class MissingDedicatedAdminUrlError(ValueError):
+    """Provisioning a *new* dedicated tenant's database needs `--dedicated-db-admin-url`: an
+    admin connection (CREATEDB privilege) to the Postgres server that will host it. Never raised
+    on a re-run against an already-provisioned dedicated tenant -- see module docstring."""
+
+
+@dataclass(frozen=True, slots=True)
+class DedicatedDatabaseResult:
+    alias: str
+    owner_dsn: str
+    outcome: str  # "provisioned" | "already provisioned"
+
+
+def generate_database_alias(tenant_id: UUID) -> str:
+    """A fresh alias for `tenant_id`'s dedicated database -- also used verbatim as the database's
+    own name (quoted where used as a SQL identifier). Mirrors
+    `app.gateway_provisioning.generate_gateway_credential_alias`'s shape; short enough to stay
+    under Postgres's 63-byte identifier limit."""
+    return f"tenant-{tenant_id}-{secrets.token_hex(4)}"
+
+
+def _app_secret_path(alias: str) -> Path:
+    directory = Path(os.environ.get("TENANT_DB_SECRETS_DIR", _DEFAULT_TENANT_DB_SECRETS_DIR))
+    return directory / alias
+
+
+def _migrations_secret_path(alias: str) -> Path:
+    return migrate_module._migrations_secrets_dir() / alias
+
+
+def _as_asyncpg_url(url: str) -> str:
+    if url.startswith("postgresql+asyncpg://"):
+        return url
+    if url.startswith("postgresql://"):
+        return "postgresql+asyncpg://" + url[len("postgresql://") :]
+    raise ValueError(
+        f"Unsupported --dedicated-db-admin-url scheme: {url!r} "
+        "(expected postgresql:// or postgresql+asyncpg://)"
+    )
+
+
+def _render_dsn(
+    url: URL,
+    *,
+    database: str | None = None,
+    username: str | None = None,
+    password: str | None = None,
+) -> str:
+    """A DSN string for `url` with the given overrides, in the exact unencoded shape this
+    codebase's own DSNs everywhere else use (`postgresql+asyncpg://user[:pass]@host[:port]/db
+    [?query]`, e.g. `tests/test_migrate_alias_integration.py`, `app/db/engine_registry.py`'s
+    tenant-secret files) -- never `URL.render_as_string()`/`str(url)`: both percent-encode
+    special characters in query values (a unix-socket path passed as `?host=/tmp/...` becomes
+    `?host=%2Ftmp%2F...`), and a literal `%` in a DSN then breaks
+    `alembic.config.Config.set_main_option` (`ConfigParser`'s `%`-interpolation) the moment
+    `scripts.migrate._upgrade_head` hands it that DSN -- exactly the code path this module calls
+    into.
+    """
+    database = url.database if database is None else database
+    username = url.username if username is None else username
+    password = url.password if password is None else password
+
+    userinfo = username or ""
+    if password:
+        userinfo += f":{password}"
+    hostport = url.host or ""
+    if url.port:
+        hostport += f":{url.port}"
+    query = "&".join(f"{k}={v}" for k, v in url.query.items())
+    suffix = f"?{query}" if query else ""
+    return f"{url.drivername}://{userinfo}@{hostport}/{database}{suffix}"
+
+
+def _write_secret(path: Path, dsn: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(dsn)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass  # best-effort, mirrors app.gateway_provisioning.write_gateway_credential_file
+
+
+async def ensure_dedicated_database(
+    *, alias: str, admin_url: str | None
+) -> DedicatedDatabaseResult:
+    """Idempotently provision (or reconcile) `alias`'s own physical database. See module
+    docstring for the full contract."""
+    migrations_path = _migrations_secret_path(alias)
+    if migrations_path.exists():
+        return DedicatedDatabaseResult(
+            alias=alias,
+            owner_dsn=migrations_path.read_text(encoding="utf-8").strip(),
+            outcome="already provisioned",
+        )
+
+    if not admin_url:
+        raise MissingDedicatedAdminUrlError(
+            "creating a new dedicated tenant needs --dedicated-db-admin-url: an admin connection "
+            "(CREATEDB privilege) to the Postgres server that will host its database. Not needed "
+            "again once that database has been provisioned."
+        )
+
+    admin = make_url(_as_asyncpg_url(admin_url))
+    db_name = alias
+    quoted_db = '"' + db_name.replace('"', '""') + '"'
+
+    # See `_render_dsn`'s docstring for why every DSN below goes through it rather than
+    # `URL.render_as_string()`/`str(url)`.
+    admin_dsn = _render_dsn(admin)
+
+    # CREATE DATABASE cannot run inside a transaction block -- AUTOCOMMIT, exactly like
+    # docker/postgres/01-init.sh's own separate psql invocation for the gateway database.
+    admin_engine = create_async_engine(admin_dsn, isolation_level="AUTOCOMMIT")
+    try:
+        async with admin_engine.connect() as conn:
+            exists = (
+                await conn.execute(
+                    text("SELECT 1 FROM pg_database WHERE datname = :n"), {"n": db_name}
+                )
+            ).first()
+            if exists is None:
+                await conn.execute(text(f"CREATE DATABASE {quoted_db}"))
+    finally:
+        await admin_engine.dispose()
+
+    new_db_admin_dsn = _render_dsn(admin, database=db_name)
+    await provision_roles_module.provision(new_db_admin_dsn)
+
+    # Same env vars scripts/provision_roles.py itself reads -- the roles it just created (or
+    # confirmed) on the new database carry exactly these passwords.
+    app_owner_password = os.environ.get("APP_OWNER_DB_PASSWORD", "app_owner")
+    app_password = os.environ.get("APP_DB_PASSWORD", "app")
+    owner_dsn = _render_dsn(
+        admin, database=db_name, username="app_owner", password=app_owner_password
+    )
+    app_dsn = _render_dsn(admin, database=db_name, username="app", password=app_password)
+
+    _write_secret(migrations_path, owner_dsn)
+    # scripts.migrate.migrate_alias is a blocking call that itself calls asyncio.run()
+    # internally (alembic has no async API) -- fatal if called directly from a coroutine already
+    # running inside an event loop (this one), so it runs in a worker thread instead.
+    await asyncio.to_thread(migrate_module.migrate_alias, alias)
+
+    _write_secret(_app_secret_path(alias), app_dsn)
+
+    return DedicatedDatabaseResult(alias=alias, owner_dsn=owner_dsn, outcome="provisioned")
+
+
+async def ensure_dedicated_admin_membership(
+    *,
+    owner_dsn: str,
+    tenant_id: UUID,
+    tenant_name: str,
+    tenant_settings_json: str,
+    identity_id: UUID,
+    issuer: str,
+    subject: str,
+    admin_email: str,
+) -> str:
+    """Write the tenant's bookkeeping stub row and first admin membership into its own dedicated
+    database (idempotent). Returns `"created"` or `"already exists"` for the membership, matching
+    `create_tenant`'s own pooled-path vocabulary."""
+    engine = create_async_engine(owner_dsn)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": str(tenant_id)}
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO tenants (id, name, settings) "
+                    "VALUES (:id, :name, CAST(:settings AS jsonb)) "
+                    "ON CONFLICT (id) DO NOTHING"
+                ),
+                {"id": tenant_id, "name": tenant_name, "settings": tenant_settings_json},
+            )
+            # Mirrors the same identity only to satisfy this database's own
+            # memberships->control.identities foreign key -- never read back from here (identity
+            # resolution always reads the pooled database's copy, app/repositories/control.py).
+            await conn.execute(
+                text(
+                    "INSERT INTO control.identities (id, issuer, subject, display_name, email) "
+                    "VALUES (:id, :issuer, :subject, :email, :email) "
+                    "ON CONFLICT (issuer, subject) DO UPDATE SET issuer = EXCLUDED.issuer"
+                ),
+                {"id": identity_id, "issuer": issuer, "subject": subject, "email": admin_email},
+            )
+            existing_membership = (
+                await conn.execute(
+                    text(
+                        "SELECT id FROM memberships WHERE tenant_id = :tid AND identity_id = :iid"
+                    ),
+                    {"tid": tenant_id, "iid": identity_id},
+                )
+            ).first()
+            if existing_membership is None:
+                await conn.execute(
+                    text(
+                        "INSERT INTO memberships (tenant_id, identity_id, role) "
+                        "VALUES (:tid, :iid, 'admin')"
+                    ),
+                    {"tid": tenant_id, "iid": identity_id},
+                )
+                outcome = "created"
+            else:
+                outcome = "already exists"
+    finally:
+        await engine.dispose()
+    return outcome

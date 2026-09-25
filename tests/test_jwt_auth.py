@@ -17,6 +17,7 @@ import jwt
 import pytest
 
 import app.deps as deps_module
+import app.tenant_suspension as tenant_suspension_module
 import app.token_verifier as token_verifier_module
 from app.config import Settings, get_settings
 from app.context import RequestContext
@@ -69,10 +70,10 @@ def _install_fake_control_plane(monkeypatch, *, auth_settings, identities, membe
     row (falls back to the default issuer, not suspended), mirroring the real repository.
     `identities`: {(issuer, subject): identity_id}. `memberships`: {(tenant_id, identity_id): role}.
 
-    Installed on both `app.deps` (the suspension check, issue #69) and `app.token_verifier` (the
-    shared signature/audience/identity/membership check, issue #44) — the two modules each import
-    their own copy of these names, exactly like two independent callers of the shared module are
-    meant to.
+    Installed on both `app.tenant_suspension` (the one shared suspension check every
+    context-resolution seam calls, issue #69) and `app.token_verifier` (the shared
+    signature/audience/identity/membership check, issue #44) — `app.deps` no longer keeps its own
+    copy of either.
     """
 
     class FakeTenantAuthSettingsRepository:
@@ -93,11 +94,16 @@ def _install_fake_control_plane(monkeypatch, *, auth_settings, identities, membe
         async def get_role(self, session, ctx: RequestContext, *, identity_id):
             return memberships.get((ctx.tenant_id, identity_id))
 
-    for module in (deps_module, token_verifier_module):
-        monkeypatch.setattr(module, "control_session", _fake_session)
-        monkeypatch.setattr(
-            module, "TenantAuthSettingsRepository", FakeTenantAuthSettingsRepository
-        )
+    monkeypatch.setattr(tenant_suspension_module, "control_session", _fake_session)
+    monkeypatch.setattr(
+        tenant_suspension_module,
+        "TenantAuthSettingsRepository",
+        FakeTenantAuthSettingsRepository,
+    )
+    monkeypatch.setattr(token_verifier_module, "control_session", _fake_session)
+    monkeypatch.setattr(
+        token_verifier_module, "TenantAuthSettingsRepository", FakeTenantAuthSettingsRepository
+    )
     monkeypatch.setattr(token_verifier_module, "tenant_session", lambda ctx: _fake_session())
     monkeypatch.setattr(token_verifier_module, "IdentityRepository", FakeIdentityRepository)
     monkeypatch.setattr(token_verifier_module, "MembershipRepository", FakeMembershipRepository)

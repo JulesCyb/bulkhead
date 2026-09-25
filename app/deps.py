@@ -50,9 +50,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings, get_settings
 from app.context import RequestContext
-from app.db.session import control_session, tenant_session
+from app.db.session import tenant_session
 from app.jwt_verifier import KeySource, TokenVerificationError
-from app.repositories.control import TenantAuthSettingsRepository
+from app.tenant_suspension import TenantSuspendedError, ensure_tenant_not_suspended
 from app.token_verifier import (
     AGENT_IDENTITY_ISSUER,
     TenantTokenVerificationError,
@@ -97,11 +97,12 @@ def get_key_source(settings: Annotated[Settings, Depends(get_settings)]) -> KeyS
 
 
 def _log_forbidden(*, reason: str, tenant_id: UUID, issuer: str, request_id: str) -> HTTPException:
-    """Logs the one structured security-event line every forbidden branch produces, then returns
+    """Logs the one structured security-event line every forbidden branch produces (both
+    AUTH_MODE=jwt's own checks and AUTH_MODE=dev-headers' suspension check, #69), then returns
     (does not raise) the generic HTTPException the caller raises itself — keeping `raise
     _log_forbidden(...)` readable at each call site."""
     log.warning(
-        "AUTH_MODE=jwt request rejected",
+        "request rejected: not authorized for this tenant",
         extra={
             "event": "jwt_auth_forbidden",
             "reason": reason,
@@ -150,20 +151,19 @@ async def _get_jwt_context(
         ) from None
 
     # Tenant suspension is *not* part of the shared verifier above -- it is enforced here,
-    # directly, the same way every other place that resolves a context enforces it (issue #69).
-    # A tenant with no control-plane row at all (never marked dedicated/suspended, or not
-    # created in the control plane yet) is treated as not suspended (ADR-0002, app/db/session.py).
-    async with control_session() as session:
-        auth_settings = await TenantAuthSettingsRepository().get(
-            session, tenant_id=tenant_id, default_issuer=settings.default_identity_issuer
-        )
-    if auth_settings is not None and auth_settings.suspended:
+    # directly, via the same shared check every other context-resolution seam uses
+    # (`app.tenant_suspension`, issue #69). A tenant with no control-plane row at all (never
+    # marked dedicated/suspended, or not created in the control plane yet) is treated as not
+    # suspended (ADR-0002, app/db/session.py).
+    try:
+        await ensure_tenant_not_suspended(tenant_id)
+    except TenantSuspendedError:
         raise _log_forbidden(
             reason="tenant_suspended",
             tenant_id=tenant_id,
             issuer=resolved.issuer,
             request_id=request_id,
-        )
+        ) from None
 
     ctx = RequestContext(
         tenant_id=tenant_id,
@@ -199,6 +199,18 @@ async def get_context(
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid UUID in header") from exc
         roles = frozenset(r.strip() for r in (x_roles or "").split(",") if r.strip())
         ctx = RequestContext(tenant_id=tenant_id, identity_id=identity_id, roles=roles)
+        # dev-headers has no other check standing between a client and its tenant's data, so
+        # suspension has to be checked here explicitly (AUTH_MODE=jwt already does, above) —
+        # same generic 403 body, same "never say why" logging as the jwt branch (#69, ADR-0010).
+        try:
+            await ensure_tenant_not_suspended(ctx.tenant_id)
+        except TenantSuspendedError:
+            raise _log_forbidden(
+                reason="tenant_suspended",
+                tenant_id=tenant_id,
+                issuer="dev-headers",
+                request_id=ctx.request_id,
+            ) from None
         # Stashed on request.state (not returned as a header here) so the ASGI middleware in
         # app/main.py can attach it to the response regardless of the route's return type
         # (JSONResponse, StreamingResponse, or the chat endpoint's Vercel AI stream), and so a

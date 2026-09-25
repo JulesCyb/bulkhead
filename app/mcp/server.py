@@ -10,6 +10,12 @@ Which transport is active is a single setting (`Settings.mcp_transport`, issue #
 guarded at startup by `check_mcp_mode` below the same way `AUTH_MODE=dev-headers` is guarded by
 `app.main.check_auth_mode`.
 
+Every tool resolves its context through `resolve_context()`, not `context_provider()` directly
+(Spec 9 / #69, ADR-0010): it builds the context, then checks suspension
+(`app.tenant_suspension.ensure_tenant_not_suspended`) before any tool body runs -- the MCP
+connection handler's own, independent check, alongside the HTTP API's (`app/deps.py`) and the
+agent-run entry points' (`app/agents/assistant.py`).
+
 Start (stdio, e.g. in Claude Code's .mcp.json):
     uv run python -m app.mcp.server
 
@@ -42,6 +48,7 @@ from app.config import Settings, get_settings
 from app.context import RequestContext
 from app.deps import get_key_source
 from app.startup_checks import run_startup_checks
+from app.tenant_suspension import ensure_tenant_not_suspended
 from app.token_verifier import (
     AGENT_IDENTITY_ISSUER,
     TenantTokenVerificationError,
@@ -101,6 +108,16 @@ def _context_from_connection() -> RequestContext:
 context_provider: Callable[[], RequestContext] = _context_from_env
 
 
+async def resolve_context() -> RequestContext:
+    """The MCP connection handler's own context resolution: builds the context, then rejects a
+    suspended tenant before any tool body runs (Spec 9 / #69, ADR-0010) -- see module docstring.
+    Every tool calls this, never `context_provider()` directly.
+    """
+    ctx = context_provider()
+    await ensure_tenant_not_suspended(ctx.tenant_id)
+    return ctx
+
+
 # Every non-`PermissionError` exception a tool raises comes back as exactly this text -- never the
 # exception's own message (issue #49's acceptance criterion 4, matching how
 # `app.main.handle_unhandled_exception` never leaks a raw exception to an HTTP caller). The real
@@ -133,7 +150,8 @@ def _masked(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
 @_masked
 async def search_documents(query: str, limit: int = 5) -> list[dict]:
     """Semantic search in the current tenant's documents."""
-    hits = await document_tools.search_documents(context_provider(), query, limit)
+    ctx = await resolve_context()
+    hits = await document_tools.search_documents(ctx, query, limit)
     return [hit.model_dump(mode="json") for hit in hits]
 
 
@@ -151,7 +169,7 @@ async def list_memberships() -> list[dict]:
     take the connection down -- the same wrapper every other tool call goes through, not a special
     case added here for this one tool.
     """
-    records = await membership_tools.list_memberships(context_provider())
+    records = await membership_tools.list_memberships(await resolve_context())
     return [record.model_dump(mode="json") for record in records]
 
 

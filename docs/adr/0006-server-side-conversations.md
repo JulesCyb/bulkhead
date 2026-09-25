@@ -1,6 +1,6 @@
 # ADR-0006: Conversations live on the server, the client contributes only new messages
 
-- **Status:** proposed
+- **Status:** accepted
 - **Date:** 2026-09-12
 - **Deciders:** JulesCyb
 - **Skill version:** ai-app-blueprints v2.0.0 (research 2026-08)
@@ -35,8 +35,12 @@ We choose **option 2**.
   `message_history`, and uses only the last user message from the body; assistant and tool
   parts sent by the client are dropped, not merged. New messages produced by the run are
   appended by the server.
-- A retention period is a tenant setting with a safe default; expired conversations are deleted
-  by a job that runs per tenant. Deleting a tenant deletes its conversations.
+- A retention period is a tenant setting (`tenants.settings["retention_days"]`,
+  `app/tenant_settings.py`) with a safe default of 90 days (`DEFAULT_RETENTION_DAYS`) when a
+  tenant never sets its own; expired conversations are deleted by a job
+  (`app/retention.py`, run via `scripts/retention.py`) that runs per tenant, through the same
+  `tenant_session(ctx)` every other request uses — never a superuser or bypass-RLS statement.
+  Deleting a tenant deletes its conversations for free, via the existing cascade.
 - This is the prerequisite for the approval flow (next decision) and for audit records.
 
 ## Consequences

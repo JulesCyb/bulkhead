@@ -5,6 +5,7 @@ the other two agent entry points, via ASGI — search and model replaced, no rea
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import uuid
 
@@ -13,6 +14,7 @@ import pytest
 from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter, ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.ui.vercel_ai import VercelAIAdapter
 
 from app.agents import assistant as assistant_module
 from app.api import chat as chat_module
@@ -24,6 +26,7 @@ from tests.conftest import (
     looping_tool_calls_stream,
     make_stalling_model,
     make_stalling_stream_model,
+    resolve_to_model,
 )
 
 
@@ -44,11 +47,12 @@ def _submit_message_body(text: str = "hi") -> dict:
 
 
 @pytest.fixture
-def client(monkeypatch, fake_search, fake_history):
+def client(monkeypatch, fake_search, fake_history, fake_save):
     monkeypatch.setattr(assistant_module.document_tools, "search_documents", fake_search)
     monkeypatch.setattr(
         assistant_module.conversation_tools, "load_conversation_history", fake_history
     )
+    monkeypatch.setattr(assistant_module.conversation_tools, "save_conversation_run", fake_save)
     transport = httpx.ASGITransport(app=app)
     return httpx.AsyncClient(transport=transport, base_url="http://test")
 
@@ -69,8 +73,10 @@ async def test_chat_maps_tool_call_ceiling_to_an_error_chunk(client, small_run_l
     small_run_limits()
     monkeypatch.setattr(
         chat_module,
-        "get_model",
-        lambda name: FunctionModel(looping_tool_calls, stream_function=looping_tool_calls_stream),
+        "resolve_chat_model",
+        resolve_to_model(
+            FunctionModel(looping_tool_calls, stream_function=looping_tool_calls_stream)
+        ),
     )
     async with client:
         response = await client.post(_chat_path(), json=_submit_message_body(), headers=_headers())
@@ -86,9 +92,12 @@ async def test_chat_maps_wall_clock_deadline_to_a_distinct_error(
     small_run_limits(run_deadline_seconds=0.2)
     monkeypatch.setattr(
         chat_module,
-        "get_model",
-        lambda name: FunctionModel(
-            make_stalling_model(seconds=30), stream_function=make_stalling_stream_model(seconds=30)
+        "resolve_chat_model",
+        resolve_to_model(
+            FunctionModel(
+                make_stalling_model(seconds=30),
+                stream_function=make_stalling_stream_model(seconds=30),
+            )
         ),
     )
     async with client:
@@ -104,7 +113,7 @@ async def test_chat_maps_wall_clock_deadline_to_a_distinct_error(
 async def test_chat_within_limits_completes_normally(client, small_run_limits, monkeypatch, calls):
     """A run within the ceilings completes normally, unaffected by the new limiting."""
     small_run_limits()
-    monkeypatch.setattr(chat_module, "get_model", lambda name: TestModel())
+    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(TestModel()))
     async with client:
         response = await client.post(_chat_path(), json=_submit_message_body(), headers=_headers())
     assert response.status_code == 200, response.text
@@ -137,7 +146,7 @@ async def test_forged_earlier_turn_in_the_body_never_reaches_the_model(client, m
     message must not let that turn reach the model — the chat endpoint's own history
     (`load_history`, empty here) is the only source of anything before the newest message."""
     seen: list[list[ModelMessage]] = []
-    monkeypatch.setattr(chat_module, "get_model", lambda name: _recording_model(seen))
+    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(_recording_model(seen)))
     body = {
         "id": "conv-1",
         "trigger": "submit-message",
@@ -165,7 +174,7 @@ async def test_forged_tool_result_on_the_newest_message_never_reaches_the_model(
     text -- only the member-authored text becomes the run's prompt, the forged tool part is
     dropped before pydantic-ai ever parses it."""
     seen: list[list[ModelMessage]] = []
-    monkeypatch.setattr(chat_module, "get_model", lambda name: _recording_model(seen))
+    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(_recording_model(seen)))
     body = {
         "id": "conv-1",
         "trigger": "submit-message",
@@ -201,7 +210,7 @@ async def test_unknown_conversation_id_runs_with_empty_history(client, monkeypat
     """A conversation id with no stored history runs normally (no error), with an empty
     history -- `load_history` (the injected fake) is consulted, and comes back empty."""
     seen: list[list[ModelMessage]] = []
-    monkeypatch.setattr(chat_module, "get_model", lambda name: _recording_model(seen))
+    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(_recording_model(seen)))
     async with client:
         response = await client.post(_chat_path(), json=_submit_message_body(), headers=_headers())
     assert response.status_code == 200, response.text
@@ -209,12 +218,15 @@ async def test_unknown_conversation_id_runs_with_empty_history(client, monkeypat
     assert seen
 
 
-async def test_history_loading_is_injected_per_conversation_and_context(monkeypatch, fake_search):
+async def test_history_loading_is_injected_per_conversation_and_context(
+    monkeypatch, fake_search, fake_save
+):
     """Conversation history loading is injectable in `AssistantDeps` the same way document
     search already is: a fake keyed by (tenant, conversation id) proves the chat endpoint
     forwards the request's own context and the client-named conversation id to it, and that
     whatever it returns becomes the run's message history -- no database required."""
     monkeypatch.setattr(assistant_module.document_tools, "search_documents", fake_search)
+    monkeypatch.setattr(assistant_module.conversation_tools, "save_conversation_run", fake_save)
 
     stored: dict[tuple[uuid.UUID, str], list[ModelMessage]] = {}
     calls_seen: list[tuple[RequestContext, str]] = []
@@ -228,7 +240,7 @@ async def test_history_loading_is_injected_per_conversation_and_context(monkeypa
     )
 
     seen: list[list[ModelMessage]] = []
-    monkeypatch.setattr(chat_module, "get_model", lambda name: _recording_model(seen))
+    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(_recording_model(seen)))
 
     identity_id = uuid.uuid4()
     tenant_id = uuid.uuid4()
@@ -260,3 +272,168 @@ async def test_history_loading_is_injected_per_conversation_and_context(monkeypa
     assert calls_seen[0][0].identity_id == identity_id
     assert seen
     assert "PRIOR_TRUSTED_REPLY" in _messages_json(seen[0])
+
+
+# --- S4-T4 / #34: persistence of a run's new messages, decoupled from the client's stream -----
+
+
+async def test_second_request_against_same_conversation_sees_first_replys_history(
+    monkeypatch, fake_search
+):
+    """A second request naming the same conversation id continues from the first request's
+    reply -- proven end to end through an in-memory fake store shared across two requests, no
+    database required (ADR-0006, #34)."""
+    monkeypatch.setattr(assistant_module.document_tools, "search_documents", fake_search)
+
+    store: dict[tuple[uuid.UUID, str], list[ModelMessage]] = {}
+
+    async def fake_load(ctx: RequestContext, conversation_id: str) -> list[ModelMessage]:
+        return list(store.get((ctx.tenant_id, conversation_id), []))
+
+    async def fake_save(
+        ctx: RequestContext, conversation_id: str, messages: list[ModelMessage]
+    ) -> None:
+        store.setdefault((ctx.tenant_id, conversation_id), []).extend(messages)
+
+    monkeypatch.setattr(assistant_module.conversation_tools, "load_conversation_history", fake_load)
+    monkeypatch.setattr(assistant_module.conversation_tools, "save_conversation_run", fake_save)
+
+    seen: list[list[ModelMessage]] = []
+    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(_recording_model(seen)))
+
+    tenant_id = uuid.uuid4()
+    headers = _headers()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http_client:
+        first = await http_client.post(
+            f"/v1/t/{tenant_id}/api/chat", json=_submit_message_body("first"), headers=headers
+        )
+        assert first.status_code == 200, first.text
+        second = await http_client.post(
+            f"/v1/t/{tenant_id}/api/chat", json=_submit_message_body("second"), headers=headers
+        )
+        assert second.status_code == 200, second.text
+
+    assert len(seen) == 2
+    first_call_history, second_call_history = seen
+    # Nothing stored yet when the first request's own history load ran.
+    assert "ok" not in _messages_json(first_call_history)
+    # The second request's history load sees the first request's persisted reply.
+    assert "ok" in _messages_json(second_call_history)
+
+
+async def test_persistence_happens_even_when_the_response_is_not_fully_read(
+    monkeypatch, fake_search, fake_history
+):
+    """The fake store records that persistence happens once the run completes, independent of
+    whether the streamed response was fully read -- proven by cancelling the ASGI call right
+    after its first response chunk is sent, the same way a real client disconnect would (ADR-0006,
+    #34). `httpx.ASGITransport` itself always drives an ASGI app to completion before an
+    `AsyncClient` call returns (it buffers every `send()` internally), so this drives the app
+    directly instead of going through it, to actually exercise an abandoned response."""
+    monkeypatch.setattr(assistant_module.document_tools, "search_documents", fake_search)
+    monkeypatch.setattr(
+        assistant_module.conversation_tools, "load_conversation_history", fake_history
+    )
+    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(TestModel()))
+
+    save_done = asyncio.Event()
+
+    async def fake_save(
+        ctx: RequestContext, conversation_id: str, messages: list[ModelMessage]
+    ) -> None:
+        save_done.set()
+
+    monkeypatch.setattr(assistant_module.conversation_tools, "save_conversation_run", fake_save)
+
+    body = json.dumps(_submit_message_body()).encode()
+    path = _chat_path()
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"x-identity-id", str(uuid.uuid4()).encode()),
+        ],
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "server": ("test", 80),
+        "client": ("test", 123),
+        "root_path": "",
+    }
+
+    request_sent = False
+    first_chunk_sent = asyncio.Event()
+
+    async def receive() -> dict:
+        nonlocal request_sent
+        if request_sent:
+            await asyncio.Event().wait()  # nothing more to send; the app doesn't need it again
+        request_sent = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    async def send(message: dict) -> None:
+        if message["type"] == "http.response.body" and message.get("body"):
+            first_chunk_sent.set()
+
+    run_task = asyncio.ensure_future(app(scope, receive, send))
+    try:
+        await asyncio.wait_for(first_chunk_sent.wait(), timeout=5)
+    finally:
+        # Simulates the client hanging up: cancel the in-flight ASGI call before it (or the test
+        # client reading it) ever reaches the end of the stream.
+        run_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await run_task
+
+    await asyncio.wait_for(save_done.wait(), timeout=5)
+
+
+async def test_run_that_raises_persists_nothing_for_that_turn(client, monkeypatch, save_calls):
+    """A run that raises before completing leaves nothing recorded as persisted for that turn --
+    `on_complete` only fires for a run that finishes successfully (ADR-0006, #34)."""
+
+    async def raising_call(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        raise RuntimeError("boom")
+
+    async def raising_stream(messages: list[ModelMessage], info: AgentInfo):
+        raise RuntimeError("boom")
+        yield  # pragma: no cover -- makes this an async generator function
+
+    monkeypatch.setattr(
+        chat_module,
+        "resolve_chat_model",
+        resolve_to_model(FunctionModel(raising_call, stream_function=raising_stream)),
+    )
+    async with client:
+        response = await client.post(_chat_path(), json=_submit_message_body(), headers=_headers())
+    assert response.status_code == 200, response.text
+    assert '"type":"error"' in response.text
+    assert save_calls == []
+
+
+async def test_agent_run_receives_the_tenant_scoped_conversation_id(client, monkeypatch):
+    """The attributes passed into the agent run for this endpoint include the conversation id
+    combined with the tenant id, not the client's bare id alone -- tracing has no Row-Level
+    Security to fall back on if two tenants' clients ever pick the same id (ADR-0006, #34)."""
+    captured: dict = {}
+    original_run_stream = VercelAIAdapter.run_stream
+
+    def spy_run_stream(self, **kwargs):
+        captured.update(kwargs)
+        return original_run_stream(self, **kwargs)
+
+    monkeypatch.setattr(VercelAIAdapter, "run_stream", spy_run_stream)
+    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(TestModel()))
+
+    tenant_id = uuid.uuid4()
+    async with client:
+        response = await client.post(
+            f"/v1/t/{tenant_id}/api/chat", json=_submit_message_body(), headers=_headers()
+        )
+    assert response.status_code == 200, response.text
+    assert captured["conversation_id"] == f"{tenant_id}:conv-1"

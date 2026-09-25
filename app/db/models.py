@@ -19,8 +19,10 @@ from uuid import UUID
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    BigInteger,
     Column,
     DateTime,
+    FetchedValue,
     ForeignKey,
     ForeignKeyConstraint,
     Index,
@@ -265,3 +267,47 @@ class StandingGrant(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     revoked_by: Mapped[UUID | None] = mapped_column(ForeignKey("memberships.id"), nullable=True)
+
+
+class ApprovalAuditEvent(Base):
+    """One append-only milestone of the approval mechanism (ADR-0007, Spec 5 / #39): a write
+    requested, approved, refused, expired, denied for lack of a grant, executed, or failed to
+    execute. Distinct from the `created_by`/`updated_by` audit-column pattern 0010 established
+    for `documents` -- that answers "who wrote this row"; this answers "who authorized this
+    write, and how" (CLAUDE.md rule 4).
+
+    `actor_membership_id` references `memberships`, not `control.identities` -- the same split
+    `PendingAction` and `StandingGrant` already draw: the record is a tenant-scoped fact about a
+    membership's role at the moment the milestone happened.
+
+    `pending_action_id`/`standing_grant_id` are plain, unconstrained `uuid` columns (no FK),
+    deliberately: this row must document, and outlive, the pending action or standing grant it
+    names, the same way `control.operator_actions`/`control.tenant_erasures` (migration 0004)
+    outlive the tenant they document. At most one of the two is set for most kinds; a
+    `denied_for_lack_of_grant` event -- by definition, no grant exists -- leaves both null.
+
+    `seq` is a database-generated identity column used only for ordering (see migration 0035's
+    docstring for why `created_at` alone cannot be trusted to order events written in the same
+    transaction).
+    """
+
+    __tablename__ = "approval_audit_events"
+    __table_args__ = (
+        Index("approval_audit_events_tenant_idx", "tenant_id"),
+        Index("approval_audit_events_pending_action_idx", "pending_action_id"),
+        Index("approval_audit_events_standing_grant_idx", "standing_grant_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    # GENERATED ALWAYS AS IDENTITY (migration 0035) -- never set from Python; FetchedValue keeps
+    # this column out of the INSERT statement entirely, exactly as Postgres's identity clause
+    # requires (it errors on any explicit value, even NULL, without OVERRIDING SYSTEM VALUE).
+    seq: Mapped[int] = mapped_column(BigInteger, server_default=FetchedValue())
+    tenant_id: Mapped[UUID] = mapped_column(ForeignKey("tenants.id"))
+    kind: Mapped[str] = mapped_column(String(30))
+    tool_name: Mapped[str] = mapped_column(String(200))
+    actor_membership_id: Mapped[UUID] = mapped_column(ForeignKey("memberships.id"))
+    pending_action_id: Mapped[UUID | None] = mapped_column(PGUUID(as_uuid=True), nullable=True)
+    standing_grant_id: Mapped[UUID | None] = mapped_column(PGUUID(as_uuid=True), nullable=True)
+    details: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

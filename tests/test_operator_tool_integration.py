@@ -320,6 +320,160 @@ async def test_cli_records_a_failed_invocation_too(database_urls, operator_env, 
     assert "simulated failure" in details["error"]
 
 
+async def test_suspend_sets_the_flag_and_timestamp_and_reruns_as_a_no_op(database_urls):
+    """Spec 9 / #69, ADR-0010, seam 1: `suspend` sets `suspended`/`suspended_at`, and running it
+    again against an already-suspended tenant reports a no-op, not an error."""
+    from app.operator.suspend import set_tenant_suspended
+
+    tenant_id = await _seed_tenant(database_urls["superuser"], name="Suspend Co")
+
+    engine = create_async_engine(database_urls["migrations"])
+    try:
+        async with engine.begin() as conn:
+            first = await set_tenant_suspended(conn, str(tenant_id), suspended=True)
+        async with engine.begin() as conn:
+            second = await set_tenant_suspended(conn, str(tenant_id), suspended=True)
+    finally:
+        await engine.dispose()
+
+    assert first.changed is True
+    assert first.suspended is True
+    assert first.suspended_at is not None
+
+    assert second.changed is False
+    assert second.suspended is True
+    assert second.suspended_at == first.suspended_at
+
+
+async def test_unsuspend_restores_the_tenant_with_nothing_reprovisioned(database_urls):
+    """`unsuspend` clears `suspended_at` and is itself a no-op when the tenant is already
+    active -- and never touches isolation tier, database alias, or residency."""
+    from app.operator.listing import list_tenants
+    from app.operator.suspend import set_tenant_suspended
+
+    tenant_id = await _seed_tenant(
+        database_urls["superuser"],
+        name="Restore Co",
+        residency="us",
+        isolation_tier="dedicated",
+        database_alias="restore_db",
+        suspended=True,
+    )
+
+    engine = create_async_engine(database_urls["migrations"])
+    try:
+        async with engine.begin() as conn:
+            result = await set_tenant_suspended(conn, str(tenant_id), suspended=False)
+        async with engine.begin() as conn:
+            no_op = await set_tenant_suspended(conn, str(tenant_id), suspended=False)
+        async with engine.begin() as conn:
+            summaries = {t.tenant_id: t for t in await list_tenants(conn)}
+    finally:
+        await engine.dispose()
+
+    assert result.changed is True
+    assert result.suspended is False
+    assert result.suspended_at is None
+
+    assert no_op.changed is False
+
+    restored = summaries[tenant_id]
+    assert restored.suspended is False
+    assert restored.isolation_tier == "dedicated"
+    assert restored.database_alias == "restore_db"
+    assert restored.residency == "us"
+
+
+async def test_suspend_creates_a_control_plane_row_for_a_pooled_tenant_with_none_yet(
+    database_urls,
+):
+    """A tenant provisioned only through the pooled default (ADR-0002, `scripts/seed.py`'s
+    original path) has no `control.tenants` row at all -- suspending it must not error, it
+    creates one."""
+    from app.operator.suspend import set_tenant_suspended
+
+    tenant_id = uuid.uuid4()
+    engine = create_async_engine(database_urls["superuser"])
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("INSERT INTO tenants (id, name) VALUES (:id, :name)"),
+            {"id": tenant_id, "name": "No Control Row Co"},
+        )
+    await engine.dispose()
+
+    engine = create_async_engine(database_urls["migrations"])
+    try:
+        async with engine.begin() as conn:
+            result = await set_tenant_suspended(conn, str(tenant_id), suspended=True)
+    finally:
+        await engine.dispose()
+
+    assert result.changed is True
+    assert result.suspended is True
+    assert result.suspended_at is not None
+
+
+async def test_app_cannot_widen_its_control_plane_write_with_the_operator_write_flag(
+    database_urls,
+):
+    """Mirrors `test_app_cannot_widen_its_view_with_the_operator_read_flag`: `app` setting
+    `app.control_operator_write` itself must not grant it write access to `control.tenants` --
+    `current_user = 'app_owner'` is what actually restricts the escape hatch, not the flag alone."""
+    tenant_id = await _seed_tenant(database_urls["superuser"], name="Write Flag Co")
+
+    engine = create_async_engine(database_urls["app"])
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("SELECT set_config('app.control_operator_write', 'true', true)")
+            )
+            with pytest.raises(Exception):  # noqa: B017 - asyncpg's InsufficientPrivilegeError
+                await conn.execute(
+                    text("UPDATE control.tenants SET suspended_at = now() WHERE tenant_id = :tid"),
+                    {"tid": str(tenant_id)},
+                )
+    finally:
+        await engine.dispose()
+
+
+async def test_cli_suspend_is_idempotent_and_records_both_invocations_in_the_audit_log(
+    database_urls, operator_env
+):
+    from app.operator.cli import _run, build_parser
+
+    tenant_id = await _seed_tenant(database_urls["superuser"], name="Audited Suspend Co")
+
+    args = build_parser().parse_args(["suspend", str(tenant_id)])
+    assert await _run(args.command, args) == 0
+    assert await _run(args.command, args) == 0
+
+    rows = await _operator_actions(database_urls["superuser"], "suspend")
+    assert len(rows) >= 2
+    first_tenant_id, _, first_details, _ = rows[-2]
+    second_tenant_id, _, second_details, _ = rows[-1]
+    assert str(first_tenant_id) == str(tenant_id)
+    assert str(second_tenant_id) == str(tenant_id)
+    assert first_details["outcome"].startswith("ok: ")
+    assert second_details["outcome"].startswith("no-op: ")
+
+
+async def test_cli_unsuspend_records_the_invocation_by_tenant_name(database_urls, operator_env):
+    from app.operator.cli import _run, build_parser
+
+    tenant_id = await _seed_tenant(
+        database_urls["superuser"], name="Named Unsuspend Co", suspended=True
+    )
+
+    args = build_parser().parse_args(["unsuspend", "Named Unsuspend Co"])
+    exit_code = await _run(args.command, args)
+    assert exit_code == 0
+
+    rows = await _operator_actions(database_urls["superuser"], "unsuspend")
+    tenant_id_logged, _, details, _ = rows[-1]
+    assert str(tenant_id_logged) == str(tenant_id)
+    assert details["outcome"].startswith("ok: ")
+
+
 def test_cli_has_no_flag_or_env_var_for_an_alternate_connection_string():
     """Acceptance: the tool connects only as the owner role's DSN; nothing accepts or falls back
     to a superuser (or any other) connection string."""

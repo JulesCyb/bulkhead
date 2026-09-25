@@ -66,7 +66,9 @@ async def provision(admin_url: str) -> None:
     )
     connection_limit = int(os.environ.get("APP_CONNECTION_LIMIT", ROLE_CONNECTION_LIMIT))
 
-    engine = create_async_engine(str(url))
+    # str(url) would render a set password as "***" (SQLAlchemy's default __str__ masks it) --
+    # fatal here, since this DSN is what the engine actually connects with.
+    engine = create_async_engine(url.render_as_string(hide_password=False))
     try:
         async with engine.begin() as conn:
             await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
