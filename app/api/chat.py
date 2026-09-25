@@ -13,16 +13,32 @@ assistant/tool part riding along on the newest one. So this endpoint builds the 
 loads the real history from `ConversationsRepository` (via `AssistantDeps.load_history`), and
 overrides the adapter's `messages` with just the newest, member-authored turn before running —
 see `_member_authored_messages()` below.
+
+ADR-0006 / Spec 4 (#34): once the run completes, its newly produced messages are written back
+through `AssistantDeps.save_run` (the real `ConversationsRepository`, in a session of its own).
+Persistence is wired through the adapter's own `on_complete` hook, which fires when the run
+itself finishes — not when the client has read the last byte of the SSE response — but the
+`StreamingResponse.body_iterator` a caller stops reading from is a generator that simply never
+advances past the point the caller stopped, so persistence would still depend on the client
+finishing the read unless something keeps driving the underlying stream. `_decouple_from_client`
+below does that: it drains the adapter's stream into a queue from a background task the ASGI
+server's own consumption can't stall, so persistence and the client's read of the stream are two
+independent things, exactly as ADR-0006 requires. The conversation id reaching the run itself is
+combined with the tenant id (`_tenant_scoped_conversation_id`), because tracing has no
+Row-Level Security to fall back on if two tenants' clients ever pick the same id.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Coroutine
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import Response, StreamingResponse
 from pydantic import ValidationError
+from pydantic_ai.agent import AgentRunResult
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.ui.vercel_ai import VercelAIAdapter
 from pydantic_ai.ui.vercel_ai.request_types import FileUIPart, TextUIPart, UIMessage
@@ -40,6 +56,50 @@ from app.request_limit import RequestLimit
 from app.run_limits import RunDeadlineExceeded, RunLimits, build_run_limits, run_deadline
 
 router = APIRouter(prefix="/api", tags=["chat"])
+
+# Fire-and-forget background tasks (the stream-draining task started by `_decouple_from_client`)
+# are only weakly referenced by the event loop once nothing else holds them — keeping a strong
+# reference here until each finishes is what stops asyncio from garbage-collecting one mid-flight.
+_background_tasks: set[asyncio.Task[None]] = set()
+
+
+def _spawn_background(coro: Coroutine[Any, Any, None]) -> None:
+    task = asyncio.ensure_future(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def _drain_into_queue(source: AsyncIterator[str], queue: asyncio.Queue[str | None]) -> None:
+    """Pulls every chunk out of `source` — driving it to exhaustion, including whatever
+    `on_complete` callback fires on its last item — regardless of whether anything is still
+    reading the other end of `queue`. Errors already surface as an encoded `error` chunk
+    upstream (`_bounded_by_deadline`, the adapter's own `on_error`), so nothing here is expected
+    to raise; the `except` is a last-resort guard against an unretrieved-task-exception warning
+    if one somehow does, not a place that swallows a persistence failure.
+    """
+    try:
+        async for chunk in source:
+            await queue.put(chunk)
+    except Exception:
+        pass
+    finally:
+        await queue.put(None)
+
+
+async def _queue_iterator(queue: asyncio.Queue[str | None]) -> AsyncIterator[str]:
+    while (item := await queue.get()) is not None:
+        yield item
+
+
+def _decouple_from_client(source: AsyncIterator[str]) -> AsyncIterator[str]:
+    """Returns an iterator fed from a background task that drains `source` on its own, so a
+    client that stops reading the response never stalls `source` itself (ADR-0006, #34) — in
+    particular, the `on_complete` persistence hook attached to `source` still runs to completion.
+    """
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
+    _spawn_background(_drain_into_queue(source, queue))
+    return _queue_iterator(queue)
+
 
 # Chat histories are legitimately larger than a single prompt, but not unbounded —
 # mirrors the 20k prompt cap on /v1/t/{tenant_id}/agents/assistant/*.
@@ -126,7 +186,15 @@ async def chat(request: Request, ctx: Context, _limit: RequestLimit) -> Response
     adapter.messages = _member_authored_messages(adapter.run_input.messages)
 
     assert deps.load_history is not None
-    history = await deps.load_history(ctx, adapter.conversation_id or "")
+    assert deps.save_run is not None
+    conversation_id = adapter.conversation_id or ""
+    history = await deps.load_history(ctx, conversation_id)
+
+    async def _persist_new_messages(result: AgentRunResult[str]) -> None:
+        # `on_complete` only fires when the run finishes successfully (see module docstring) —
+        # a run that raises before completing never reaches here, so nothing is persisted for it.
+        assert deps.save_run is not None
+        await deps.save_run(ctx, conversation_id, result.new_messages())
 
     capabilities = instrumentation_capabilities(tracing.residency, tracing.content_tracing_opt_in)
     with tenant_span_attributes(ctx.trace_attributes()):
@@ -138,8 +206,15 @@ async def chat(request: Request, ctx: Context, _limit: RequestLimit) -> Response
                 usage_limits=limits.usage_limits,
                 metadata=ctx.trace_attributes(),
                 capabilities=capabilities,
+                # Tenant-scoped, not the client's bare id — two tenants whose clients happen to
+                # pick the same conversation id must never look like the same trace subject
+                # (ADR-0006).
+                conversation_id=(f"{ctx.tenant_id}:{conversation_id}" if conversation_id else None),
+                on_complete=_persist_new_messages,
             )
         )
     if isinstance(response, StreamingResponse):
-        response.body_iterator = _bounded_by_deadline(response.body_iterator, limits, ctx)
+        response.body_iterator = _decouple_from_client(
+            _bounded_by_deadline(response.body_iterator, limits, ctx)
+        )
     return response
