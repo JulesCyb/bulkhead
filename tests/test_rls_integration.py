@@ -163,6 +163,103 @@ async def test_search_sees_only_own_tenant(app_settings, database_urls):
     assert [h.title for h in hits] == ["Document B"]
 
 
+async def _seed_tenant_with_memberships_of_every_role(
+    url: str,
+) -> tuple[uuid.UUID, dict[str, uuid.UUID]]:
+    """One tenant, one document, and one membership per legal role (#30 / S3-T5) -- the fixture
+    the visibility-regression test needs: a real `memberships` row (not a hand-built context) for
+    each of `admin`, `member`, `support`, `agent`, all in the same tenant, all pointing at their
+    own `control.identities` row (the document's own `created_by` seam, #29)."""
+    from app.context import ROLES
+
+    engine = create_async_engine(url)
+    tenant_id = uuid.uuid4()
+    identities_by_role: dict[str, uuid.UUID] = {}
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("INSERT INTO tenants (id, name) VALUES (:id, 'Visibility')"), {"id": tenant_id}
+        )
+        for role in sorted(ROLES):
+            identity_id = uuid.uuid4()
+            await conn.execute(
+                text(
+                    "INSERT INTO control.identities (id, issuer, subject) "
+                    "VALUES (:id, 'seed', :sub)"
+                ),
+                {"id": identity_id, "sub": str(identity_id)},
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO memberships (tenant_id, identity_id, role) "
+                    "VALUES (:tid, :iid, :role)"
+                ),
+                {"tid": tenant_id, "iid": identity_id, "role": role},
+            )
+            identities_by_role[role] = identity_id
+
+        # Seed the document as the admin identity -- created_by/updated_by (#29) need a real
+        # session identity, and which one seeds it is irrelevant to the property under test.
+        await conn.execute(
+            text("SELECT set_config('app.identity_id', :iid, true)"),
+            {"iid": str(identities_by_role["admin"])},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO documents (tenant_id, title, content, embedding) "
+                "VALUES (:tid, :title, :content, CAST(:emb AS vector))"
+            ),
+            {
+                "tid": tenant_id,
+                "title": "Shared Document",
+                "content": "Visible to every role in this tenant",
+                "emb": _vec(0.5),
+            },
+        )
+    await engine.dispose()
+    return tenant_id, identities_by_role
+
+
+async def test_roles_never_affect_document_visibility(app_settings, database_urls):
+    """#30 (S3-T5) AC1: the regression guard for ADR-0004's "roles gate actions, never
+    visibility" -- memberships of all four roles in the same tenant, resolved from real
+    `memberships` rows through the embedded-Postgres seam, get identical `search_documents`
+    results over the same tenant's documents."""
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.repositories.documents import DocumentRepository
+    from app.repositories.memberships import MembershipRepository
+
+    tenant_id, identities_by_role = await _seed_tenant_with_memberships_of_every_role(
+        database_urls["superuser"]
+    )
+    query = [0.0] * DIM
+    query[0] = 1.0
+
+    results_by_role: dict[str, list[tuple[uuid.UUID, str, float]]] = {}
+    for role, identity_id in identities_by_role.items():
+        ctx = RequestContext(tenant_id=tenant_id, identity_id=identity_id, roles=frozenset({role}))
+        async with tenant_session(ctx) as session:
+            # The membership's role really is `role`, resolved from the database -- not just
+            # asserted on the context object -- so this also proves the fixture wired the
+            # `memberships` row correctly.
+            resolved_role = await MembershipRepository().get_role(
+                session, ctx, identity_id=identity_id
+            )
+            assert resolved_role == role
+            hits = await DocumentRepository().search(session, query, limit=10)
+        results_by_role[role] = [(h.id, h.title, h.score) for h in hits]
+
+    distinct_result_sets = set(map(tuple, results_by_role.values()))
+    assert len(distinct_result_sets) == 1, results_by_role
+    assert next(iter(distinct_result_sets)) == (
+        (
+            next(iter(results_by_role.values()))[0][0],
+            "Shared Document",
+            results_by_role["admin"][0][2],
+        ),
+    )
+
+
 async def test_insert_for_other_tenant_is_rejected(app_settings, database_urls):
     from sqlalchemy.exc import DBAPIError
 

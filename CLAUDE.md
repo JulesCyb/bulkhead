@@ -51,6 +51,16 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    is the worked example to copy for a new admin-only action. A failed check raises `PermissionError`
    and is reported by the registered exception handler (`app.main.handle_permission_error`) as a 403
    naming the missing role — never a bare exception left to the default handler, never a 500.
+1b. **The per-transaction `app.identity_id` setting is the source of truth for who did a write**
+   (ADR-0004): `tenant_session(ctx)` sets it on every transaction; a table that needs an audit
+   trail reads it from the database side, never from a value the application passes explicitly or
+   a client could put in a request body. `documents.created_by`/`documents.updated_by`
+   (migration `0010_document_audit_columns.py`) are the worked, shipped example — `created_by`
+   defaults to the setting on `INSERT`, and a `BEFORE UPDATE` trigger refreshes `updated_by` (and
+   `updated_at`) on every update, since a column `DEFAULT` alone never fires again after the
+   first write. Copy this pattern verbatim (two columns, a `DEFAULT`, a trigger, an FK to
+   `control.identities` — never to a membership, which can be revoked) for any other tenant
+   table that needs to say who wrote or last touched a row.
 2. **Every new table** has `tenant_id uuid NOT NULL REFERENCES tenants(id)`, an index on it,
    `ENABLE`/`FORCE ROW LEVEL SECURITY`, and a policy `tenant_id = current_setting('app.tenant_id',
    true)::uuid` (USING and WITH CHECK) plus a GRANT to the `app` role, and must be added to the
