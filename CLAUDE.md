@@ -95,6 +95,8 @@ scripts/seed.py       first tenant + user
 - `app/context.py`, `app/deps.py`, `app/db/session.py` — changes here are authorized by
   ADR-0003 (identity and membership) and ADR-0012 (tenant in the path); check those first
   before editing, rather than treating a matching change as an unreviewed edit
+- `control.tenant_erasures` and `control.operator_actions` (append-only by grant, see
+  migration 0004) — never grant UPDATE/DELETE on either, to any role, for any reason
 
 ## Agent skills
 
