@@ -257,15 +257,21 @@ def test_embedding_client_carries_the_configured_call_deadline(settings):
 async def test_resolve_tenant_embedding_client_uses_the_tenants_own_credential(settings, tmp_path):
     (tmp_path / "acme-gateway-key").write_text("sk-acme-secret")
     ctx = RequestContext(tenant_id=uuid.uuid4(), identity_id=uuid.uuid4())
-    session = _fake_session(alias_row=("acme-gateway-key",), residency_row=None)
+    # resolve_tenant_embedding_client now routes through resolve_residency_route (#61), which
+    # reads residency first, then the gateway-credential alias -- same order as the chat path.
+    session = _fake_session(alias_row=("acme-gateway-key",), residency_row=("eu",))
 
-    # resolve_tenant_embedding_client only needs the alias, not residency; the fake session's
-    # single queued row goes to the one execute() call it makes.
-    async def _execute(*_args, **_kwargs):
-        result = MagicMock()
-        result.first.return_value = ("acme-gateway-key",)
-        return result
-
-    session.execute = AsyncMock(side_effect=_execute)
     client = await resolve_tenant_embedding_client(session, ctx, settings=settings)
     assert client.api_key == "sk-acme-secret"
+
+
+async def test_resolve_tenant_embedding_client_fails_closed_with_no_resolvable_residency(settings):
+    """#61: the embedding path fails closed on an unresolvable residency exactly like the chat
+    path does -- it must never fall back to a default embedding endpoint."""
+    from app.residency import ResidencyUnresolved
+
+    ctx = RequestContext(tenant_id=uuid.uuid4(), identity_id=uuid.uuid4())
+    session = _fake_session(alias_row=None, residency_row=None)
+
+    with pytest.raises(ResidencyUnresolved):
+        await resolve_tenant_embedding_client(session, ctx, settings=settings)

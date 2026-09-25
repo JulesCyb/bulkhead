@@ -43,10 +43,10 @@ from pydantic_ai.messages import ModelMessage
 from pydantic_ai.ui.vercel_ai import VercelAIAdapter
 from pydantic_ai.ui.vercel_ai.request_types import FileUIPart, TextUIPart, UIMessage
 
-from app.agents.assistant import AssistantDeps, chat_assistant
+from app.agents.assistant import AssistantDeps, chat_assistant, resolve_chat_model
+from app.api.agents import ROUTING_ERRORS, routing_error_detail
 from app.context import RequestContext
 from app.deps import Context
-from app.llm import get_model
 from app.observability import (
     instrumentation_capabilities,
     resolve_tenant_tracing,
@@ -165,6 +165,14 @@ async def chat(request: Request, ctx: Context, _limit: RequestLimit) -> Response
     )
     limits = build_run_limits()
 
+    # Resolved before the adapter even parses the body (Spec 8 / #61, ADR-0008): a tenant with no
+    # usable residency, an unlisted model, or no gateway credential is refused cleanly, never
+    # silently served from `app.llm.get_model()`'s deployment-wide default.
+    try:
+        model = await resolve_chat_model(deps)
+    except ROUTING_ERRORS as exc:
+        raise HTTPException(status_code=503, detail=routing_error_detail(exc)) from exc
+
     try:
         adapter = await VercelAIAdapter.from_request(request, agent=chat_assistant, sdk_version=6)
     except ValidationError as exc:
@@ -202,7 +210,7 @@ async def chat(request: Request, ctx: Context, _limit: RequestLimit) -> Response
             adapter.run_stream(
                 message_history=history,
                 deps=deps,
-                model=get_model(deps.model_name),
+                model=model,
                 usage_limits=limits.usage_limits,
                 metadata=ctx.trace_attributes(),
                 capabilities=capabilities,

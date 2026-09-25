@@ -15,9 +15,23 @@ from pydantic_ai.exceptions import UsageLimitExceeded
 
 from app.agents.assistant import AssistantDeps, run_assistant, stream_assistant
 from app.deps import Context
+from app.gateway_credentials import GatewayCredentialUnavailable
+from app.llm import ModelNotAllowedForResidency
 from app.observability import resolve_tenant_tracing, tenant_span_attributes
 from app.request_limit import RequestLimit
+from app.residency import ResidencyUnresolved
 from app.run_limits import RunDeadlineExceeded, build_run_limits, run_deadline
+
+# Raised by `resolve_chat_model` (app/agents/assistant.py) when the requesting tenant's residency
+# cannot be routed at all -- unresolved/unknown residency, a chosen model outside its allow-list,
+# or a missing gateway credential (Spec 8 / #61, ADR-0008). Every one of these is a fail-closed
+# routing failure, never a fallback to a default route, so all three map to the same clear,
+# distinct error rather than a raw exception or a silent default.
+ROUTING_ERRORS = (ResidencyUnresolved, ModelNotAllowedForResidency, GatewayCredentialUnavailable)
+
+
+def routing_error_detail(exc: Exception) -> dict:
+    return {"error": "content_routing_unavailable", "message": str(exc)}
 
 
 def _sse(data: str) -> str:
@@ -68,6 +82,8 @@ async def run(body: RunRequest, ctx: Context, _limit: RequestLimit) -> RunRespon
             status_code=504,
             detail={"error": "run_deadline_exceeded", "message": str(exc)},
         ) from exc
+    except ROUTING_ERRORS as exc:
+        raise HTTPException(status_code=503, detail=routing_error_detail(exc)) from exc
     return RunResponse(output=output)
 
 
@@ -96,6 +112,14 @@ async def stream(body: RunRequest, ctx: Context, _limit: RequestLimit) -> Stream
             return
         except RunDeadlineExceeded as exc:
             yield _sse_error("run_deadline_exceeded", str(exc))
+            return
+        except ROUTING_ERRORS as exc:
+            # Model resolution happens before the stream is opened (see
+            # `resolve_chat_model`/`stream_assistant`), but by the time this generator runs the
+            # ASGI response has already started (status 200, headers sent) -- so a routing
+            # failure here must become a mapped SSE error event, never a raw exception on an
+            # already-started stream.
+            yield _sse_error("content_routing_unavailable", str(exc))
             return
         yield "event: done\ndata: \n\n"
 
