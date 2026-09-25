@@ -102,10 +102,24 @@ def app_settings(database_urls, monkeypatch):
 
 
 async def _seed(url: str) -> tuple[uuid.UUID, uuid.UUID]:
-    """Two tenants with one document each — as the owner; without context RLS blocks all."""
+    """Two tenants with one document each — as the owner; without context RLS blocks all.
+
+    Documents' created_by/updated_by (#29) are NOT NULL foreign keys to control.identities,
+    defaulted from the session's app.identity_id -- so seeding needs a real identity row and
+    that setting in scope before the INSERTs, exactly like a real tenant_session() would supply.
+    """
     engine = create_async_engine(url)
     tenant_a, tenant_b = uuid.uuid4(), uuid.uuid4()
+    seed_identity = uuid.uuid4()
     async with engine.begin() as conn:
+        await conn.execute(
+            text("INSERT INTO control.identities (id, issuer, subject) VALUES (:id, 'seed', :sub)"),
+            {"id": seed_identity, "sub": str(seed_identity)},
+        )
+        await conn.execute(
+            text("SELECT set_config('app.identity_id', :iid, true)"),
+            {"iid": str(seed_identity)},
+        )
         for tenant_id, name, seed in ((tenant_a, "A", 0.1), (tenant_b, "B", 0.9)):
             await conn.execute(
                 text("INSERT INTO tenants (id, name) VALUES (:id, :name)"),
@@ -179,6 +193,145 @@ async def test_app_role_cannot_delete_tenants(app_settings, database_urls):
     with pytest.raises((DBAPIError, ProgrammingError)):
         async with tenant_session(ctx_a) as session:
             await session.execute(text("DELETE FROM tenants WHERE id = :tid"), {"tid": tenant_a})
+
+
+async def _create_tenant_and_identity(url: str) -> tuple[uuid.UUID, uuid.UUID]:
+    """A bare tenant and a real control.identities row — for the document audit-column tests
+    (#29), whose created_by/updated_by are NOT NULL foreign keys to control.identities."""
+    engine = create_async_engine(url)
+    tenant_id, identity_id = uuid.uuid4(), uuid.uuid4()
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("INSERT INTO tenants (id, name) VALUES (:id, 'Audit')"), {"id": tenant_id}
+        )
+        await conn.execute(
+            text("INSERT INTO control.identities (id, issuer, subject) VALUES (:id, 'seed', :sub)"),
+            {"id": identity_id, "sub": str(identity_id)},
+        )
+    await engine.dispose()
+    return tenant_id, identity_id
+
+
+async def test_document_insert_sets_created_by_from_session_identity(app_settings, database_urls):
+    """#29 AC1: inserting a document through the tenant-bound session sets created_by (and
+    updated_by, on first write) to the session's identity without application code passing it
+    explicitly -- DocumentRepository.add() never mentions the column."""
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.repositories.documents import DocumentRepository
+
+    tenant_id, identity_id = await _create_tenant_and_identity(database_urls["superuser"])
+    ctx = RequestContext(tenant_id=tenant_id, identity_id=identity_id)
+    async with tenant_session(ctx) as session:
+        doc = await DocumentRepository().add(session, ctx, title="t", content="c", embedding=None)
+        doc_id = doc.id
+
+    # Re-read the row directly: the property under test is what the database persisted, not
+    # what the ORM's local object happens to reflect.
+    engine = create_async_engine(database_urls["superuser"])
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text("SELECT created_by, updated_by FROM documents WHERE id = :id"),
+                {"id": doc_id},
+            )
+        ).one()
+    await engine.dispose()
+    assert row.created_by == identity_id
+    assert row.updated_by == identity_id
+
+
+async def test_document_update_refreshes_updated_by_and_keeps_created_by(
+    app_settings, database_urls
+):
+    """#29 AC2: updating a document in a second transaction with a different session identity
+    changes updated_by/updated_at, while the original creator (created_by) stays unchanged."""
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.repositories.documents import DocumentRepository
+
+    tenant_id, creator_id = await _create_tenant_and_identity(database_urls["superuser"])
+    _, editor_id = await _create_tenant_and_identity(database_urls["superuser"])
+
+    creator_ctx = RequestContext(tenant_id=tenant_id, identity_id=creator_id)
+    async with tenant_session(creator_ctx) as session:
+        doc = await DocumentRepository().add(
+            session, creator_ctx, title="t", content="c", embedding=None
+        )
+        doc_id = doc.id
+
+    editor_ctx = RequestContext(tenant_id=tenant_id, identity_id=editor_id)
+    async with tenant_session(editor_ctx) as session:
+        await session.execute(
+            text("UPDATE documents SET title = 'updated' WHERE id = :id"), {"id": doc_id}
+        )
+
+    engine = create_async_engine(database_urls["superuser"])
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text(
+                    "SELECT created_by, updated_by, created_at, updated_at "
+                    "FROM documents WHERE id = :id"
+                ),
+                {"id": doc_id},
+            )
+        ).one()
+    await engine.dispose()
+    assert row.created_by == creator_id
+    assert row.updated_by == editor_id
+    assert row.updated_at > row.created_at
+
+
+async def test_document_created_by_fk_checked_as_owner_not_app_role(app_settings, database_urls):
+    """#29 AC3: the creator FK resolves against control.identities even though the app role's
+    only grant on it is the narrow issuer-plus-subject lookup view (ADR-0003) -- app has no
+    grant at all on control.identities itself. Proves the FK is checked with the referenced
+    table's owner privileges, not the querying role's, rather than assuming it: a real identity
+    resolves despite the missing grant, and an unknown identity is still rejected by the FK."""
+    from sqlalchemy.exc import DBAPIError
+
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.repositories.documents import DocumentRepository
+
+    tenant_id, identity_id = await _create_tenant_and_identity(database_urls["superuser"])
+
+    engine = create_async_engine(database_urls["app"])
+    async with engine.connect() as conn:
+        grants = (
+            await conn.execute(
+                text(
+                    "SELECT count(*) FROM information_schema.role_table_grants "
+                    "WHERE table_schema = 'control' AND table_name = 'identities' "
+                    "AND grantee = current_user"
+                )
+            )
+        ).scalar_one()
+    await engine.dispose()
+    assert grants == 0
+
+    ctx = RequestContext(tenant_id=tenant_id, identity_id=identity_id)
+    async with tenant_session(ctx) as session:
+        doc = await DocumentRepository().add(session, ctx, title="t", content="c", embedding=None)
+        doc_id = doc.id
+
+    engine = create_async_engine(database_urls["superuser"])
+    async with engine.connect() as conn:
+        created_by = (
+            await conn.execute(
+                text("SELECT created_by FROM documents WHERE id = :id"), {"id": doc_id}
+            )
+        ).scalar_one()
+    await engine.dispose()
+    assert created_by == identity_id
+
+    unknown_ctx = RequestContext(tenant_id=tenant_id, identity_id=uuid.uuid4())
+    with pytest.raises(DBAPIError):
+        async with tenant_session(unknown_ctx) as session:
+            await DocumentRepository().add(
+                session, unknown_ctx, title="t2", content="c2", embedding=None
+            )
 
 
 async def test_tenant_session_sets_identity_id(app_settings, database_urls):
