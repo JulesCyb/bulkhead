@@ -28,10 +28,15 @@ The agent logic runs as its own service with an HTTP API — web, mobile, and Cl
 uv sync --group dbtest              # dbtest only if you want the real RLS test
 cp .env.example .env                # add keys and model names
 docker compose up -d --wait postgres    # --wait blocks until the healthcheck passes
-uv run alembic upgrade head
+uv run python scripts/migrate.py    # migrations run once per database alias; this brings every known alias to head
 uv run python scripts/seed.py "My Tenant" me@example.com   # prints tenant/user IDs
 uv run uvicorn app.main:app --reload
 ```
+
+Migrations run once per database alias (ADR-0002): `scripts/migrate.py` with no argument brings
+every alias the control plane currently knows about to head; naming one alias explicitly
+(`uv run python scripts/migrate.py <alias>`) migrates only that database, leaving every other
+alias untouched.
 
 First call (dev headers are enough locally):
 

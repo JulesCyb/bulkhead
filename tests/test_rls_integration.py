@@ -431,7 +431,10 @@ async def test_control_tenants_owned_by_app_owner_never_app(database_urls):
 
 async def test_control_tenants_has_forced_rls_with_using_and_check(database_urls):
     """`control.tenants` carries forced RLS with a policy that both restricts and validates,
-    the same shape as every other tenant-scoped table (#12)."""
+    the same shape as every other tenant-scoped table (#12). Selected by name, not "the only
+    policy on this table": migration 0016 (#76) adds a second, purely additive SELECT-only
+    policy (a narrow migration-runner escape hatch) alongside this one -- it carries no
+    with_check clause of its own and does not change this policy's shape."""
     engine = create_async_engine(database_urls["migrations"])
     async with engine.connect() as conn:
         row = (
@@ -447,7 +450,8 @@ async def test_control_tenants_has_forced_rls_with_using_and_check(database_urls
             await conn.execute(
                 text(
                     "SELECT qual IS NOT NULL, with_check IS NOT NULL FROM pg_policies "
-                    "WHERE schemaname = 'control' AND tablename = 'tenants'"
+                    "WHERE schemaname = 'control' AND tablename = 'tenants' "
+                    "AND policyname = 'control_tenants_tenant_isolation'"
                 )
             )
         ).one()
