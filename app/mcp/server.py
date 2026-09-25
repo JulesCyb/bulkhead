@@ -22,6 +22,7 @@ from mcp.server.mcpserver import MCPServer
 
 from app.config import get_settings
 from app.context import RequestContext
+from app.startup_checks import run_startup_checks
 from app.tools import documents as document_tools
 
 server = MCPServer(
@@ -50,5 +51,15 @@ async def search_documents(query: str, limit: int = 5) -> list[dict]:
     return [hit.model_dump(mode="json") for hit in hits]
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """The MCP server's own startup path (issue #59 / ADR-0008): runs the same fail-closed
+    residency/model-allow-list checks the HTTP API runs at construction and lifespan
+    (`app.startup_checks.run_startup_checks`) before this process ever accepts a tool call on
+    the stdio transport -- one startup-checks function, not a second validation this entry point
+    would otherwise have to reconcile by hand."""
+    run_startup_checks(get_settings())
     server.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()
