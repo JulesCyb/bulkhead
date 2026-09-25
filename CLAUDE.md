@@ -74,6 +74,19 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    first write. Copy this pattern verbatim (two columns, a `DEFAULT`, a trigger, an FK to
    `control.identities` — never to a membership, which can be revoked) for any other tenant
    table that needs to say who wrote or last touched a row.
+1c. **Fail closed, never leak existence across tenants** (review of #46/#38): when a repository
+   (`app/repositories/`) refuses because a target id belongs to another tenant, does not exist at
+   all, or exists here but fails some other in-tenant invariant (e.g. a membership with the wrong
+   role), raise a subclass of `app.repositories.errors.NotFoundInTenant` — never a bare
+   `ValueError` left unmapped, which falls through to the generic 500 handler and is itself a
+   leak (500 vs 404 already tells a caller "this id exists somewhere" a 404 does not). Set
+   `public_message` on the subclass to the one fixed sentence every caller sees regardless of
+   *which* of those reasons actually happened; `str(exc)` may name real ids and is logged for
+   operators, never put in the response. One handler, `app.main.handle_not_found_in_tenant`, is
+   registered once on the base class and catches every subclass by MRO — a new repository reuses
+   it by subclassing, never by adding its own per-exception handler in `app/main.py`.
+   `UnknownAgentIdentity` (`app/repositories/agent_credentials.py`) and `NotAnAgentMembership`
+   (`app/repositories/standing_grants.py`) are the worked examples.
 2. **Every new table** has `tenant_id uuid NOT NULL REFERENCES tenants(id)`, an index on it,
    `ENABLE`/`FORCE ROW LEVEL SECURITY`, and a policy `tenant_id = NULLIF(current_setting(
    'app.tenant_id', true), '')::uuid` (USING and WITH CHECK; the NULLIF matters: a reused pooled

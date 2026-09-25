@@ -21,7 +21,7 @@ from app.context import RoleRequired
 from app.db.guard import run_role_rls_guard
 from app.mcp.server import build_streamable_http_app, check_mcp_mode
 from app.observability import setup_observability
-from app.repositories.agent_credentials import UnknownAgentIdentity
+from app.repositories.errors import NotFoundInTenant
 from app.startup_checks import run_startup_checks
 
 log = logging.getLogger(__name__)
@@ -110,21 +110,36 @@ async def handle_permission_error(request: Request, exc: Exception) -> JSONRespo
     )
 
 
-async def handle_unknown_agent_identity(request: Request, exc: Exception) -> JSONResponse:
-    """Finding from the 2026-09-25 review of #46: `issue_agent_credential` used to check only
-    that the *caller* was an admin, never that `identity_id` actually named an agent identity in
-    the caller's own tenant -- so an admin could mint a (unusable, but real) credential row for
-    another tenant's identity, or a person's, and the response would tell them which. This
-    handler is the one place that answer is given, and it gives the same answer -- a 404 with
-    this exact, fixed body -- for every reason `UnknownAgentIdentity`
-    (`app/repositories/agent_credentials.py`) can be raised: an id that names nothing, a
-    cross-tenant id, or a person's id. `str(exc)` (which does name the identity id) is logged for
-    operators, never put in the response, so the client never learns anything an unknown id
-    wouldn't also tell it."""
-    log.info("Agent-credential issue refused: unknown agent identity (%s)", exc)
+async def handle_not_found_in_tenant(request: Request, exc: Exception) -> JSONResponse:
+    """The one shared answer for every repository condition meaning "nothing in the caller's own
+    tenant matches" (`app.repositories.errors.NotFoundInTenant` and its subclasses) -- fail
+    closed, never leak existence across tenants.
+
+    Finding from the 2026-09-25 review of #46: `issue_agent_credential` used to check only that
+    the *caller* was an admin, never that `identity_id` actually named an agent identity in the
+    caller's own tenant -- so an admin could mint a (unusable, but real) credential row for
+    another tenant's identity, or a person's, and the response would tell them which. That became
+    `UnknownAgentIdentity` (`app/repositories/agent_credentials.py`). The same review, sweeping
+    for the same shape elsewhere, found `NotAnAgentMembership`
+    (`app/repositories/standing_grants.py`) had the identical reasoning in its own docstring but
+    no handler at all -- it fell through to the generic 500, which is itself a leak (500 vs 404
+    already tells a caller "this id exists somewhere" a 404 wouldn't). Both are now
+    `NotFoundInTenant` subclasses, caught by this one handler registered on the base class
+    (Starlette dispatches by walking the exception's MRO, so a new subclass needs no new handler
+    registered here) -- this is the pattern a new repository should reuse for its own "not in
+    this tenant" condition, never a bespoke per-exception handler.
+
+    This gives the same answer -- a 404 with a fixed body -- for every reason the raised
+    exception's type can occur: an id that names nothing, a cross-tenant id, or one that exists
+    here but fails some other in-tenant invariant (e.g. a membership with the wrong role).
+    `str(exc)` (which may name the real id) is logged for operators; the client only ever sees
+    `exc.public_message`, the fixed sentence the raising exception class itself owns -- so it
+    never learns anything an unknown id wouldn't also tell it."""
+    log.info("%s refused: %s", type(exc).__name__, exc)
+    message = getattr(exc, "public_message", NotFoundInTenant.public_message)
     return JSONResponse(
         status_code=status.HTTP_404_NOT_FOUND,
-        content={"error": "not_found", "message": "No such agent identity in this tenant."},
+        content={"error": "not_found", "message": message},
     )
 
 
@@ -238,7 +253,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         openapi_url="/openapi.json" if docs_enabled else None,
     )
     app.add_exception_handler(PermissionError, handle_permission_error)
-    app.add_exception_handler(UnknownAgentIdentity, handle_unknown_agent_identity)
+    app.add_exception_handler(NotFoundInTenant, handle_not_found_in_tenant)
     app.add_exception_handler(Exception, handle_unhandled_exception)
     origins = settings.cors_origin_list
     app.add_middleware(

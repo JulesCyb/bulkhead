@@ -8,10 +8,10 @@ pattern `app/tools/memberships.py` established (ADR-0004, S3-T1 / #26): a failed
 
 `issue_agent_credential` additionally relies on `AgentCredentialRepository.create` to raise
 `app.repositories.agent_credentials.UnknownAgentIdentity` (never letting a bad `identity_id`
-reach the database as anything other than that one exception, see that module's docstring) --
-turned into a 404 by `app.main.handle_unknown_agent_identity`, identical regardless of whether
-`identity_id` names nothing at all, another tenant's identity, or a person's identity in this
-tenant.
+reach the database as anything other than that one exception, see that module's docstring) -- a
+`app.repositories.errors.NotFoundInTenant` subclass, turned into a 404 by
+`app.main.handle_not_found_in_tenant`, identical regardless of whether `identity_id` names
+nothing at all, another tenant's identity, or a person's identity in this tenant.
 """
 
 from __future__ import annotations

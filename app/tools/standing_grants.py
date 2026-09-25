@@ -23,8 +23,10 @@ async def create_standing_grant(
     ctx: RequestContext, *, agent_membership_id: UUID, tool_name: str, granted_by: UUID
 ) -> StandingGrantRecord:
     """Grant `agent_membership_id` standing permission to call `tool_name` with no person
-    present. Admin-only; refused (`NotAnAgentMembership`, from the repository) unless the target
-    membership currently carries the `agent` role."""
+    present. Admin-only; refused (`NotAnAgentMembership`, from the repository -- a
+    `app.repositories.errors.NotFoundInTenant` subclass, turned into a 404 by
+    `app.main.handle_not_found_in_tenant`) unless the target membership currently carries the
+    `agent` role."""
     ctx.require_role("admin")
     async with tenant_session(ctx) as session:
         grant = await StandingGrantRepository().create(
