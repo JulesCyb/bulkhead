@@ -44,6 +44,24 @@ class MembershipRepository:
             )
         ).scalar_one_or_none()
 
+    async def get_by_identity(
+        self, session: AsyncSession, ctx: RequestContext, *, identity_id: UUID
+    ) -> MembershipRecord | None:
+        """The full membership row (id and role) of `identity_id` in `ctx.tenant_id`, or None --
+        never raises -- when no such membership exists. Unlike `get_role`, this also returns the
+        membership's own id, which the approval mechanism (ADR-0007, `app/tools/approvals.py`)
+        needs as `asking_membership_id`/`actor_membership_id` -- a tenant-scoped fact about the
+        membership, not the global identity."""
+        row = (
+            await session.execute(
+                select(Membership).where(
+                    Membership.tenant_id == ctx.tenant_id,
+                    Membership.identity_id == identity_id,
+                )
+            )
+        ).scalar_one_or_none()
+        return MembershipRecord.model_validate(row) if row is not None else None
+
     async def list_for_tenant(
         self, session: AsyncSession, ctx: RequestContext
     ) -> list[MembershipRecord]:

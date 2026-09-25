@@ -56,6 +56,7 @@ from app.observability import (
 from app.request_limit import RequestLimit
 from app.run_limits import RunDeadlineExceeded, RunLimits, build_run_limits, run_deadline
 from app.tenant_suspension import ensure_tenant_not_suspended
+from app.tools.approvals import resolve_incoming_decisions
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
@@ -204,7 +205,22 @@ async def chat(request: Request, ctx: Context, _limit: RequestLimit) -> Response
     assert deps.load_history is not None
     assert deps.save_run is not None
     conversation_id = adapter.conversation_id or ""
+    deps.conversation_id = conversation_id
     history = await deps.load_history(ctx, conversation_id)
+
+    # ADR-0007 / #40: a resumed request may carry the member's approve/refuse decision for a
+    # writing tool's earlier deferred call (`VercelAIAdapter.deferred_tool_results`, extracted
+    # from the raw request body regardless of the `adapter.messages` override above). A refusal
+    # is resolved by pydantic-ai substituting `ToolDenied` directly -- the tool's own
+    # `args_validator` never runs for a denied call -- so this is the only place a refusal's
+    # audit milestone can ever be recorded; an approval is resolved here too, before the run
+    # itself starts, so the tool's own execution-time re-verification always has an `approved`
+    # (not merely `pending`) record to check against.
+    deferred_tool_results = adapter.deferred_tool_results
+    if deferred_tool_results is not None:
+        await resolve_incoming_decisions(
+            ctx, conversation_id=conversation_id, decisions=deferred_tool_results.approvals
+        )
 
     async def _persist_new_messages(result: AgentRunResult[str]) -> None:
         # `on_complete` only fires when the run finishes successfully (see module docstring) —

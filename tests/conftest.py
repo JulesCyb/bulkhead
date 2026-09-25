@@ -155,14 +155,20 @@ def resolve_to_model(model):
 
 @pytest.fixture
 def test_model(monkeypatch):
-    """TestModel calls every tool once and answers deterministically.
+    """TestModel calls every named tool once and answers deterministically.
 
     Overrides both agents (Spec 5 / #36 split) since a test may exercise either the one-shot
-    endpoints or /api/chat without knowing in advance which one it will hit. Also patches out
-    per-tenant residency-based model resolution (`resolve_to_model`, above) so no real database
-    connection is attempted before the override even takes effect.
+    endpoints or /api/chat without knowing in advance which one it will hit. Restricted to
+    `search_documents` (`call_tools=`, rather than the default `'all'`) so a plain functional test
+    never drives `chat_assistant`'s writing tool, `rename_document` (ADR-0007, #40) -- that tool's
+    own `args_validator` needs a real tenant-bound database session (it writes a pending action),
+    which a test using this fixture is not set up to provide. A test that specifically exercises
+    the writing tool builds its own `TestModel`/`FunctionModel` against a real database instead
+    (see `tests/test_writing_tool_approval_integration.py`). Also patches out per-tenant
+    residency-based model resolution (`resolve_to_model`, above) so no real database connection is
+    attempted before the override even takes effect.
     """
-    tm = TestModel()
+    tm = TestModel(call_tools=["search_documents"])
     resolver = resolve_to_model(tm)
     monkeypatch.setattr(assistant_module, "resolve_chat_model", resolver)
     monkeypatch.setattr(chat_module, "resolve_chat_model", resolver)

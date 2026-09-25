@@ -76,7 +76,11 @@ async def test_stream_endpoint_carries_request_id_header(client, captured_ctx):
 async def test_chat_endpoint_carries_request_id_header(monkeypatch, fake_history):
     from tests.conftest import resolve_to_model
 
-    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(TestModel()))
+    monkeypatch.setattr(
+        chat_module,
+        "resolve_chat_model",
+        resolve_to_model(TestModel(call_tools=["search_documents"])),
+    )
     monkeypatch.setattr(
         assistant_module.conversation_tools, "load_conversation_history", fake_history
     )
