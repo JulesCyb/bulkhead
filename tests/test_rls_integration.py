@@ -468,3 +468,141 @@ async def test_app_statement_timeout_matches_bootstrap(database_urls):
         ).scalar_one()
     await engine.dispose()
     assert int(timeout_ms) == ROLE_STATEMENT_TIMEOUT_MS
+
+
+async def _insert_public_tenant(conn, tenant_id: uuid.UUID, name: str) -> None:
+    await conn.execute(
+        text("INSERT INTO tenants (id, name) VALUES (:id, :name)"), {"id": tenant_id, "name": name}
+    )
+
+
+async def _insert_control_tenant(
+    conn, tenant_id: uuid.UUID, *, isolation_tier: str, database_alias: str | None
+) -> None:
+    await conn.execute(
+        text(
+            "INSERT INTO control.tenants (tenant_id, isolation_tier, database_alias) "
+            "VALUES (:tid, :tier, :alias)"
+        ),
+        {"tid": tenant_id, "tier": isolation_tier, "alias": database_alias},
+    )
+
+
+async def test_pooled_tier_with_alias_rejected_by_schema_constraint(database_urls):
+    """(#73) A pooled tenant's database alias must be NULL -- enforced by the `CHECK`
+    constraint added in 0005, not by application code."""
+    from sqlalchemy.exc import DBAPIError
+
+    engine = create_async_engine(database_urls["superuser"])
+    tenant_id = uuid.uuid4()
+    async with engine.begin() as conn:
+        await _insert_public_tenant(conn, tenant_id, "pooled-with-alias")
+    with pytest.raises(DBAPIError):
+        async with engine.begin() as conn:
+            await _insert_control_tenant(
+                conn, tenant_id, isolation_tier="pooled", database_alias="eu1"
+            )
+    await engine.dispose()
+
+
+async def test_dedicated_tier_without_alias_rejected_by_schema_constraint(database_urls):
+    """(#73) A dedicated tenant's database alias must be set -- enforced the same way."""
+    from sqlalchemy.exc import DBAPIError
+
+    engine = create_async_engine(database_urls["superuser"])
+    tenant_id = uuid.uuid4()
+    async with engine.begin() as conn:
+        await _insert_public_tenant(conn, tenant_id, "dedicated-without-alias")
+    with pytest.raises(DBAPIError):
+        async with engine.begin() as conn:
+            await _insert_control_tenant(
+                conn, tenant_id, isolation_tier="dedicated", database_alias=None
+            )
+    await engine.dispose()
+
+
+async def test_database_aliases_view_enumerates_distinct_aliases(database_urls):
+    """(#73) `control.database_aliases` returns exactly the pooled default while every tenant
+    is pooled, and includes a newly seeded alias once a dedicated tenant is added."""
+    engine = create_async_engine(database_urls["superuser"])
+    pooled_a, pooled_b, dedicated = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    async with engine.begin() as conn:
+        for tenant_id, name in ((pooled_a, "pooled-a"), (pooled_b, "pooled-b")):
+            await _insert_public_tenant(conn, tenant_id, name)
+            await _insert_control_tenant(
+                conn, tenant_id, isolation_tier="pooled", database_alias=None
+            )
+
+    async with engine.connect() as conn:
+        aliases = set(
+            (await conn.execute(text("SELECT database_alias FROM control.database_aliases")))
+            .scalars()
+            .all()
+        )
+    assert aliases == {"pooled"}
+
+    async with engine.begin() as conn:
+        await _insert_public_tenant(conn, dedicated, "dedicated-eu1")
+        await _insert_control_tenant(
+            conn, dedicated, isolation_tier="dedicated", database_alias="eu1"
+        )
+
+    async with engine.connect() as conn:
+        aliases = set(
+            (await conn.execute(text("SELECT database_alias FROM control.database_aliases")))
+            .scalars()
+            .all()
+        )
+    await engine.dispose()
+    assert aliases == {"pooled", "eu1"}
+
+
+async def test_control_tenants_stores_only_the_alias_string(database_urls):
+    """(#73) The dedicated-tenant record has exactly one column for "where its database
+    lives" -- the alias string -- and no column for a DSN, hostname, port, user, or password:
+    that connection detail lives in a tenant secret file keyed by the alias (ADR-0011), never
+    in the control plane's own schema."""
+    engine = create_async_engine(database_urls["migrations"])
+    async with engine.connect() as conn:
+        columns = (
+            await conn.execute(
+                text(
+                    "SELECT column_name, data_type FROM information_schema.columns "
+                    "WHERE table_schema = 'control' AND table_name = 'tenants'"
+                )
+            )
+        ).all()
+    await engine.dispose()
+    by_name = {row.column_name: row.data_type for row in columns}
+    assert set(by_name) == {"tenant_id", "created_at", "isolation_tier", "database_alias"}
+    assert by_name["database_alias"] == "text"
+
+
+async def test_tenants_view_still_select_only_after_adding_isolation_columns(database_urls):
+    """(#73) Extending `control.tenants_view` with `isolation_tier`/`database_alias` adds no
+    new grant: `app` still holds SELECT only, exactly as after #12."""
+    engine = create_async_engine(database_urls["app"])
+    async with engine.connect() as conn:
+        table_grants = (
+            await conn.execute(
+                text(
+                    "SELECT table_name, privilege_type FROM information_schema.table_privileges "
+                    "WHERE table_schema = 'control' AND grantee = 'app'"
+                )
+            )
+        ).all()
+        columns = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns WHERE table_schema = "
+                        "'control' AND table_name = 'tenants_view'"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    await engine.dispose()
+    assert set(table_grants) == {("tenants_view", "SELECT")}
+    assert set(columns) == {"tenant_id", "created_at", "isolation_tier", "database_alias"}
