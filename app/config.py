@@ -171,6 +171,20 @@ class Settings(BaseSettings):
     jwt_verification_key: SecretStr | None = None
     jwt_algorithm: str = "RS256"
 
+    # Agent-credential token exchange (Spec 6 / #47, ADR-0005): the signing counterpart to
+    # jwt_verification_key above -- used only to mint a short-lived access token when an agent
+    # identity exchanges its own credential, never to verify a customer-owned identity provider's
+    # tokens (that stays jwt_verification_key/verify_token's job). For the symmetric algorithm
+    # this starter defaults verification to, this is literally the same secret as
+    # jwt_verification_key; kept as its own SecretStr field (file-backed via secrets_dir, same as
+    # every other secret here) so a deployment can rotate or split it independently. No default:
+    # an unconfigured signing key fails every exchange rather than silently minting an unsigned
+    # or otherwise weak token.
+    agent_token_signing_key: SecretStr | None = None
+    # Short-lived by design (ADR-0005): long enough for one connection/tool-call session to
+    # authenticate once, short enough that a leaked token has a small blast radius.
+    agent_token_ttl_seconds: int = 300
+
     # Per-membership request limit on the agent-facing routes
     # (/v1/t/{tenant_id}/agents/assistant/run, /v1/t/{tenant_id}/agents/assistant/stream,
     # /v1/t/{tenant_id}/api/chat): a single-process, best-effort backstop against a
