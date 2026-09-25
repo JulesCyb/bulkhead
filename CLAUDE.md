@@ -95,6 +95,9 @@ scripts/seed.py       first tenant + user
 - `app/context.py`, `app/deps.py`, `app/db/session.py` — changes here are authorized by
   ADR-0003 (identity and membership) and ADR-0012 (tenant in the path); check those first
   before editing, rather than treating a matching change as an unreviewed edit
+- `app/db/engine_registry.py` — the process-wide alias-to-engine cache ADR-0002 (hybrid tenant
+  isolation) depends on; a mistake here has the same blast radius as a mistake in the
+  tenant-session layer
 
 ## Agent skills
 
