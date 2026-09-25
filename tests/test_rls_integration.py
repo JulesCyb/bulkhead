@@ -456,6 +456,120 @@ async def test_control_tenants_has_forced_rls_with_using_and_check(database_urls
     assert policy[1] is True
 
 
+async def _public_schema_tenant_isolation_violations(conn, exceptions: frozenset[str]) -> dict:
+    """Walks live catalog state (not a fixed list of table names) and reports, per table
+    outside `exceptions`, which of the three mandatory parts (forced RLS, a policy that both
+    restricts and validates, tied to `app.tenant_id`) is missing. An empty result means every
+    table in `public` outside the exception list is fully protected.
+    """
+    tables = (
+        await conn.execute(
+            text(
+                "SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity FROM pg_class c "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname = 'public' AND c.relkind = 'r'"
+            )
+        )
+    ).all()
+
+    violations: dict[str, list[str]] = {}
+    for row in tables:
+        if row.relname in exceptions:
+            continue
+        reasons = []
+        if not row.relrowsecurity:
+            reasons.append("row security not enabled")
+        if not row.relforcerowsecurity:
+            reasons.append("row security not forced")
+
+        policies = (
+            await conn.execute(
+                text(
+                    "SELECT qual, with_check FROM pg_policies "
+                    "WHERE schemaname = 'public' AND tablename = :t"
+                ),
+                {"t": row.relname},
+            )
+        ).all()
+        # A policy both restricts (USING -> qual) and validates (WITH CHECK -> with_check)
+        # against the tenant setting; the column it compares (tenant_id on most tables, id on
+        # `tenants` itself) varies, but every such policy names the same setting.
+        has_tenant_policy = any(
+            p.qual
+            and "app.tenant_id" in p.qual
+            and p.with_check
+            and "app.tenant_id" in p.with_check
+            for p in policies
+        )
+        if not has_tenant_policy:
+            reasons.append(
+                "no policy with both a restrict (USING) and validate (WITH CHECK) clause "
+                "tied to app.tenant_id"
+            )
+        if reasons:
+            violations[row.relname] = reasons
+    return violations
+
+
+async def test_public_schema_tenant_isolation_invariant(database_urls):
+    """Acceptance: every public-schema table outside TENANT_ISOLATION_EXCEPTIONS carries
+    forced RLS, a tenant column, and a policy with both a restrict and a validate clause."""
+    from app.db.models import TENANT_ISOLATION_EXCEPTIONS
+
+    engine = create_async_engine(database_urls["migrations"])
+    async with engine.connect() as conn:
+        violations = await _public_schema_tenant_isolation_violations(
+            conn, TENANT_ISOLATION_EXCEPTIONS
+        )
+    await engine.dispose()
+    assert violations == {}
+
+
+async def test_alembic_bookkeeping_table_is_the_only_exception(database_urls):
+    """Acceptance: the migration tool's own bookkeeping table is the only table on the
+    exception list, and it genuinely needs the exemption (it really does carry none of the
+    three mandatory parts) -- proving the list isn't hiding an under-protected domain table."""
+    from app.db.models import TENANT_ISOLATION_EXCEPTIONS
+
+    assert TENANT_ISOLATION_EXCEPTIONS == frozenset({"alembic_version"})
+
+    engine = create_async_engine(database_urls["migrations"])
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text(
+                    "SELECT relrowsecurity FROM pg_class c "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE n.nspname = 'public' AND c.relname = 'alembic_version'"
+                )
+            )
+        ).one()
+    await engine.dispose()
+    assert row.relrowsecurity is False
+
+
+async def test_invariant_catches_an_unprotected_table(database_urls):
+    """Acceptance: adding a table with no policy to the schema under test causes the invariant
+    check to fail -- proving it walks live catalog state rather than a fixed list of names."""
+    from app.db.models import TENANT_ISOLATION_EXCEPTIONS
+
+    engine = create_async_engine(database_urls["migrations"])
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text("CREATE TABLE scratch_unprotected (id int)"))
+        async with engine.connect() as conn:
+            violations = await _public_schema_tenant_isolation_violations(
+                conn, TENANT_ISOLATION_EXCEPTIONS
+            )
+    finally:
+        async with engine.begin() as conn:
+            await conn.execute(text("DROP TABLE IF EXISTS scratch_unprotected"))
+        await engine.dispose()
+
+    assert "scratch_unprotected" in violations
+    assert "row security not enabled" in violations["scratch_unprotected"]
+
+
 async def test_app_statement_timeout_matches_bootstrap(database_urls):
     """The role-level statement_timeout the bootstrap script sets for `app` is the one that
     actually applies to its connections."""
