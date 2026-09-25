@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
+import os
 import uuid
 
 import pytest
 from pydantic_ai.models.test import TestModel
+
+# EMBEDDING_PROVIDER/EMBEDDING_MODEL have no default (app/config.py) — Settings() refuses to
+# construct without them. Set process-wide test defaults here, at collection time, so tests that
+# don't care about embedding config (most of the suite) don't each have to supply it. Tests that
+# exercise the "unset" failure construct Settings(embedding_provider=None, ...) directly, which
+# bypasses these env vars entirely.
+os.environ.setdefault("EMBEDDING_PROVIDER", "openai")
+os.environ.setdefault("EMBEDDING_MODEL", "text-embedding-3-small")
 
 from app.agents.assistant import AssistantDeps, assistant
 from app.context import RequestContext
