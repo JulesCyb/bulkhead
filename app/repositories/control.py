@@ -5,6 +5,10 @@
 The application never creates, changes, or removes an identity; only the owner-role seed/admin
 path does that. `find_by_issuer_and_subject` and `get` below are read-only by construction: they
 issue a single SELECT each and return None on no match rather than raising.
+
+`ControlRepository` (Spec 7 / #52) is the one tenant-scoped read: it takes a session from
+`tenant_session(ctx)` and reads the caller's own row through `control.tenants_view`, which RLS
+filters to `ctx.tenant_id`.
 """
 
 from __future__ import annotations
@@ -14,6 +18,8 @@ from uuid import UUID
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.context import RequestContext
 
 
 class Identity(BaseModel):
@@ -77,3 +83,20 @@ class TenantAuthSettingsRepository:
             issuer=row["identity_issuer"] or default_issuer,
             suspended=row["suspended_at"] is not None,
         )
+
+
+class ControlRepository:
+    async def get_gateway_credential_alias(
+        self, session: AsyncSession, ctx: RequestContext
+    ) -> str | None:
+        """The alias of `ctx.tenant_id`'s gateway credential, or None if none is recorded yet."""
+        row = (
+            await session.execute(
+                text(
+                    "SELECT gateway_credential_alias FROM control.tenants_view "
+                    "WHERE tenant_id = :tid"
+                ),
+                {"tid": str(ctx.tenant_id)},
+            )
+        ).first()
+        return row[0] if row else None
