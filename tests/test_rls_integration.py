@@ -29,16 +29,29 @@ def _vec(seed: float) -> str:
     return "[" + ",".join(f"{v:.3f}" for v in values) + "]"
 
 
+def _psql(server, command: str) -> None:
+    """`server.psql` without a shell: pgserver's own version breaks on paths with spaces."""
+    from pgserver.postgres_server import POSTGRES_BIN_PATH
+
+    subprocess.run(
+        [str(POSTGRES_BIN_PATH / "psql"), server.get_uri()],
+        input=command.encode(),
+        check=True,
+        capture_output=True,
+    )
+
+
 @pytest.fixture(scope="module")
 def database_urls():
     pgdata = tempfile.mkdtemp(prefix="pgdata-")
     server = pgserver.get_server(pgdata)
     sockdir = parse_qs(urlparse(server.get_uri()).query)["host"][0]
-    server.psql(
+    _psql(
+        server,
         "CREATE ROLE app LOGIN NOSUPERUSER NOBYPASSRLS; "
         "GRANT USAGE ON SCHEMA public TO app; "
         "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE "
-        "ON TABLES TO app;"
+        "ON TABLES TO app;",
     )
     urls = {
         "migrations": f"postgresql+asyncpg://postgres@/postgres?host={sockdir}",
@@ -156,3 +169,33 @@ async def test_no_context_means_no_rows(app_settings, database_urls):
         count = (await conn.execute(text("SELECT count(*) FROM documents"))).scalar_one()
     await engine.dispose()
     assert count == 0
+
+
+async def test_pool_checkin_clears_leftover_tenant_context(app_settings):
+    """A connection returned to the pool carries none of a request's session-local
+    settings. Simulates the bug this guards against: a context committed at session
+    scope (set_config(..., false)), not transaction scope (is_local=true) — a plain
+    rollback-on-checkin would not undo an already-committed session setting, so the
+    pool must explicitly wipe it on checkin instead."""
+    from app.db.session import get_engine
+
+    engine = get_engine()
+    tenant_id = str(uuid.uuid4())
+
+    conn = await engine.connect()
+    await conn.execute(text("SELECT set_config('app.tenant_id', :tid, false)"), {"tid": tenant_id})
+    set_value = (
+        await conn.execute(text("SELECT current_setting('app.tenant_id', true)"))
+    ).scalar_one()
+    assert set_value == tenant_id
+    await conn.commit()  # the setting is now session-level and committed, not rolled back
+    await conn.close()  # checkin
+
+    conn2 = await engine.connect()
+    try:
+        leftover = (
+            await conn2.execute(text("SELECT current_setting('app.tenant_id', true)"))
+        ).scalar_one()
+    finally:
+        await conn2.close()
+    assert leftover in (None, "")
