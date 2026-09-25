@@ -28,21 +28,28 @@ from tests.conftest import (
 
 
 @pytest.fixture
-def client(monkeypatch, fake_search, test_model):
-    # Search without a DB: AssistantDeps resolves the default at runtime -> inject the fake.
+def client(monkeypatch, fake_search, fake_history, test_model):
+    # Search and conversation history without a DB: AssistantDeps resolves both defaults at
+    # runtime -> inject the fakes (ADR-0006, #33).
     monkeypatch.setattr(assistant_module.document_tools, "search_documents", fake_search)
+    monkeypatch.setattr(
+        assistant_module.conversation_tools, "load_conversation_history", fake_history
+    )
     transport = httpx.ASGITransport(app=app)
     return httpx.AsyncClient(transport=transport, base_url="http://test")
 
 
 @pytest.fixture
-def raw_client(monkeypatch, fake_search):
+def raw_client(monkeypatch, fake_search, fake_history):
     """Like `client`, but without the `test_model` override — for tests that need to inject their
     own model via `resolve_chat_model` (patched per-test, in place of the deployment-wide
     `get_model()`), so the `run_limits` wiring in `app/agents/assistant.py` and
     `app/api/agents.py` is genuinely exercised rather than bypassed.
     """
     monkeypatch.setattr(assistant_module.document_tools, "search_documents", fake_search)
+    monkeypatch.setattr(
+        assistant_module.conversation_tools, "load_conversation_history", fake_history
+    )
     transport = httpx.ASGITransport(app=app)
     return httpx.AsyncClient(transport=transport, base_url="http://test")
 
@@ -302,11 +309,14 @@ async def test_one_shot_endpoints_answer_through_reading_only_agent(monkeypatch,
         assert all(tool_def.kind != "unapproved" for tool_def in info.function_tools)
 
 
-async def test_chat_endpoint_answers_through_chat_agent(monkeypatch, fake_search):
+async def test_chat_endpoint_answers_through_chat_agent(monkeypatch, fake_search, fake_history):
     """The chat endpoint exposes the chat agent's tool set, and never touches the one-shot
     agent — the mirror image of the one-shot assertion above.
     """
     monkeypatch.setattr(assistant_module.document_tools, "search_documents", fake_search)
+    monkeypatch.setattr(
+        assistant_module.conversation_tools, "load_conversation_history", fake_history
+    )
     monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(TestModel()))
     one_shot_seen: list[AgentInfo] = []
     chat_seen: list[AgentInfo] = []
@@ -329,10 +339,15 @@ async def test_chat_endpoint_answers_through_chat_agent(monkeypatch, fake_search
     assert seen_names == expected_names
 
 
-async def test_both_agents_instructions_state_tool_results_are_data(monkeypatch, fake_search):
+async def test_both_agents_instructions_state_tool_results_are_data(
+    monkeypatch, fake_search, fake_history
+):
     """Acceptance criterion: each agent's instructions text plainly states that tool results
     are data to weigh, not instructions to follow (closes the prompt-injection gap)."""
     monkeypatch.setattr(assistant_module.document_tools, "search_documents", fake_search)
+    monkeypatch.setattr(
+        assistant_module.conversation_tools, "load_conversation_history", fake_history
+    )
     monkeypatch.setattr(assistant_module, "resolve_chat_model", resolve_to_model(TestModel()))
     monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(TestModel()))
     one_shot_seen: list[AgentInfo] = []

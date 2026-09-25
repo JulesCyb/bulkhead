@@ -17,6 +17,7 @@ import jwt
 import pytest
 
 import app.deps as deps_module
+import app.token_verifier as token_verifier_module
 from app.config import Settings, get_settings
 from app.context import RequestContext
 from app.main import app
@@ -67,6 +68,11 @@ def _install_fake_control_plane(monkeypatch, *, auth_settings, identities, membe
     """`auth_settings`: {tenant_id: (issuer, suspended)} — a missing key means no control-plane
     row (falls back to the default issuer, not suspended), mirroring the real repository.
     `identities`: {(issuer, subject): identity_id}. `memberships`: {(tenant_id, identity_id): role}.
+
+    Installed on both `app.deps` (the suspension check, issue #69) and `app.token_verifier` (the
+    shared signature/audience/identity/membership check, issue #44) — the two modules each import
+    their own copy of these names, exactly like two independent callers of the shared module are
+    meant to.
     """
 
     class FakeTenantAuthSettingsRepository:
@@ -87,13 +93,14 @@ def _install_fake_control_plane(monkeypatch, *, auth_settings, identities, membe
         async def get_role(self, session, ctx: RequestContext, *, identity_id):
             return memberships.get((ctx.tenant_id, identity_id))
 
-    monkeypatch.setattr(deps_module, "control_session", _fake_session)
-    monkeypatch.setattr(deps_module, "tenant_session", lambda ctx: _fake_session())
-    monkeypatch.setattr(
-        deps_module, "TenantAuthSettingsRepository", FakeTenantAuthSettingsRepository
-    )
-    monkeypatch.setattr(deps_module, "IdentityRepository", FakeIdentityRepository)
-    monkeypatch.setattr(deps_module, "MembershipRepository", FakeMembershipRepository)
+    for module in (deps_module, token_verifier_module):
+        monkeypatch.setattr(module, "control_session", _fake_session)
+        monkeypatch.setattr(
+            module, "TenantAuthSettingsRepository", FakeTenantAuthSettingsRepository
+        )
+    monkeypatch.setattr(token_verifier_module, "tenant_session", lambda ctx: _fake_session())
+    monkeypatch.setattr(token_verifier_module, "IdentityRepository", FakeIdentityRepository)
+    monkeypatch.setattr(token_verifier_module, "MembershipRepository", FakeMembershipRepository)
 
 
 @pytest.fixture
@@ -264,6 +271,33 @@ async def test_nonexistent_tenant_gets_the_identical_forbidden_response_as_a_non
 
     assert response_nonexistent.status_code == response_non_member.status_code == 403
     assert response_nonexistent.json() == response_non_member.json()
+
+
+async def test_a_change_fed_only_into_the_shared_module_is_observed_at_the_http_layer(
+    jwt_client, monkeypatch, caplog
+):
+    """Proves delegation (#44 acceptance criterion 3): `app/deps.py` no longer contains its own
+    copy of the audience check. Patching `verify_tenant_token` itself -- the shared module's only
+    entry point -- to always report a wrong-audience failure, with no other part of the control
+    plane faked, is enough to make the HTTP layer reject the request. If `app/deps.py` still ran
+    its own audience check, this patch alone could not produce a 403 here."""
+    import app.token_verifier as token_verifier_module
+
+    tenant_id = uuid.uuid4()
+
+    async def _always_audience_mismatch(*args, **kwargs):
+        raise token_verifier_module.TenantTokenVerificationError(
+            token_verifier_module.VerificationFailureReason.AUDIENCE_MISMATCH, issuer=ISSUER
+        )
+
+    monkeypatch.setattr(deps_module, "verify_tenant_token", _always_audience_mismatch)
+    token = _make_token(audience=str(tenant_id))
+    with caplog.at_level("WARNING"):
+        response = await _post_run(tenant_id, token)
+    assert response.status_code == 403
+    assert response.json()["detail"] == deps_module.FORBIDDEN_DETAIL
+    reasons = [r.reason for r in caplog.records if hasattr(r, "reason")]
+    assert "audience_mismatch" in reasons
 
 
 async def test_valid_token_succeeds_and_roles_come_from_the_membership_row(

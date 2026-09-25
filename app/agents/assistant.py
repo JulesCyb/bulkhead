@@ -29,6 +29,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 from pydantic_ai import Agent, RunContext
+from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models import Model
 from pydantic_ai.result import StreamedRunResult
 
@@ -37,9 +38,11 @@ from app.db.session import tenant_session
 from app.llm import resolve_tenant_chat_model
 from app.repositories.documents import DocumentHit
 from app.run_limits import RunLimits, build_run_limits, run_deadline
+from app.tools import conversations as conversation_tools
 from app.tools import documents as document_tools
 
 SearchFn = Callable[[RequestContext, str, int], Awaitable[list[DocumentHit]]]
+LoadHistoryFn = Callable[[RequestContext, str], Awaitable[list[ModelMessage]]]
 
 
 @dataclass
@@ -47,11 +50,17 @@ class AssistantDeps:
     ctx: RequestContext
     # Injectable so tests run without a database and embeddings (None = the real search).
     search: SearchFn | None = None
+    # Injectable the same way (ADR-0006, #33): given a conversation id, the trusted,
+    # server-held message history for it. None = the real ConversationsRepository, scoped to
+    # the tenant and to the member who started the conversation.
+    load_history: LoadHistoryFn | None = None
     model_name: str | None = None  # e.g. from tenants.settings["model"]
 
     def __post_init__(self) -> None:
         if self.search is None:
             self.search = document_tools.search_documents
+        if self.load_history is None:
+            self.load_history = conversation_tools.load_conversation_history
 
 
 # Shared by both agents: every tool's result — a search hit today, a writing tool's outcome once

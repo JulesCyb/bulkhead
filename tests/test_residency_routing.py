@@ -115,7 +115,13 @@ async def test_chat_endpoint_uses_the_model_resolved_for_each_tenants_residency(
     async def _fake_resolve(deps):
         return routes[deps.ctx.tenant_id]
 
+    async def _fake_load_history(ctx, conversation_id):
+        return []
+
     monkeypatch.setattr(chat_module, "resolve_chat_model", _fake_resolve)
+    monkeypatch.setattr(
+        assistant_module.conversation_tools, "load_conversation_history", _fake_load_history
+    )
 
     async with asgi_client:
         response_eu = await asgi_client.post(

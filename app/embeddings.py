@@ -1,4 +1,5 @@
-"""Embeddings via an OpenAI-compatible endpoint, through LiteLLM only (Spec 8 / #61, ADR-0008).
+"""Embeddings via the LiteLLM gateway's OpenAI-compatible endpoint (required, ADR-0009;
+Spec 8 / #61, ADR-0008).
 
 The dimension must match the documents.embedding column (migration 0001: 1536).
 

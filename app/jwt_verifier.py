@@ -17,6 +17,7 @@ compares it itself.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -86,3 +87,35 @@ def verify_token(
         raise TokenVerificationError("token missing a usable aud claim")
 
     return VerifiedClaims(issuer=expected_issuer, subject=subject, audience=audience)
+
+
+def mint_token(
+    *,
+    subject: str,
+    issuer: str,
+    audience: str,
+    signing_key: str,
+    algorithm: str = "RS256",
+    ttl_seconds: int,
+) -> str:
+    """Mint a short-lived, signed token (Spec 6 / #47) -- the counterpart to `verify_token`
+    above, used only for tokens this application mints itself (today: an agent identity
+    exchanging its own credential, `app/agent_credential_exchange.py`). Never used for a
+    customer-owned identity provider's own tokens, which this module only ever verifies.
+
+    `signing_key`/`algorithm` must be whatever `verify_token`'s own `key_source` later checks the
+    token against -- for the symmetric algorithm this starter defaults to (HS256), that is
+    literally the same secret value; no key/algorithm negotiation happens here.
+
+    Carries exactly the four claims `verify_token` requires (`iss`, `sub`, `aud`, `exp`) plus
+    `iat` -- nothing else, so a minted token reveals no more than what verification needs.
+    """
+    now = int(time.time())
+    claims = {
+        "iss": issuer,
+        "sub": subject,
+        "aud": audience,
+        "iat": now,
+        "exp": now + ttl_seconds,
+    }
+    return jwt.encode(claims, signing_key, algorithm=algorithm)

@@ -1,6 +1,6 @@
 # ADR-0009: Budgets and rate limits at the gateway per tenant, run limits and a model allow-list in the application
 
-- **Status:** proposed
+- **Status:** accepted
 - **Date:** 2026-09-12
 - **Deciders:** JulesCyb
 - **Skill version:** ai-app-blueprints v2.0.0 (research 2026-08)

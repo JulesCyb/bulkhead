@@ -1,10 +1,11 @@
-"""Owner-role connection string for offline tooling (Alembic migrations, `scripts/seed.py`) only.
+"""Owner-role connection string for offline tooling (Alembic migrations, the operator tool) only.
 
 Deliberately a separate settings object from `app.config.Settings` (issue #14 / ADR-0011): the
 owner/migrations DSN must never be a field on the configuration object the long-running API
 process constructs, so a bug in `app.main` or `app.deps` can never read, log, or use the
-credential that owns the database. Only `migrations/env.py` and `scripts/seed.py` import this
-module — neither `app.main` nor `app.deps` does.
+credential that owns the database. Only `migrations/env.py` and `app/operator/cli.py` (the
+operator tool, which replaces the retired `scripts/seed.py`) import this module — neither
+`app.main` nor `app.deps` does.
 """
 
 from __future__ import annotations
