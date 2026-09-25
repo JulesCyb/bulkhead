@@ -181,6 +181,9 @@ async def _get_jwt_context(
         request_id=request_id,
     )
     request.state.request_id = ctx.request_id
+    # Also stashed whole (S3-T1 / #26): `app.main.handle_permission_error` reads it back to
+    # log a denied role check with identifiers only, without re-deriving them.
+    request.state.context = ctx
     return ctx
 
 
@@ -210,6 +213,9 @@ async def get_context(
         # (JSONResponse, StreamingResponse, or the chat endpoint's Vercel AI stream), and so a
         # request that fails before a context exists never gets the header at all.
         request.state.request_id = ctx.request_id
+        # Also stashed whole (S3-T1 / #26): `app.main.handle_permission_error` reads it back to
+        # log a denied role check with identifiers only, without re-deriving them.
+        request.state.context = ctx
         return ctx
 
     return await _get_jwt_context(request, settings, tenant_id, key_source, authorization)

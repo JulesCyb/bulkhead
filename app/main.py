@@ -6,6 +6,7 @@ Start: uv run uvicorn app.main:app --reload
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
 from contextlib import asynccontextmanager
@@ -15,7 +16,7 @@ from fastapi import APIRouter, FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api import agents, chat, health
+from app.api import agents, chat, health, memberships
 from app.config import Settings, get_settings
 from app.db.guard import run_role_rls_guard
 from app.observability import setup_observability
@@ -62,11 +63,34 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
 
 
+# `RequestContext.require_role` (app/context.py) raises a bare `PermissionError` with this exact
+# message shape; matched here (never re-derived) so the log line below can name the required role
+# without the two places drifting apart.
+_REQUIRED_ROLE_RE = re.compile(r"^role '(\w+)' required$")
+
+
 async def handle_permission_error(request: Request, exc: Exception) -> JSONResponse:
     """ADR-0004: a failed `RequestContext.require_role` check answers 403, never 500 — clean and
     predictable regardless of which route, tool, or dependency called it. `PermissionError`
-    carries no sensitive detail (only the missing role name), so it is safe to echo back."""
+    carries no sensitive detail (only the missing role name), so it is safe to echo back.
+
+    S3-T1 / #26: also logs the denial with identifiers only (tenant, identity, the required
+    role) — never request content — so a pattern of repeated denials is visible in the
+    application logs. `request.state.context` is the `RequestContext` `app.deps.get_context`
+    already resolved for this request, in both dev-headers and jwt mode.
+    """
     message = str(exc) or "This action requires a role you don't have."
+    ctx = getattr(request.state, "context", None)
+    match = _REQUIRED_ROLE_RE.match(message)
+    log.warning(
+        "Role check denied",
+        extra={
+            "event": "role_check_denied",
+            "tenant_id": str(ctx.tenant_id) if ctx is not None else None,
+            "identity_id": str(ctx.identity_id) if ctx is not None else None,
+            "required_role": match.group(1) if match else None,
+        },
+    )
     return JSONResponse(
         status_code=status.HTTP_403_FORBIDDEN,
         content={"error": "forbidden", "message": message},
@@ -209,6 +233,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     tenant_router = APIRouter(prefix="/v1/t/{tenant_id}")
     tenant_router.include_router(agents.router)
     tenant_router.include_router(chat.router)
+    tenant_router.include_router(memberships.router)
 
     app.include_router(health.router)
     app.include_router(tenant_router)

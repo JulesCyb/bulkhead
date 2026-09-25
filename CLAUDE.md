@@ -42,6 +42,14 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
 
 1. **Context object**: `RequestContext(tenant_id, identity_id, roles)` is created in `app/deps.py` and
    passed through every request, agent run, tool call, and job. No global state.
+1a. **Roles gate actions, never visibility** (ADR-0004): a role check is `ctx.require_role(role)`,
+   called at the top of a tool (`app/tools/`) or a route (`app/api/`) — before any data access —
+   never inside a repository's read path (`app/repositories/`), since RLS already handles the only
+   visibility question that exists (tenant boundary) and a role has no say in it. `list_memberships`
+   / the `/v1/t/{tenant_id}/memberships` route (`app/tools/memberships.py`, `app/api/memberships.py`)
+   is the worked example to copy for a new admin-only action. A failed check raises `PermissionError`
+   and is reported by the registered exception handler (`app.main.handle_permission_error`) as a 403
+   naming the missing role — never a bare exception left to the default handler, never a 500.
 2. **Every new table** has `tenant_id uuid NOT NULL REFERENCES tenants(id)`, an index on it,
    `ENABLE`/`FORCE ROW LEVEL SECURITY`, and a policy `tenant_id = current_setting('app.tenant_id',
    true)::uuid` (USING and WITH CHECK) plus a GRANT to the `app` role, and must be added to the
