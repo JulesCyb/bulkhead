@@ -1,14 +1,16 @@
 """Provider abstraction for language models.
 
-Model name in PydanticAI format "<provider>:<model>" (LLM_MODEL). If LITELLM_BASE_URL is set,
-everything goes through the LiteLLM gateway (OpenAI-compatible) — switching providers is one
-config line.
+Model name in PydanticAI format "<provider>:<model>" (LLM_MODEL). The gateway is a required
+service, not an optional profile (ADR-0009): a deployment always routes through it
+(OpenAI-compatible), which is what makes switching providers one config line.
 Per tenant, tenants.settings["model"] can override the default (the model_name argument).
 
 Two entry points live here:
 
 - `get_model()` — the pre-existing, deployment-wide resolver: no tenant, no residency check, no
-  per-tenant credential. Kept for the deployment default and for tests that don't need a tenant.
+  per-tenant credential. Kept for the deployment default and for tests that don't need a tenant;
+  its own LITELLM_BASE_URL check is a historical fallback for that narrow case, not a second,
+  supported way to skip the gateway in production.
 - `resolve_tenant_chat_model()` — the per-tenant entry point (Spec 7 / #54, ADR-0009): before a
   chat client is ever built, the tenant's chosen model name is validated against the allow-list
   for its residency (`RESIDENCY_MODEL_ALLOW_LIST`, app/config.py) and rejected with

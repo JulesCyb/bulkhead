@@ -63,7 +63,7 @@ Tests: `uv run pytest` — the RLS integration test is skipped when `pgserver` i
 | Agent | `app/agents/assistant.py` | PydanticAI agent, model resolved at runtime, tracing metadata |
 | API | `app/api/` | `/v1/t/{tenant_id}/agents/assistant/run`, `/v1/t/{tenant_id}/agents/assistant/stream` (SSE), `/v1/t/{tenant_id}/api/chat` (Vercel AI SDK) |
 | MCP server | `app/mcp/server.py` | the same tools for Claude Code / Claude Desktop |
-| Models | `app/llm.py`, `app/embeddings.py` | provider abstraction, LiteLLM option |
+| Models | `app/llm.py`, `app/embeddings.py` | provider abstraction; the LiteLLM gateway is mandatory, not an add-on (ADR-0009) |
 | Tracing | `app/observability.py` | Langfuse via OTel (optional) |
 | Tests | `tests/` | unit (TestModel, no DB) + a real RLS test against embedded Postgres |
 

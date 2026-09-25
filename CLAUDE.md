@@ -12,7 +12,8 @@ ADR wins — then update this file.
 
 - Backend/API: FastAPI, Python 3.12, `uv`
 - Agent logic: PydanticAI (`app/agents/assistant.py`); LangGraph only with an ADR justification
-- Models: `LLM_MODEL` in `<provider>:<model>` format, optionally through the LiteLLM gateway (`app/llm.py`)
+- Models: `LLM_MODEL` in `<provider>:<model>` format, always through the LiteLLM gateway — a
+  required service, not an optional profile (ADR-0009, `app/llm.py`)
 - Data: PostgreSQL 17 + pgvector, RLS on; the app connects as `app` (no superuser); a separate
   `app_owner` role (no superuser either) owns every object and runs migrations; operator-owned
   facts live in a `control` schema `app` can only read through views
