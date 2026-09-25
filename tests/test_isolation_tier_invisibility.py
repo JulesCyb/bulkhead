@@ -74,17 +74,20 @@ def test_tenant_settings_rejects_dsn_shaped_value_in_any_field():
 
 def test_tenant_settings_rejects_unknown_keys_outright():
     """extra="forbid" on top of the marker/DSN checks: a tenant may only ever set the fields
-    this model declares (today: model, residency)."""
+    this model declares (today: model)."""
     with pytest.raises(ValidationError):
         TenantSettings.model_validate({"some_new_field": "value"})
 
 
 def test_tenant_settings_accepts_known_tenant_preferences():
-    settings = TenantSettings.model_validate(
-        {"model": "anthropic:claude-sonnet-4-5", "residency": "eu"}
-    )
+    settings = TenantSettings.model_validate({"model": "anthropic:claude-sonnet-4-5"})
     assert settings.model == "anthropic:claude-sonnet-4-5"
-    assert settings.residency == "eu"
+
+
+def test_tenant_settings_rejects_residency():
+    """Residency is an operator-owned control-plane fact (ADR-0008), never a tenant setting."""
+    with pytest.raises(ValidationError):
+        TenantSettings.model_validate({"residency": "us"})
 
 
 def test_settings_has_no_field_capable_of_holding_a_second_tenants_connection_string():

@@ -72,12 +72,10 @@ class TenantSettings(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    # `tenants.settings["model"]` (app/llm.py): per-tenant model override.
+    # `tenants.settings["model"]` (app/llm.py): per-tenant model override. Residency is not
+    # here on purpose: it is an operator-owned control-plane fact (`control.tenants.residency`,
+    # ADR-0008), so a tenant cannot move itself to another jurisdiction.
     model: str | None = None
-    # `tenants.settings["residency"]` (ADR-0008): the tenant's own residency, resolved against
-    # `RESIDENCY_ALLOW_LIST` (app/config.py) at the call sites that use it — not re-validated
-    # against that list here, so this module stays independent of the allow-list's contents.
-    residency: str | None = None
 
     @model_validator(mode="before")
     @classmethod

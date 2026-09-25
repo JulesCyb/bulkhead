@@ -121,3 +121,14 @@ class ControlRepository:
             )
         ).first()
         return row[0] if row else None
+
+    async def get_residency(self, session: AsyncSession, ctx: RequestContext) -> str | None:
+        """`ctx.tenant_id`'s residency (ADR-0008), or None if none is recorded -- callers fail
+        closed on None (`app.residency.ResidencyUnresolved`), never fall back to a default."""
+        row = (
+            await session.execute(
+                text("SELECT residency FROM control.tenants_view WHERE tenant_id = :tid"),
+                {"tid": str(ctx.tenant_id)},
+            )
+        ).first()
+        return row[0] if row else None

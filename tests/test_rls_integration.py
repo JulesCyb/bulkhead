@@ -1306,7 +1306,7 @@ async def _set_gateway_alias(url: str, tenant_id: uuid.UUID, alias: str) -> None
             text("SELECT set_config('app.tenant_id', :t, false)"), {"t": str(tenant_id)}
         )
         await conn.execute(
-            text("INSERT INTO control.tenants (tenant_id) VALUES (:tid)"),
+            text("INSERT INTO control.tenants (tenant_id) VALUES (:tid) ON CONFLICT DO NOTHING"),
             {"tid": tenant_id},
         )
         await conn.execute(
@@ -1495,6 +1495,103 @@ async def test_role_rls_guard_raises_for_a_table_missing_forced_rls(database_url
         await owner_engine.dispose()
 
 
+# --- Tenant residency (#54): the control-plane fact the model allow-list check reads --------
+
+
+async def test_control_tenants_residency_has_no_default(database_urls):
+    """A tenant row with no residency specified has none (NULL): ADR-0008 fails closed rather than
+    silently assigning the deployment's residency."""
+    tenant_id, _ = await _seed(database_urls["superuser"])
+    engine = create_async_engine(database_urls["migrations"])
+    async with engine.connect() as conn:
+        await conn.execute(
+            text("SELECT set_config('app.tenant_id', :t, false)"), {"t": str(tenant_id)}
+        )
+        await conn.execute(
+            text("INSERT INTO control.tenants (tenant_id) VALUES (:tid)"), {"tid": tenant_id}
+        )
+        await conn.commit()
+        residency = (
+            await conn.execute(
+                text("SELECT residency FROM control.tenants WHERE tenant_id = :tid"),
+                {"tid": tenant_id},
+            )
+        ).scalar_one()
+    await engine.dispose()
+    assert residency is None
+
+
+async def test_control_tenants_residency_rejects_an_unknown_value(database_urls):
+    """The database-level CHECK constraint rejects a residency this deployment's configuration
+    doesn't know about, mirroring 0005's `isolation_tier` constraint -- adding a residency is a
+    migration, never an unchecked string."""
+    from sqlalchemy.exc import DBAPIError, IntegrityError
+
+    tenant_id, _ = await _seed(database_urls["superuser"])
+    engine = create_async_engine(database_urls["migrations"])
+    async with engine.connect() as conn:
+        await conn.execute(
+            text("SELECT set_config('app.tenant_id', :t, false)"), {"t": str(tenant_id)}
+        )
+        with pytest.raises((IntegrityError, DBAPIError)):
+            await conn.execute(
+                text(
+                    "INSERT INTO control.tenants (tenant_id, residency) VALUES (:tid, 'atlantis')"
+                ),
+                {"tid": tenant_id},
+            )
+    await engine.dispose()
+
+
+async def test_control_tenants_view_exposes_residency(app_settings, database_urls):
+    """The residency the owner role recorded is visible to `app` through the read-only view,
+    scoped to the caller's own tenant like every other row in `control.tenants`."""
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.repositories.control import ControlRepository
+
+    tenant_a, _ = await _seed(database_urls["superuser"])
+    await _set_residency(database_urls["superuser"], tenant_a, "us")
+
+    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
+    async with tenant_session(ctx_a) as session:
+        residency = await ControlRepository().get_residency(session, ctx_a)
+    assert residency == "us"
+
+
+async def test_control_tenants_residency_is_none_when_no_control_plane_row(
+    app_settings, database_urls
+):
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.repositories.control import ControlRepository
+
+    tenant_a, _ = await _seed(database_urls["superuser"])
+    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
+    async with tenant_session(ctx_a) as session:
+        residency = await ControlRepository().get_residency(session, ctx_a)
+    assert residency is None
+
+
+async def test_app_cannot_write_residency(app_settings, database_urls):
+    """`app` has no UPDATE (or any DML) anywhere in `control` -- only the owner role can ever
+    set a tenant's residency; a tenant's own request cannot move itself to another jurisdiction."""
+    from sqlalchemy.exc import DBAPIError, ProgrammingError
+
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+
+    tenant_a, _ = await _seed(database_urls["superuser"])
+    await _set_residency(database_urls["superuser"], tenant_a, "us")
+    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
+    with pytest.raises((DBAPIError, ProgrammingError)):
+        async with tenant_session(ctx_a) as session:
+            await session.execute(
+                text("UPDATE control.tenants SET residency = 'eu' WHERE tenant_id = :tid"),
+                {"tid": tenant_a},
+            )
+
+
 async def test_ready_endpoint_succeeds_against_real_postgres_as_the_app_role(
     app_settings, database_urls
 ):
@@ -1528,17 +1625,15 @@ async def test_ready_endpoint_succeeds_against_real_postgres_as_the_app_role(
 
 
 async def _set_residency(url: str, tenant_id: uuid.UUID, residency: str | None) -> None:
-    """As the superuser, exactly like `_seed` above: writes `tenants.settings["residency"]`
-    directly rather than through the resolver-under-test, so the resolver's own read is what's
+    """As the superuser, exactly like `_seed` above: records the tenant's residency in the control
+    plane (`control.tenants.residency`, 0013) directly, so the resolver's own read is what's
     being verified, not a round trip through itself."""
     engine = create_async_engine(url)
     async with engine.begin() as conn:
         await conn.execute(
             text(
-                "UPDATE tenants SET settings = jsonb_set("
-                "coalesce(settings, '{}'::jsonb), '{residency}', "
-                "to_jsonb(CAST(:residency AS text))) "
-                "WHERE id = :tid"
+                "INSERT INTO control.tenants (tenant_id, residency) VALUES (:tid, :residency) "
+                "ON CONFLICT (tenant_id) DO UPDATE SET residency = EXCLUDED.residency"
             ),
             {"tid": tenant_id, "residency": residency},
         )
@@ -1631,14 +1726,22 @@ async def test_resolver_fails_closed_for_a_tenant_with_no_residency_set(
 
 
 async def test_resolver_fails_closed_for_a_tenant_with_an_unknown_residency(
-    app_settings, database_urls
+    app_settings, database_urls, monkeypatch
 ):
+    import app.residency as residency_module
     from app.context import RequestContext
     from app.db.session import tenant_session
     from app.residency import ResidencyUnresolved, resolve_residency_route
 
     tenant_a, _ = await _seed(database_urls["superuser"])
-    await _set_residency(database_urls["superuser"], tenant_a, "mars")
+    await _set_residency(database_urls["superuser"], tenant_a, "us")
+    # The database only stores residencies it knows; a deployment whose configuration drops one
+    # must still fail closed for tenants recorded under it.
+    monkeypatch.setattr(
+        residency_module,
+        "RESIDENCY_ALLOW_LIST",
+        {k: v for k, v in residency_module.RESIDENCY_ALLOW_LIST.items() if k != "us"},
+    )
     ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
     with pytest.raises(ResidencyUnresolved):
         async with tenant_session(ctx_a) as session:

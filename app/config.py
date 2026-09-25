@@ -8,7 +8,7 @@ host patterns and endpoints one residency (jurisdiction) may reach on any conten
 path — model/gateway hosts, the embedding endpoint, the trace sink. Adding a residency is a
 new entry in that dict, not a code change scattered across the model-routing, embeddings, and
 observability modules. ``Settings.residency`` (the deployment's own residency, or a tenant's
-``tenants.settings["residency"]`` at the call sites that resolve it) is validated against this
+``control.tenants.residency`` at the call sites that resolve it) is validated against this
 allow-list's keys, so an unknown residency identifier is rejected here, not discovered later at
 request time. This module only defines the allow-list and validates identifiers against it; the
 startup walk that checks every configured endpoint against its residency's allow-list, and the
@@ -52,6 +52,19 @@ RESIDENCY_ALLOW_LIST: dict[str, ResidencyRoute] = {
         embedding_endpoint="https://api.openai.com/v1",
         trace_sink_host="us.cloud.langfuse.com",
     ),
+}
+
+# Model allow-list per residency (Spec 7 / #54, ADR-0009): the bare gateway alias names --
+# exactly the `model_name` entries in docker/litellm/config.yaml's `model_list`, never a raw
+# provider model id -- a tenant assigned to one residency may use. `tenants.settings["model"]`
+# (or the deployment default, `Settings.llm_model`) is validated against the entry for that
+# tenant's own residency in `app/llm.py` before any client is constructed: the application-side
+# half of ADR-0009's two-layer defense, with the gateway's own key-scoped models as the second
+# layer. A residency with no configured provider access has no alias here, not an empty tuple
+# meaning "anything goes" -- see the lookup in `app/llm.py`.
+RESIDENCY_MODEL_ALLOW_LIST: dict[str, tuple[str, ...]] = {
+    "eu": ("claude-eu", "embeddings"),
+    "us": ("claude", "embeddings"),
 }
 
 
@@ -197,6 +210,13 @@ class Settings(BaseSettings):
     run_tool_calls_limit: int = 20
     run_total_tokens_limit: int | None = None
     run_deadline_seconds: float = 60.0
+
+    # Per-call wall-clock deadlines (Spec 7 / #54, ADR-0009): distinct from `run_deadline_seconds`
+    # above, which bounds a whole agent run (many model requests and tool calls). These bound one
+    # single model or embedding request, replacing the client library's own multi-minute default,
+    # and are sized under the reverse proxy's own timeout.
+    llm_call_timeout_seconds: float = 30.0
+    embedding_call_timeout_seconds: float = 30.0
 
     @property
     def cors_origin_list(self) -> list[str]:

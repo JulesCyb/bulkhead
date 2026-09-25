@@ -28,7 +28,9 @@ because Anthropic offers no embedding model (its documentation points to Voyage 
 
 We choose **option 2**, with option 1's guard as the baseline.
 
-- `tenants.settings["residency"]` names the residency (for example `eu`). Every path that
+- `control.tenants.residency` names the residency (for example `eu`) -- an operator-owned
+  control-plane fact (ADR-0011), not a tenant-writable setting, so a tenant cannot move itself
+  to another jurisdiction; no default, a tenant without one fails closed. Every path that
   carries content resolves its route from it: the model (a gateway alias or provider client per
   residency), the embedding provider, and the tracing sink. A request never uses a route of
   another residency; an unresolvable route fails closed.

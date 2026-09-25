@@ -1,13 +1,13 @@
 """Per-tenant residency route resolution (Spec 8 / #60, ADR-0008).
 
-A tenant's `tenants.settings["residency"]` names a jurisdiction (for example `eu`). This module
-is the one place that turns that setting into an actual route: the allow-listed model/gateway
-hosts, embedding endpoint, and trace sink for that residency (`app.config.RESIDENCY_ALLOW_LIST`),
-composed with that same tenant's own gateway credential (`app.gateway_credentials`, #52). Model
-routing (#54) and embedding client construction (#61) are both meant to call
-`resolve_residency_route` for this and build no parallel per-tenant route of their own -- so two
-tenants in different residencies can never be handed each other's route, and a credential from
-one tenant can never end up paired with an endpoint resolved for another.
+A tenant's `control.tenants.residency` (operator-owned, ADR-0008) names a jurisdiction (for example
+`eu`). This module is the one place that turns that setting into an actual route: the allow-listed
+model/gateway hosts, embedding endpoint, and trace sink for that residency
+(`app.config.RESIDENCY_ALLOW_LIST`), composed with that same tenant's own gateway credential
+(`app.gateway_credentials`, #52). Model routing (#54) and embedding client construction (#61) are
+both meant to call `resolve_residency_route` for this and build no parallel per-tenant route of
+their own -- so two tenants in different residencies can never be handed each other's route, and a
+credential from one tenant can never end up paired with an endpoint resolved for another.
 
 Reads the tenant's own row through the same tenant-scoped, RLS-filtered session every repository
 uses (`tenant_session(ctx)`, see `app/db/session.py`) -- never a cross-tenant control-plane
@@ -19,19 +19,19 @@ ADR-0008.
 from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, SecretStr
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import RESIDENCY_ALLOW_LIST, ResidencyRoute, Settings
 from app.context import RequestContext
 from app.gateway_credentials import resolve_gateway_credential
+from app.repositories.control import ControlRepository
 
 
 class ResidencyUnresolved(Exception):
     """A tenant's residency could not be resolved to an allow-listed route.
 
     Raised for exactly these reasons, never masked and never papered over with a default:
-    `tenants.settings["residency"]` is unset (missing key or null), it is set but not a
+    `control.tenants.residency` is unset (no row, or null), it is set but not a
     recognized value, or it names a residency absent from `RESIDENCY_ALLOW_LIST`. No call site
     of this module falls back to a default residency, another tenant's route, or the
     deployment-wide `Settings.residency_route`.
@@ -56,20 +56,13 @@ class ResolvedResidencyRoute(BaseModel):
 
 
 async def _read_tenant_residency(session: AsyncSession, ctx: RequestContext) -> str | None:
-    """`tenants.settings["residency"]` for the caller's own tenant (ADR-0008).
+    """The caller's own residency from the control plane (`control.tenants.residency`, 0013).
 
-    Reads through the caller's tenant-scoped session: RLS already restricts `tenants` to the
-    caller's own row (see migrations/versions/0001_initial.py), and the `WHERE id = :tid` here
-    matches the pattern every repository uses -- an explicit filter on top of RLS, not instead
-    of it.
+    An operator-owned fact: `app` can read it through `control.tenants_view` (RLS-scoped to the
+    caller's tenant) but never write it, so a tenant's own request cannot move itself to another
+    jurisdiction.
     """
-    row = (
-        await session.execute(
-            text("SELECT settings ->> 'residency' FROM tenants WHERE id = :tid"),
-            {"tid": str(ctx.tenant_id)},
-        )
-    ).first()
-    return row[0] if row else None
+    return await ControlRepository().get_residency(session, ctx)
 
 
 async def resolve_residency_route(
@@ -87,7 +80,7 @@ async def resolve_residency_route(
     residency = await _read_tenant_residency(session, ctx)
     if not residency or residency not in RESIDENCY_ALLOW_LIST:
         raise ResidencyUnresolved(
-            f"tenant {ctx.tenant_id} has no usable residency (tenants.settings['residency'] = "
+            f"tenant {ctx.tenant_id} has no usable residency (control.tenants.residency = "
             f"{residency!r}); configured residencies: {sorted(RESIDENCY_ALLOW_LIST)}"
         )
     gateway_credential = await resolve_gateway_credential(session, ctx, settings=settings)
