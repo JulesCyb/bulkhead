@@ -16,7 +16,7 @@ from fastapi import APIRouter, FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api import agents, chat, health, memberships
+from app.api import agent_tokens, agents, chat, health, memberships
 from app.config import Settings, get_settings
 from app.db.guard import run_role_rls_guard
 from app.observability import setup_observability
@@ -244,6 +244,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     tenant_router.include_router(agents.router)
     tenant_router.include_router(chat.router)
     tenant_router.include_router(memberships.router)
+    tenant_router.include_router(agent_tokens.router)
 
     app.include_router(health.router)
     app.include_router(tenant_router)
