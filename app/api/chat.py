@@ -1,7 +1,8 @@
 """Chat endpoint in the Vercel AI SDK format.
 
-A Next.js frontend using `useChat` (Vercel AI SDK) can talk directly to POST /api/chat —
-PydanticAI translates messages and stream (incl. tool events). See docs/frontend.md.
+A Next.js frontend using `useChat` (Vercel AI SDK) can talk directly to
+POST /v1/t/{tenant_id}/api/chat — PydanticAI translates messages and stream (incl. tool
+events). See docs/frontend.md.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from app.request_limit import RequestLimit
 router = APIRouter(prefix="/api", tags=["chat"])
 
 # Chat histories are legitimately larger than a single prompt, but not unbounded —
-# mirrors the 20k prompt cap on /agents/assistant/*.
+# mirrors the 20k prompt cap on /v1/t/{tenant_id}/agents/assistant/*.
 MAX_BODY_BYTES = 200_000
 
 

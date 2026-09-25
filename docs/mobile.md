@@ -9,16 +9,18 @@ and ADR template `adr-0005-mobile.md`.
 1. **PWA / packaged web app** (Capacitor, Trusted Web Activity): the Next.js frontend as an
    installable app — the cheapest test, often enough for internal tools.
 2. **Expo / React Native**: same language as the web frontend; the Vercel AI SDK also runs in
-   React Native and talks to `POST /api/chat`. Monorepo with a shared package (types, hooks,
-   API client generated from the OpenAPI schema at `/openapi.json`).
+   React Native and talks to `POST /v1/t/{tenant_id}/api/chat`. Monorepo with a shared package
+   (types, hooks, API client generated from the OpenAPI schema at `/openapi.json`).
 3. **Native (Kotlin/Compose)**: only with a reason — deep OS integration, a native team.
 
 ## Backend duties before the first app release
 
 - Implement `AUTH_MODE=jwt` in `app/deps.py`: OIDC + PKCE with an identity provider,
   short-lived access tokens, refresh tokens, revocation. The dev headers are off-limits on a device.
-- Freeze API contracts: `/v1/` prefix, no breaking changes, `/openapi.json` as the contract,
-  generate a client (e.g. `openapi-typescript`), keep a deprecation window.
+- Freeze API contracts: `/v1/t/{tenant_id}/` prefix (ADR-0012 — the tenant lives in the path, a
+  single `X-Identity-Id`/token identifies the caller, never a tenant header), no breaking
+  changes, `/openapi.json` as the contract, generate a client (e.g. `openapi-typescript`), keep
+  a deprecation window.
 - Long agent runs as jobs: `POST /v1/jobs` → status endpoint or push → result in the DB
   (a table with `tenant_id` + RLS). SSE streaming only for chat.
 - Uploads via signed URLs to object storage (tenant prefix), processing server-side.

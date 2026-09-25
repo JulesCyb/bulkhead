@@ -1,7 +1,8 @@
 # Attaching a frontend (Next.js + Vercel AI SDK)
 
-The backend serves the Vercel AI SDK stream format at `POST /api/chat` (PydanticAI
-`VercelAIAdapter`, `sdk_version=6`). A Next.js frontend therefore needs no agent code of its own.
+The backend serves the Vercel AI SDK stream format at `POST /v1/t/{tenant_id}/api/chat`
+(PydanticAI `VercelAIAdapter`, `sdk_version=6`) — the tenant is named in the URL path
+(ADR-0012), never in a header. A Next.js frontend therefore needs no agent code of its own.
 
 Versions move fast — check current docs before starting (`ai`, `@ai-sdk/react`, Next.js).
 
@@ -18,11 +19,11 @@ import { useChat } from "@ai-sdk/react";
 import { DefaultChatTransport } from "ai";
 
 export default function Page() {
+  const tenantId = process.env.NEXT_PUBLIC_DEV_TENANT_ID!;
   const { messages, sendMessage, status } = useChat({
     transport: new DefaultChatTransport({
-      api: process.env.NEXT_PUBLIC_API_URL + "/api/chat",
-      headers: {                       // dev headers — use session/JWT in production
-        "X-Tenant-Id": process.env.NEXT_PUBLIC_DEV_TENANT_ID!,
+      api: `${process.env.NEXT_PUBLIC_API_URL}/v1/t/${tenantId}/api/chat`,
+      headers: {                       // dev header — use session/JWT in production
         "X-Identity-Id": process.env.NEXT_PUBLIC_DEV_USER_ID!,
       },
     }),
@@ -34,5 +35,8 @@ export default function Page() {
 Notes:
 - CORS: set `CORS_ORIGINS` in the backend to the frontend URL.
 - Tool calls (`search_documents`) arrive as tool parts in the stream — display them so users see what the agent is doing.
-- In production, solve auth in the frontend via the session (cookie/JWT); never ship the dev headers.
-- Alternative without a UI-framework binding: `POST /agents/assistant/stream` (SSE, plain text) or PydanticAI's AG-UI adapter.
+- In production, solve auth in the frontend via the session (cookie/JWT); never ship the dev header.
+- The tenant lives only in the URL path (ADR-0012) — a re-login in one tenant's tab can never
+  redirect another tenant's tab.
+- Alternative without a UI-framework binding: `POST /v1/t/{tenant_id}/agents/assistant/stream`
+  (SSE, plain text) or PydanticAI's AG-UI adapter.

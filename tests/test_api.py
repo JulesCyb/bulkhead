@@ -33,7 +33,9 @@ async def test_health(client):
 
 async def test_run_requires_dev_headers(client):
     async with client:
-        response = await client.post("/agents/assistant/run", json={"prompt": "Hi"})
+        response = await client.post(
+            f"/v1/t/{uuid.uuid4()}/agents/assistant/run", json={"prompt": "Hi"}
+        )
     assert response.status_code == 401
 
 
@@ -41,29 +43,54 @@ async def test_run_with_context(client, calls, contexts):
     tenant_id, identity_id = uuid.uuid4(), uuid.uuid4()
     async with client:
         response = await client.post(
-            "/agents/assistant/run",
+            f"/v1/t/{tenant_id}/agents/assistant/run",
             json={"prompt": "What does the contract say?"},
-            headers={"X-Tenant-Id": str(tenant_id), "X-Identity-Id": str(identity_id)},
+            headers={"X-Identity-Id": str(identity_id)},
         )
     assert response.status_code == 200, response.text
     assert response.json()["output"]
     assert calls and calls[0][0] == tenant_id
 
 
+async def test_run_ignores_a_stray_tenant_header_and_uses_the_path(client, calls):
+    """ADR-0012: the URL path is the request's sole statement of intent. A stray old-style
+    X-Tenant-Id header naming a different tenant must be ignored entirely."""
+    path_tenant_id, header_tenant_id, identity_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    async with client:
+        response = await client.post(
+            f"/v1/t/{path_tenant_id}/agents/assistant/run",
+            json={"prompt": "What does the contract say?"},
+            headers={"X-Identity-Id": str(identity_id), "X-Tenant-Id": str(header_tenant_id)},
+        )
+    assert response.status_code == 200, response.text
+    assert calls and calls[0][0] == path_tenant_id
+    assert calls[0][0] != header_tenant_id
+
+
+async def test_chat_old_unprefixed_path_is_gone(client):
+    async with client:
+        response = await client.post("/api/chat", json=_chat_body(), headers=_headers())
+    assert response.status_code == 404
+
+
 async def test_stream_uses_one_shot_agent_tools(client, calls):
     tenant_id, user_id = uuid.uuid4(), uuid.uuid4()
     async with client:
         response = await client.post(
-            "/agents/assistant/stream",
+            f"/v1/t/{tenant_id}/agents/assistant/stream",
             json={"prompt": "What does the contract say?"},
-            headers={"X-Tenant-Id": str(tenant_id), "X-Identity-Id": str(user_id)},
+            headers={"X-Identity-Id": str(user_id)},
         )
     assert response.status_code == 200, response.text
     assert calls and calls[0][0] == tenant_id
 
 
 def _headers() -> dict[str, str]:
-    return {"X-Tenant-Id": str(uuid.uuid4()), "X-Identity-Id": str(uuid.uuid4())}
+    return {"X-Identity-Id": str(uuid.uuid4())}
+
+
+def _tenant_path(suffix: str) -> str:
+    return f"/v1/t/{uuid.uuid4()}{suffix}"
 
 
 def _chat_body(text: str = "What does the contract say?") -> dict:
@@ -128,10 +155,10 @@ async def test_one_shot_endpoints_answer_through_reading_only_agent(monkeypatch,
     ):
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             run_response = await client.post(
-                "/agents/assistant/run", json={"prompt": "Hi"}, headers=_headers()
+                _tenant_path("/agents/assistant/run"), json={"prompt": "Hi"}, headers=_headers()
             )
             stream_response = await client.post(
-                "/agents/assistant/stream", json={"prompt": "Hi"}, headers=_headers()
+                _tenant_path("/agents/assistant/stream"), json={"prompt": "Hi"}, headers=_headers()
             )
 
     assert run_response.status_code == 200, run_response.text
@@ -159,7 +186,9 @@ async def test_chat_endpoint_answers_through_chat_agent(monkeypatch, fake_search
         chat_assistant.override(model=_capturing_model(chat_seen)),
     ):
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            response = await client.post("/api/chat", json=_chat_body(), headers=_headers())
+            response = await client.post(
+                _tenant_path("/api/chat"), json=_chat_body(), headers=_headers()
+            )
 
     assert response.status_code == 200, response.text
     assert not one_shot_seen, "the chat endpoint must never reach the one-shot agent"
@@ -181,8 +210,10 @@ async def test_both_agents_instructions_state_tool_results_are_data(monkeypatch,
         chat_assistant.override(model=_capturing_model(chat_seen)),
     ):
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            await client.post("/agents/assistant/run", json={"prompt": "Hi"}, headers=_headers())
-            await client.post("/api/chat", json=_chat_body(), headers=_headers())
+            await client.post(
+                _tenant_path("/agents/assistant/run"), json={"prompt": "Hi"}, headers=_headers()
+            )
+            await client.post(_tenant_path("/api/chat"), json=_chat_body(), headers=_headers())
 
     for seen in (one_shot_seen, chat_seen):
         assert seen
