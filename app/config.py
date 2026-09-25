@@ -97,8 +97,9 @@ class Settings(BaseSettings):
     # The owner/migrations connection string is NOT a field here (issue #14 / ADR-0011): it is
     # removed from the application's configuration object entirely, so no code path in the
     # long-running API process can ever construct a connection with the database owner's
-    # privileges. Alembic's own environment module and scripts/seed.py resolve it from
-    # app.migration_settings instead — a source app.main and app.deps never import.
+    # privileges. Alembic's own environment module and the operator tool (app/operator/cli.py)
+    # resolve it from app.migration_settings instead — a source app.main and app.deps never
+    # import.
 
     # Explicit pool sizing (Spec 7 / #55) — named configuration instead of SQLAlchemy/driver
     # defaults, so the deployment's real concurrency ceiling (pool_size + max_overflow, per
@@ -143,6 +144,15 @@ class Settings(BaseSettings):
     mcp_tenant_id: str | None = None
     mcp_identity_id: str | None = None
 
+    # MCP transport (issue #48 / ADR-0005): a single documented setting choosing whether the
+    # tools server speaks its local-development transport (stdio, the process-wide identity from
+    # MCP_TENANT_ID/MCP_IDENTITY_ID above) or the networked one (streamable-http, a per-connection
+    # identity derived from a verified token via app.token_verifier). stdio is the default, so
+    # moving from a laptop to a real deployment is a configuration change -- one
+    # `app.mcp.server.check_mcp_mode` refuses to leave half-finished (ADR-0005's guard, mirroring
+    # `check_auth_mode` above).
+    mcp_transport: str = Field(default="stdio", pattern="^(stdio|streamable-http)$")
+
     # The process-wide token issuer used for every tenant whose control-plane
     # `identity_issuer` column is unset (issue #22 / ADR-0003): the interim "one operator-run
     # identity provider" case, open until a tenant brings its own. Read by
@@ -160,6 +170,20 @@ class Settings(BaseSettings):
     # silently accepting unverifiable tokens.
     jwt_verification_key: SecretStr | None = None
     jwt_algorithm: str = "RS256"
+
+    # Agent-credential token exchange (Spec 6 / #47, ADR-0005): the signing counterpart to
+    # jwt_verification_key above -- used only to mint a short-lived access token when an agent
+    # identity exchanges its own credential, never to verify a customer-owned identity provider's
+    # tokens (that stays jwt_verification_key/verify_token's job). For the symmetric algorithm
+    # this starter defaults verification to, this is literally the same secret as
+    # jwt_verification_key; kept as its own SecretStr field (file-backed via secrets_dir, same as
+    # every other secret here) so a deployment can rotate or split it independently. No default:
+    # an unconfigured signing key fails every exchange rather than silently minting an unsigned
+    # or otherwise weak token.
+    agent_token_signing_key: SecretStr | None = None
+    # Short-lived by design (ADR-0005): long enough for one connection/tool-call session to
+    # authenticate once, short enough that a leaked token has a small blast radius.
+    agent_token_ttl_seconds: int = 300
 
     # Per-membership request limit on the agent-facing routes
     # (/v1/t/{tenant_id}/agents/assistant/run, /v1/t/{tenant_id}/agents/assistant/stream,
@@ -228,6 +252,11 @@ class Settings(BaseSettings):
     # and are sized under the reverse proxy's own timeout.
     llm_call_timeout_seconds: float = 30.0
     embedding_call_timeout_seconds: float = 30.0
+
+    # Pending-action approval window (ADR-0007, Spec 5 / #37): how long a writing-tool approval
+    # request stays valid before it can no longer be approved -- configuration, not a constant,
+    # so a deployment can tune it to how quickly its members typically respond.
+    pending_action_expiry_seconds: float = 300.0
 
     @property
     def cors_origin_list(self) -> list[str]:

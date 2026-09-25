@@ -18,11 +18,18 @@ AUTH_MODE=jwt (issue #24, ADR-0003, ADR-0012) checks, in this order:
 2. The token's audience names the same tenant as the URL path — otherwise 403 Forbidden.
 3. The (issuer, subject) the token names is on file as a known identity
    (`control.identity_lookup`) — otherwise 403 Forbidden.
-4. The tenant is not suspended (`control.tenant_auth_settings`) — otherwise 403 Forbidden.
-5. That identity has a membership in that tenant (`memberships`, read inside the tenant's own
+4. That identity has a membership in that tenant (`memberships`, read inside the tenant's own
    context — no RLS bypass needed: no row means 403) — otherwise 403 Forbidden. This is also
    what makes a path naming a tenant that does not exist at all behave identically to one naming
    a tenant the caller simply isn't a member of: neither has a membership row.
+
+Checks 1-4 above are delegated to `app/token_verifier.py::verify_tenant_token` (issue #44) — a
+module with no FastAPI/HTTP dependency of its own, so a second caller (the MCP transport, Spec 6)
+can reuse the exact same check instead of a second implementation of it.
+
+5. The tenant is not suspended (`control.tenant_auth_settings`) — otherwise 403 Forbidden. This
+   check is *not* part of the shared module above; it is enforced here, directly, the same way
+   every other place that resolves a context enforces it (issue #69).
 
 Every step-2-through-5 rejection returns the exact same generic body (`FORBIDDEN_DETAIL` below)
 and is logged as a security event (`app/deps.py`'s `log`) naming the reason, the tenant id, the
@@ -44,9 +51,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Settings, get_settings
 from app.context import RequestContext
 from app.db.session import control_session, tenant_session
-from app.jwt_verifier import KeySource, TokenVerificationError, verify_token
-from app.repositories.control import IdentityRepository, TenantAuthSettingsRepository
-from app.repositories.memberships import MembershipRepository
+from app.jwt_verifier import KeySource, TokenVerificationError
+from app.repositories.control import TenantAuthSettingsRepository
+from app.token_verifier import (
+    TenantTokenVerificationError,
+    VerificationFailureReason,
+    verify_tenant_token,
+)
 
 log = logging.getLogger(__name__)
 
@@ -104,83 +115,53 @@ async def _get_jwt_context(
     if not token:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing or malformed bearer token")
 
+    try:
+        resolved = await verify_tenant_token(
+            token,
+            tenant_id=tenant_id,
+            key_source=key_source,
+            default_issuer=settings.default_identity_issuer,
+            algorithms=(settings.jwt_algorithm,),
+        )
+    except TenantTokenVerificationError as exc:
+        if exc.reason is VerificationFailureReason.INVALID_OR_EXPIRED:
+            detail = (
+                "No token issuer configured" if exc.issuer is None else "Invalid or expired token"
+            )
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail) from None
+        raise _log_forbidden(
+            reason=exc.reason.value,
+            tenant_id=tenant_id,
+            issuer=exc.issuer or "",
+            request_id=request_id,
+        ) from None
+
+    # Tenant suspension is *not* part of the shared verifier above -- it is enforced here,
+    # directly, the same way every other place that resolves a context enforces it (issue #69).
     # A tenant with no control-plane row at all (never marked dedicated/suspended, or not
-    # created in the control plane yet) is not "nonexistent" here -- it is the ordinary default
-    # for a pooled tenant (ADR-0002, app/db/session.py): unset issuer falls back to the
-    # process-wide default, and it is treated as not suspended. A *genuinely* nonexistent tenant
-    # is caught later, identically to a real tenant the caller isn't a member of, by the
-    # membership check at the end of this function.
+    # created in the control plane yet) is treated as not suspended (ADR-0002, app/db/session.py).
     async with control_session() as session:
         auth_settings = await TenantAuthSettingsRepository().get(
             session, tenant_id=tenant_id, default_issuer=settings.default_identity_issuer
         )
-    expected_issuer = auth_settings.issuer if auth_settings else settings.default_identity_issuer
-    if not expected_issuer:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "No token issuer configured")
-
-    try:
-        claims = verify_token(
-            token,
-            key_source=key_source,
-            expected_issuer=expected_issuer,
-            algorithms=(settings.jwt_algorithm,),
-        )
-    except TokenVerificationError:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired token") from None
-
-    if claims.audience != str(tenant_id):
-        raise _log_forbidden(
-            reason="audience_mismatch",
-            tenant_id=tenant_id,
-            issuer=expected_issuer,
-            request_id=request_id,
-        )
-
-    async with control_session() as session:
-        identity = await IdentityRepository().find_by_issuer_and_subject(
-            session, issuer=expected_issuer, subject=claims.subject
-        )
-    if identity is None:
-        raise _log_forbidden(
-            reason="unknown_identity",
-            tenant_id=tenant_id,
-            issuer=expected_issuer,
-            request_id=request_id,
-        )
-
     if auth_settings is not None and auth_settings.suspended:
         raise _log_forbidden(
             reason="tenant_suspended",
             tenant_id=tenant_id,
-            issuer=expected_issuer,
-            request_id=request_id,
-        )
-
-    # The membership lookup runs inside the requested tenant's own context (ADR-0003) -- no RLS
-    # bypass, no separate "does this tenant exist" query: no row means 403, whether that is
-    # because the identity truly isn't a member or because the tenant in the path never existed.
-    preliminary_ctx = RequestContext(
-        tenant_id=tenant_id, identity_id=identity.id, roles=frozenset()
-    )
-    async with tenant_session(preliminary_ctx) as session:
-        role = await MembershipRepository().get_role(
-            session, preliminary_ctx, identity_id=identity.id
-        )
-    if role is None:
-        raise _log_forbidden(
-            reason="missing_membership",
-            tenant_id=tenant_id,
-            issuer=expected_issuer,
+            issuer=resolved.issuer,
             request_id=request_id,
         )
 
     ctx = RequestContext(
         tenant_id=tenant_id,
-        identity_id=identity.id,
-        roles=frozenset({role}),
+        identity_id=resolved.identity_id,
+        roles=frozenset({resolved.role}),
         request_id=request_id,
     )
     request.state.request_id = ctx.request_id
+    # Also stashed whole (S3-T1 / #26): `app.main.handle_permission_error` reads it back to
+    # log a denied role check with identifiers only, without re-deriving them.
+    request.state.context = ctx
     return ctx
 
 
@@ -210,6 +191,9 @@ async def get_context(
         # (JSONResponse, StreamingResponse, or the chat endpoint's Vercel AI stream), and so a
         # request that fails before a context exists never gets the header at all.
         request.state.request_id = ctx.request_id
+        # Also stashed whole (S3-T1 / #26): `app.main.handle_permission_error` reads it back to
+        # log a denied role check with identifiers only, without re-deriving them.
+        request.state.context = ctx
         return ctx
 
     return await _get_jwt_context(request, settings, tenant_id, key_source, authorization)

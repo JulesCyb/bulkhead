@@ -1,11 +1,15 @@
 """Real database, real filesystem, faked gateway (Spec 7 / #53, ADR-0009, ADR-0011).
 
-Runs `app.gateway_provisioning.provision_gateway_credential`/`revoke_gateway_credential`, and
-`scripts/seed.py`, against an embedded Postgres instance migrated to head (`pgserver`, via
-`uv sync --group dbtest`) -- proving the control-plane write (owner role only, #12), the
-resolver read-back (#52), and the secret-file lifecycle all work end to end. The gateway's
-administrative HTTP interface is never reached over a real network: `GatewayAdminClient` is
-always built on `httpx.MockTransport` here.
+Runs `app.gateway_provisioning.provision_gateway_credential`/`revoke_gateway_credential` against
+an embedded Postgres instance migrated to head (`pgserver`, via `uv sync --group dbtest`) --
+proving the control-plane write (owner role only, #12), the resolver read-back (#52), and the
+secret-file lifecycle all work end to end. The gateway's administrative HTTP interface is never
+reached over a real network: `GatewayAdminClient` is always built on `httpx.MockTransport` here.
+
+The retired `scripts/seed.py`'s own equivalent tests (a tenant with a working credential on disk,
+one identity and one admin membership, a second membership attached without touching the first)
+now live in `tests/test_operator_tool_integration.py`, exercising the operator tool's `create`
+command (Spec 9 / #70) that replaced it.
 """
 
 from __future__ import annotations
@@ -246,165 +250,3 @@ async def test_revoke_calls_gateway_once_removes_file_and_second_revoke_is_noop(
 
     assert second is False
     assert second_client.revoke_calls == []  # type: ignore[attr-defined]  # never reached the gateway
-
-
-async def test_seed_script_produces_a_tenant_with_a_working_gateway_credential_on_disk(
-    app_settings, database_urls, tmp_path, monkeypatch
-):
-    """Acceptance criterion: running the seed script against a fresh database produces a tenant
-    with a working gateway credential on disk, with no manual step beyond running the script."""
-    import scripts.seed as seed
-    from app.config import Settings, get_settings
-
-    monkeypatch.setenv("GATEWAY_CREDENTIALS_DIR", str(tmp_path))
-    get_settings.cache_clear()
-    settings = get_settings()
-    assert isinstance(settings, Settings)
-
-    admin_client = _fake_admin_client(key="sk-seeded")
-    await seed.main("Acme", "admin@acme.test", settings=settings, admin_client=admin_client)
-
-    files = list(tmp_path.iterdir())
-    assert len(files) == 1
-    assert files[0].read_text() == "sk-seeded"
-
-    get_settings.cache_clear()
-
-
-async def test_default_seed_mode_creates_one_identity_and_one_admin_membership(
-    app_settings, database_urls, tmp_path, monkeypatch
-):
-    """Acceptance criterion (#25): the seed script's default mode creates one identity row and
-    one admin-role membership row for a fresh tenant, connected with the owner-role migrations
-    connection (`seed.main` itself always writes through DATABASE_URL_MIGRATIONS -- verification
-    below reads back over the superuser connection only because RLS would otherwise hide
-    `memberships` from a read with no tenant context set)."""
-    import scripts.seed as seed
-    from app.config import get_settings
-
-    monkeypatch.setenv("GATEWAY_CREDENTIALS_DIR", str(tmp_path))
-    get_settings.cache_clear()
-    settings = get_settings()
-
-    await seed.main(
-        "Acme2", "admin2@acme.test", settings=settings, admin_client=_fake_admin_client()
-    )
-
-    verify_engine = create_async_engine(database_urls["superuser"])
-    async with verify_engine.connect() as conn:
-        identities = (
-            await conn.execute(
-                text(
-                    "SELECT id, issuer, subject FROM control.identities "
-                    "WHERE subject = 'admin2@acme.test'"
-                )
-            )
-        ).all()
-        assert len(identities) == 1
-        identity_id = identities[0].id
-
-        memberships = (
-            await conn.execute(
-                text("SELECT role, identity_id FROM memberships WHERE identity_id = :iid"),
-                {"iid": identity_id},
-            )
-        ).all()
-    await verify_engine.dispose()
-
-    assert len(memberships) == 1
-    assert memberships[0].role == "admin"
-    assert memberships[0].identity_id == identity_id
-
-    get_settings.cache_clear()
-
-
-async def test_add_membership_mode_attaches_second_membership_without_touching_the_first(
-    app_settings, database_urls, tmp_path, monkeypatch
-):
-    """Acceptance criterion (#25): running the seed script's second-membership mode against an
-    already-seeded tenant inserts a new membership, in any of the four defined roles, for either a
-    brand-new identity or an existing one, leaving the first membership untouched."""
-    import scripts.seed as seed
-    from app.config import get_settings
-
-    monkeypatch.setenv("GATEWAY_CREDENTIALS_DIR", str(tmp_path))
-    get_settings.cache_clear()
-    settings = get_settings()
-
-    await seed.main(
-        "AcmeThree", "admin3@acme.test", settings=settings, admin_client=_fake_admin_client()
-    )
-    # A second, already-seeded tenant whose admin is the same person who will be attached to
-    # AcmeThree below -- this is how an *existing* identity looks in practice: someone who
-    # already holds a membership somewhere else, not someone freshly minted for this call.
-    await seed.main(
-        "BetaThree",
-        "consultant3@example.test",
-        settings=settings,
-        admin_client=_fake_admin_client(),
-    )
-
-    verify_engine = create_async_engine(database_urls["superuser"])
-    async with verify_engine.connect() as conn:
-        tenant_id = (
-            await conn.execute(text("SELECT id FROM tenants WHERE name = 'AcmeThree'"))
-        ).scalar_one()
-        admin_identity_id = (
-            await conn.execute(
-                text("SELECT id FROM control.identities WHERE subject = 'admin3@acme.test'")
-            )
-        ).scalar_one()
-        consultant_identity_id = (
-            await conn.execute(
-                text("SELECT id FROM control.identities WHERE subject = 'consultant3@example.test'")
-            )
-        ).scalar_one()
-    await verify_engine.dispose()
-
-    # A brand-new identity, attached as `support`.
-    support_identity_id = await seed.add_membership(tenant_id, "support", "support3@example.test")
-    assert support_identity_id != admin_identity_id
-
-    # The *existing* consultant identity (already BetaThree's admin), attached to AcmeThree too
-    # -- the find-or-create lookup must reuse the row rather than creating a duplicate.
-    reused_identity_id = await seed.add_membership(tenant_id, "member", "consultant3@example.test")
-    assert reused_identity_id == consultant_identity_id
-
-    verify_engine = create_async_engine(database_urls["superuser"])
-    async with verify_engine.connect() as conn:
-        acme_rows = (
-            await conn.execute(
-                text(
-                    "SELECT identity_id, role FROM memberships WHERE tenant_id = :tid "
-                    "ORDER BY created_at"
-                ),
-                {"tid": tenant_id},
-            )
-        ).all()
-        identity_count = (
-            await conn.execute(
-                text(
-                    "SELECT count(*) FROM control.identities "
-                    "WHERE subject = 'consultant3@example.test'"
-                )
-            )
-        ).scalar_one()
-    await verify_engine.dispose()
-
-    by_identity = {row.identity_id: row.role for row in acme_rows}
-    assert by_identity[admin_identity_id] == "admin"  # untouched by either add_membership call
-    assert by_identity[support_identity_id] == "support"
-    assert by_identity[consultant_identity_id] == "member"
-    assert len(acme_rows) == 3
-    assert identity_count == 1  # the "existing identity" path never duplicated the row
-
-    get_settings.cache_clear()
-
-
-async def test_add_membership_rejects_an_unknown_role(app_settings, database_urls):
-    """The four roles are `admin`, `member`, `support`, `agent` (CONTEXT.md) -- anything else
-    fails before any connection is opened."""
-    import scripts.seed as seed
-
-    with pytest.raises(ValueError, match="role must be one of"):
-        await seed.add_membership(uuid.uuid4(), "superuser", "nobody@example.test")

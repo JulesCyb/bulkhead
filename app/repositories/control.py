@@ -55,6 +55,23 @@ class IdentityRepository:
         )
         return Identity.model_validate(dict(row)) if row is not None else None
 
+    async def get_by_id(self, session: AsyncSession, *, identity_id: UUID) -> Identity | None:
+        """The counterpart lookup by id (Spec 6 / #47): needed to mint a token for an agent
+        identity, whose (issuer, subject) pair must be read back before it can be embedded as the
+        token's own claims -- `find_by_issuer_and_subject` above is for verifying a token
+        already presented; this is for building one."""
+        row = (
+            (
+                await session.execute(
+                    text("SELECT id, issuer, subject FROM control.identity_lookup WHERE id = :id"),
+                    {"id": str(identity_id)},
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        return Identity.model_validate(dict(row)) if row is not None else None
+
 
 class TenantAuthSettingsRepository:
     """Reads a named tenant's configured issuer and suspension state through

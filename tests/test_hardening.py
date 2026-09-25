@@ -141,9 +141,9 @@ def test_settings_has_no_database_owner_connection_string_field():
 
 
 def test_migration_settings_independent_of_application_settings(monkeypatch):
-    """Alembic's own environment module and scripts/seed.py resolve the owner DSN from
-    app.migration_settings, a source app.main and app.deps never import — never from
-    app.config.Settings, which has no such field at all."""
+    """Alembic's own environment module and the operator tool (app/operator/cli.py) resolve the
+    owner DSN from app.migration_settings, a source app.main and app.deps never import — never
+    from app.config.Settings, which has no such field at all."""
     import inspect
 
     from app import deps as deps_module

@@ -26,6 +26,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from pydantic_ai import Agent, RunContext
+from pydantic_ai.messages import ModelMessage
 from pydantic_ai.result import StreamedRunResult
 
 from app.context import RequestContext
@@ -33,9 +34,11 @@ from app.llm import get_model
 from app.observability import instrumentation_capabilities, tenant_span_attributes
 from app.repositories.documents import DocumentHit
 from app.run_limits import RunLimits, build_run_limits, run_deadline
+from app.tools import conversations as conversation_tools
 from app.tools import documents as document_tools
 
 SearchFn = Callable[[RequestContext, str, int], Awaitable[list[DocumentHit]]]
+LoadHistoryFn = Callable[[RequestContext, str], Awaitable[list[ModelMessage]]]
 
 
 @dataclass
@@ -43,6 +46,10 @@ class AssistantDeps:
     ctx: RequestContext
     # Injectable so tests run without a database and embeddings (None = the real search).
     search: SearchFn | None = None
+    # Injectable the same way (ADR-0006, #33): given a conversation id, the trusted,
+    # server-held message history for it. None = the real ConversationsRepository, scoped to
+    # the tenant and to the member who started the conversation.
+    load_history: LoadHistoryFn | None = None
     model_name: str | None = None  # e.g. from tenants.settings["model"]
     # Tracing (Spec 8 / #62, ADR-0008): the caller resolves both from the database before
     # building these deps (`app.observability.resolve_tenant_tracing_selection`) and passes them
@@ -55,6 +62,8 @@ class AssistantDeps:
     def __post_init__(self) -> None:
         if self.search is None:
             self.search = document_tools.search_documents
+        if self.load_history is None:
+            self.load_history = conversation_tools.load_conversation_history
 
 
 # Shared by both agents: every tool's result — a search hit today, a writing tool's outcome once

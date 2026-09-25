@@ -1,6 +1,11 @@
 """Embedded-Postgres integration test for the operator tool skeleton (Spec 9 / #68): audited
 command dispatch, the tenant-lookup helper, and the read-only tenant listing. Pattern:
 `tests/test_rls_integration.py`.
+
+Also covers the `create` command (Spec 9 / #70): provisioning a pooled tenant end to end, its
+idempotency, up-front residency/model validation, and the audit log. The gateway is never
+reached over a real network here either -- `GatewayAdminClient` is always built on
+`httpx.MockTransport`, the same pattern `tests/test_gateway_provisioning_integration.py` uses.
 """
 
 from __future__ import annotations
@@ -13,11 +18,13 @@ import tempfile
 import uuid
 from urllib.parse import parse_qs, urlparse
 
+import httpx
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.config import ROLE_STATEMENT_TIMEOUT_MS
+from app.gateway_provisioning import GatewayAdminClient
 
 pgserver = pytest.importorskip("pgserver")
 
@@ -344,3 +351,244 @@ def test_cli_module_never_imports_the_application_settings_object():
 
     assert "app.config" not in imported_modules
     assert imported_modules & {"app.migration_settings"}
+
+
+def _fake_admin_client(*, key: str = "sk-minted") -> GatewayAdminClient:
+    """Mirrors `tests/test_gateway_provisioning_integration.py`'s own fake -- `create`'s gateway
+    call is never reached over a real network here either."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/key/generate":
+            return httpx.Response(200, json={"key": key})
+        return httpx.Response(404)
+
+    http_client = httpx.AsyncClient(
+        base_url="http://litellm.internal:4000", transport=httpx.MockTransport(handler)
+    )
+    return GatewayAdminClient(
+        base_url="http://litellm.internal:4000",
+        master_key="sk-master-test",
+        http_client=http_client,
+    )
+
+
+async def test_create_provisions_control_plane_credential_and_admin_membership(
+    database_urls, operator_env, tmp_path
+):
+    """Acceptance (#70): `create` writes the control-plane record (isolation tier, residency,
+    database alias), mints and writes a gateway-credential secret file, and creates the first
+    admin membership for the named identity -- all in one call."""
+    from app.config import Settings
+    from app.operator.create import create_tenant
+
+    settings = Settings(gateway_credentials_dir=str(tmp_path))
+    engine = create_async_engine(database_urls["migrations"])
+    try:
+        async with engine.begin() as conn:
+            result = await create_tenant(
+                conn,
+                tenant_name="Create Co",
+                residency="eu",
+                admin_email="admin@create.test",
+                settings=settings,
+                admin_client=_fake_admin_client(key="sk-create-co"),
+            )
+    finally:
+        await engine.dispose()
+
+    assert result.control_plane == "created"
+    assert result.admin_membership == "created"
+    assert result.gateway_credential == "provisioned"
+    assert (tmp_path / result.gateway_credential_alias).read_text() == "sk-create-co"
+
+    verify_engine = create_async_engine(database_urls["superuser"])
+    try:
+        async with verify_engine.connect() as conn:
+            tenant_row = (
+                (
+                    await conn.execute(
+                        text(
+                            "SELECT residency, isolation_tier, database_alias, "
+                            "gateway_credential_alias FROM control.tenants WHERE tenant_id = :tid"
+                        ),
+                        {"tid": result.tenant_id},
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            membership_row = (
+                await conn.execute(
+                    text(
+                        "SELECT role FROM memberships WHERE tenant_id = :tid AND identity_id = :iid"
+                    ),
+                    {"tid": result.tenant_id, "iid": result.identity_id},
+                )
+            ).one()
+    finally:
+        await verify_engine.dispose()
+
+    assert tenant_row["residency"] == "eu"
+    assert tenant_row["isolation_tier"] == "pooled"
+    assert tenant_row["database_alias"] is None
+    assert tenant_row["gateway_credential_alias"] == result.gateway_credential_alias
+    assert membership_row.role == "admin"
+
+
+async def test_create_is_idempotent_on_rerun(database_urls, operator_env, tmp_path):
+    """Acceptance (#70): re-running `create` against the same tenant name performs none of the
+    three steps again and reports each as already in place. A second, differently-keyed fake
+    admin client proves the gateway is never called a second time -- if it were, the freshly
+    minted key would overwrite the alias's file and the final assertion would fail."""
+    from app.config import Settings
+    from app.operator.create import create_tenant
+
+    settings = Settings(gateway_credentials_dir=str(tmp_path))
+
+    engine = create_async_engine(database_urls["migrations"])
+    try:
+        async with engine.begin() as conn:
+            first = await create_tenant(
+                conn,
+                tenant_name="Idempotent Co",
+                residency="us",
+                admin_email="admin@idempotent.test",
+                settings=settings,
+                admin_client=_fake_admin_client(key="sk-idempotent"),
+            )
+    finally:
+        await engine.dispose()
+
+    assert (first.control_plane, first.admin_membership, first.gateway_credential) == (
+        "created",
+        "created",
+        "provisioned",
+    )
+
+    second_engine = create_async_engine(database_urls["migrations"])
+    try:
+        async with second_engine.begin() as conn:
+            second = await create_tenant(
+                conn,
+                tenant_name="Idempotent Co",
+                residency="us",
+                admin_email="admin@idempotent.test",
+                settings=settings,
+                admin_client=_fake_admin_client(key="sk-should-not-be-minted"),
+            )
+    finally:
+        await second_engine.dispose()
+
+    assert second.tenant_id == first.tenant_id
+    assert second.identity_id == first.identity_id
+    assert (second.control_plane, second.admin_membership, second.gateway_credential) == (
+        "already exists",
+        "already exists",
+        "already provisioned",
+    )
+    assert second.gateway_credential_alias == first.gateway_credential_alias
+    assert (tmp_path / first.gateway_credential_alias).read_text() == "sk-idempotent"
+
+
+async def test_create_rejects_unrecognized_residency_before_any_write(
+    database_urls, operator_env, tmp_path
+):
+    from app.config import Settings
+    from app.operator.create import UnrecognizedResidencyError, create_tenant
+
+    settings = Settings(gateway_credentials_dir=str(tmp_path))
+    engine = create_async_engine(database_urls["migrations"])
+    try:
+        async with engine.begin() as conn:
+            with pytest.raises(UnrecognizedResidencyError):
+                await create_tenant(
+                    conn,
+                    tenant_name="Should Not Exist",
+                    residency="mars",
+                    admin_email="nobody@example.test",
+                    settings=settings,
+                    admin_client=_fake_admin_client(),
+                )
+    finally:
+        await engine.dispose()
+
+    verify_engine = create_async_engine(database_urls["superuser"])
+    try:
+        async with verify_engine.connect() as conn:
+            count = (
+                await conn.execute(
+                    text("SELECT count(*) FROM tenants WHERE name = 'Should Not Exist'")
+                )
+            ).scalar_one()
+    finally:
+        await verify_engine.dispose()
+    assert count == 0
+
+
+async def test_create_rejects_unrecognized_model_before_any_write(
+    database_urls, operator_env, tmp_path
+):
+    from app.config import Settings
+    from app.operator.create import UnrecognizedModelError, create_tenant
+
+    settings = Settings(gateway_credentials_dir=str(tmp_path))
+    engine = create_async_engine(database_urls["migrations"])
+    try:
+        async with engine.begin() as conn:
+            with pytest.raises(UnrecognizedModelError):
+                await create_tenant(
+                    conn,
+                    tenant_name="Should Not Exist Either",
+                    residency="eu",
+                    admin_email="nobody2@example.test",
+                    model="gpt-nonexistent",
+                    settings=settings,
+                    admin_client=_fake_admin_client(),
+                )
+    finally:
+        await engine.dispose()
+
+    verify_engine = create_async_engine(database_urls["superuser"])
+    try:
+        async with verify_engine.connect() as conn:
+            count = (
+                await conn.execute(
+                    text("SELECT count(*) FROM tenants WHERE name = 'Should Not Exist Either'")
+                )
+            ).scalar_one()
+    finally:
+        await verify_engine.dispose()
+    assert count == 0
+
+
+async def test_cli_create_records_the_invocation_in_the_operator_action_log(
+    database_urls, operator_env, tmp_path, monkeypatch
+):
+    """Acceptance (#70): a `create` invocation through the real CLI dispatch is recorded in the
+    operator-action log, with secrets redacted from the logged arguments (none of `create`'s own
+    arguments are secret-shaped, so this also proves ordinary arguments still show up plainly)."""
+    import app.operator.create as create_module
+    from app import config
+    from app.operator.cli import _run, build_parser
+
+    monkeypatch.setenv("GATEWAY_CREDENTIALS_DIR", str(tmp_path))
+    config.get_settings.cache_clear()
+    monkeypatch.setattr(
+        create_module, "build_admin_client", lambda settings: _fake_admin_client(key="sk-cli")
+    )
+
+    args = build_parser().parse_args(
+        ["create", "CLI Co", "--residency", "eu", "--admin-email", "admin@cli.test"]
+    )
+    exit_code = await _run(args.command, args)
+    config.get_settings.cache_clear()
+    assert exit_code == 0
+
+    rows = await _operator_actions(database_urls["superuser"], "create")
+    assert len(rows) >= 1
+    _, action, details, performed_at = rows[-1]
+    assert action == "create"
+    assert details["outcome"].startswith("ok: tenant ")
+    assert details["args"]["tenant_name"] == "CLI Co"
+    assert details["args"]["admin_email"] == "admin@cli.test"
+    assert performed_at is not None

@@ -16,7 +16,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
-from datetime import UTC
+from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -161,6 +161,103 @@ async def test_search_sees_only_own_tenant(app_settings, database_urls):
     async with tenant_session(ctx_b) as session:
         hits = await DocumentRepository().search(session, query, limit=10)
     assert [h.title for h in hits] == ["Document B"]
+
+
+async def _seed_tenant_with_memberships_of_every_role(
+    url: str,
+) -> tuple[uuid.UUID, dict[str, uuid.UUID]]:
+    """One tenant, one document, and one membership per legal role (#30 / S3-T5) -- the fixture
+    the visibility-regression test needs: a real `memberships` row (not a hand-built context) for
+    each of `admin`, `member`, `support`, `agent`, all in the same tenant, all pointing at their
+    own `control.identities` row (the document's own `created_by` seam, #29)."""
+    from app.context import ROLES
+
+    engine = create_async_engine(url)
+    tenant_id = uuid.uuid4()
+    identities_by_role: dict[str, uuid.UUID] = {}
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("INSERT INTO tenants (id, name) VALUES (:id, 'Visibility')"), {"id": tenant_id}
+        )
+        for role in sorted(ROLES):
+            identity_id = uuid.uuid4()
+            await conn.execute(
+                text(
+                    "INSERT INTO control.identities (id, issuer, subject) "
+                    "VALUES (:id, 'seed', :sub)"
+                ),
+                {"id": identity_id, "sub": str(identity_id)},
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO memberships (tenant_id, identity_id, role) "
+                    "VALUES (:tid, :iid, :role)"
+                ),
+                {"tid": tenant_id, "iid": identity_id, "role": role},
+            )
+            identities_by_role[role] = identity_id
+
+        # Seed the document as the admin identity -- created_by/updated_by (#29) need a real
+        # session identity, and which one seeds it is irrelevant to the property under test.
+        await conn.execute(
+            text("SELECT set_config('app.identity_id', :iid, true)"),
+            {"iid": str(identities_by_role["admin"])},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO documents (tenant_id, title, content, embedding) "
+                "VALUES (:tid, :title, :content, CAST(:emb AS vector))"
+            ),
+            {
+                "tid": tenant_id,
+                "title": "Shared Document",
+                "content": "Visible to every role in this tenant",
+                "emb": _vec(0.5),
+            },
+        )
+    await engine.dispose()
+    return tenant_id, identities_by_role
+
+
+async def test_roles_never_affect_document_visibility(app_settings, database_urls):
+    """#30 (S3-T5) AC1: the regression guard for ADR-0004's "roles gate actions, never
+    visibility" -- memberships of all four roles in the same tenant, resolved from real
+    `memberships` rows through the embedded-Postgres seam, get identical `search_documents`
+    results over the same tenant's documents."""
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.repositories.documents import DocumentRepository
+    from app.repositories.memberships import MembershipRepository
+
+    tenant_id, identities_by_role = await _seed_tenant_with_memberships_of_every_role(
+        database_urls["superuser"]
+    )
+    query = [0.0] * DIM
+    query[0] = 1.0
+
+    results_by_role: dict[str, list[tuple[uuid.UUID, str, float]]] = {}
+    for role, identity_id in identities_by_role.items():
+        ctx = RequestContext(tenant_id=tenant_id, identity_id=identity_id, roles=frozenset({role}))
+        async with tenant_session(ctx) as session:
+            # The membership's role really is `role`, resolved from the database -- not just
+            # asserted on the context object -- so this also proves the fixture wired the
+            # `memberships` row correctly.
+            resolved_role = await MembershipRepository().get_role(
+                session, ctx, identity_id=identity_id
+            )
+            assert resolved_role == role
+            hits = await DocumentRepository().search(session, query, limit=10)
+        results_by_role[role] = [(h.id, h.title, h.score) for h in hits]
+
+    distinct_result_sets = set(map(tuple, results_by_role.values()))
+    assert len(distinct_result_sets) == 1, results_by_role
+    assert next(iter(distinct_result_sets)) == (
+        (
+            next(iter(results_by_role.values()))[0][0],
+            "Shared Document",
+            results_by_role["admin"][0][2],
+        ),
+    )
 
 
 async def test_insert_for_other_tenant_is_rejected(app_settings, database_urls):
@@ -2431,10 +2528,15 @@ async def test_conversations_migration_downgrade_after_upgrade_drops_both_tables
 ):
     """#32 AC9: running the migration's downgrade after its upgrade drops both tables cleanly.
     Runs against a savepoint on the shared module-scoped database so it does not disturb the
-    schema other tests in this module depend on."""
+    schema other tests in this module depend on. Also drops `pending_actions` first: migration
+    0022 (#37) adds a foreign key from `pending_actions` to `conversations`, and a real
+    `alembic downgrade` would run 0022's downgrade (dropping `pending_actions`) before 0020's --
+    this manual replay of 0020's own downgrade steps needs the same ordering to avoid a dependent-
+    object error unrelated to what this test actually checks."""
     engine = create_async_engine(database_urls["migrations"])
     async with engine.begin() as conn:
         await conn.execute(text("SAVEPOINT before_downgrade"))
+        await conn.execute(text("DROP TABLE IF EXISTS pending_actions"))
         await conn.execute(text("DROP TRIGGER IF EXISTS messages_touch_conversation ON messages"))
         await conn.execute(text("DROP FUNCTION IF EXISTS conversations_touch_last_activity()"))
         await conn.execute(text("DROP TABLE IF EXISTS messages"))
@@ -2584,3 +2686,342 @@ async def test_delete_expired_removes_only_this_tenants_expired_conversations(
     assert remaining_a == ["conv-fresh"]
     assert remaining_b == ["conv-old"]
     assert old_messages_gone == 0
+
+
+# --- Pending actions for writing-tool approval (ADR-0007, Spec 5 / #37) ---
+
+
+async def _seed_pending_action_fixture(
+    url: str, *, conversation_id: str = "conv-1"
+) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
+    """A tenant with one identity holding a membership, and one conversation for it to reference
+    -- the minimum a pending action's foreign keys require. Seeded with the superuser, exactly
+    like `_seed`'s/`_create_tenant_and_identity`'s direct inserts. Returns
+    `(tenant_id, membership_id, identity_id)`."""
+    engine = create_async_engine(url)
+    tenant_id, identity_id = uuid.uuid4(), uuid.uuid4()
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("INSERT INTO tenants (id, name) VALUES (:id, 'PendingActions')"), {"id": tenant_id}
+        )
+        await conn.execute(
+            text("INSERT INTO control.identities (id, issuer, subject) VALUES (:id, 'seed', :sub)"),
+            {"id": identity_id, "sub": str(identity_id)},
+        )
+        membership_id = (
+            await conn.execute(
+                text(
+                    "INSERT INTO memberships (tenant_id, identity_id, role) "
+                    "VALUES (:tid, :iid, 'member') RETURNING id"
+                ),
+                {"tid": tenant_id, "iid": identity_id},
+            )
+        ).scalar_one()
+        await conn.execute(
+            text(
+                "INSERT INTO conversations (tenant_id, conversation_id, created_by) "
+                "VALUES (:tid, :cid, :creator)"
+            ),
+            {"tid": tenant_id, "cid": conversation_id, "creator": identity_id},
+        )
+    await engine.dispose()
+    return tenant_id, membership_id, identity_id
+
+
+def _aware(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+async def test_pending_action_has_forced_rls_and_app_grants(app_settings, database_urls):
+    """#37 AC1 (grant half): pending_actions gets the same tenant-table shape as every other
+    tenant table -- forced RLS, a tenant-scoped USING/WITH CHECK policy -- and `app` is granted
+    exactly SELECT, INSERT, UPDATE (UPDATE for resolving a pending action; no DELETE, matching
+    `agent_credentials`)."""
+    engine = create_async_engine(database_urls["migrations"])
+    async with engine.connect() as conn:
+        rls = (
+            await conn.execute(
+                text(
+                    "SELECT relrowsecurity, relforcerowsecurity FROM pg_class "
+                    "WHERE oid = CAST('pending_actions' AS regclass)"
+                )
+            )
+        ).one()
+        assert rls.relrowsecurity is True
+        assert rls.relforcerowsecurity is True
+
+        policies = (
+            await conn.execute(
+                text(
+                    "SELECT qual, with_check FROM pg_policies "
+                    "WHERE schemaname = 'public' AND tablename = 'pending_actions'"
+                )
+            )
+        ).all()
+        assert any(
+            p.qual
+            and "app.tenant_id" in p.qual
+            and p.with_check
+            and "app.tenant_id" in p.with_check
+            for p in policies
+        )
+    await engine.dispose()
+
+    app_engine = create_async_engine(database_urls["app"])
+    async with app_engine.connect() as conn:
+        privileges = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT privilege_type FROM information_schema.table_privileges "
+                        "WHERE table_schema = 'public' AND table_name = 'pending_actions' "
+                        "AND grantee = 'app'"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    await app_engine.dispose()
+    assert set(privileges) == {"SELECT", "INSERT", "UPDATE"}
+
+
+async def test_pending_action_invisible_to_another_tenant(app_settings, database_urls):
+    """#37 AC1 (isolation half): a pending action created for one tenant is invisible to a second
+    tenant's session under the standard RLS policy -- mirrors
+    test_conversation_and_messages_invisible_to_another_tenant."""
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.repositories.pending_actions import PendingActionRepository
+
+    tenant_a, membership_a, identity_a = await _seed_pending_action_fixture(
+        database_urls["superuser"]
+    )
+    tenant_b, _, identity_b = await _seed_pending_action_fixture(
+        database_urls["superuser"], conversation_id="conv-b"
+    )
+
+    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=identity_a)
+    async with tenant_session(ctx_a) as session:
+        action = await PendingActionRepository().create(
+            session,
+            ctx_a,
+            conversation_id="conv-1",
+            tool_name="delete_document",
+            arguments={"document_id": "doc-1"},
+            asking_membership_id=membership_a,
+            expires_in=timedelta(minutes=5),
+        )
+        action_id = action.id
+
+    ctx_b = RequestContext(tenant_id=tenant_b, identity_id=identity_b)
+    async with tenant_session(ctx_b) as session:
+        found = await PendingActionRepository().get(session, ctx_b, pending_action_id=action_id)
+    assert found is None
+
+    engine = create_async_engine(database_urls["superuser"])
+    async with engine.connect() as conn:
+        count = (
+            await conn.execute(
+                text("SELECT count(*) FROM pending_actions WHERE tenant_id = :tid"),
+                {"tid": tenant_b},
+            )
+        ).scalar_one()
+    await engine.dispose()
+    assert count == 0
+
+
+async def test_verify_refuses_when_recomputed_hash_does_not_match(app_settings, database_urls):
+    """#37 AC2: verification recomputes the argument hash from a fresh call and refuses when it
+    does not match the stored hash, even though the tool name, tenant, and conversation the
+    caller passes all match the approved record."""
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.repositories.pending_actions import PendingActionRepository
+
+    tenant_id, membership_id, identity_id = await _seed_pending_action_fixture(
+        database_urls["superuser"]
+    )
+    ctx = RequestContext(tenant_id=tenant_id, identity_id=identity_id)
+    repo = PendingActionRepository()
+
+    async with tenant_session(ctx) as session:
+        action = await repo.create(
+            session,
+            ctx,
+            conversation_id="conv-1",
+            tool_name="delete_document",
+            arguments={"document_id": "doc-1"},
+            asking_membership_id=membership_id,
+            expires_in=timedelta(minutes=5),
+        )
+        action_id = action.id
+        assert await repo.resolve(
+            session, ctx, pending_action_id=action_id, approved=True, resolved_by=membership_id
+        )
+
+    async with tenant_session(ctx) as session:
+        result = await repo.verify(
+            session,
+            ctx,
+            pending_action_id=action_id,
+            tool_name="delete_document",
+            arguments={"document_id": "doc-2"},
+        )
+    assert result.ok is False
+    assert result.reason == "hash_mismatch"
+
+    # The exact call that was approved still verifies -- proves the refusal above is about the
+    # arguments, not some other mismatch.
+    async with tenant_session(ctx) as session:
+        result = await repo.verify(
+            session,
+            ctx,
+            pending_action_id=action_id,
+            tool_name="delete_document",
+            arguments={"document_id": "doc-1"},
+        )
+    assert result.ok is True
+
+
+async def test_verify_refuses_a_pending_action_past_its_expiry(app_settings, database_urls):
+    """#37 AC3: verification refuses a pending action past its expiry, exercised against the real
+    wall clock (a negative `expires_in` puts the record in the past the instant it is created --
+    no mocked time module involved)."""
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.repositories.pending_actions import PendingActionRepository
+
+    tenant_id, membership_id, identity_id = await _seed_pending_action_fixture(
+        database_urls["superuser"]
+    )
+    ctx = RequestContext(tenant_id=tenant_id, identity_id=identity_id)
+    repo = PendingActionRepository()
+
+    async with tenant_session(ctx) as session:
+        action = await repo.create(
+            session,
+            ctx,
+            conversation_id="conv-1",
+            tool_name="delete_document",
+            arguments={"document_id": "doc-1"},
+            asking_membership_id=membership_id,
+            expires_in=timedelta(seconds=-1),
+        )
+        action_id = action.id
+        assert await repo.resolve(
+            session, ctx, pending_action_id=action_id, approved=True, resolved_by=membership_id
+        )
+
+    async with tenant_session(ctx) as session:
+        result = await repo.verify(
+            session,
+            ctx,
+            pending_action_id=action_id,
+            tool_name="delete_document",
+            arguments={"document_id": "doc-1"},
+        )
+    assert result.ok is False
+    assert result.reason == "expired"
+
+
+async def test_resolving_one_pending_action_leaves_anothers_status_untouched(
+    app_settings, database_urls
+):
+    """#37 AC4: two pending actions in two different conversations of the same tenant resolve
+    independently -- answering one leaves the other's status untouched."""
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.repositories.pending_actions import PendingActionRepository
+
+    tenant_id, membership_id, identity_id = await _seed_pending_action_fixture(
+        database_urls["superuser"], conversation_id="conv-1"
+    )
+    engine = create_async_engine(database_urls["superuser"])
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO conversations (tenant_id, conversation_id, created_by) "
+                "VALUES (:tid, 'conv-2', :creator)"
+            ),
+            {"tid": tenant_id, "creator": identity_id},
+        )
+    await engine.dispose()
+
+    ctx = RequestContext(tenant_id=tenant_id, identity_id=identity_id)
+    repo = PendingActionRepository()
+
+    async with tenant_session(ctx) as session:
+        first = await repo.create(
+            session,
+            ctx,
+            conversation_id="conv-1",
+            tool_name="delete_document",
+            arguments={"document_id": "doc-1"},
+            asking_membership_id=membership_id,
+            expires_in=timedelta(minutes=5),
+        )
+        second = await repo.create(
+            session,
+            ctx,
+            conversation_id="conv-2",
+            tool_name="delete_document",
+            arguments={"document_id": "doc-2"},
+            asking_membership_id=membership_id,
+            expires_in=timedelta(minutes=5),
+        )
+        first_id, second_id = first.id, second.id
+
+    async with tenant_session(ctx) as session:
+        assert await repo.resolve(
+            session, ctx, pending_action_id=first_id, approved=True, resolved_by=membership_id
+        )
+
+    async with tenant_session(ctx) as session:
+        reloaded_first = await repo.get(session, ctx, pending_action_id=first_id)
+        reloaded_second = await repo.get(session, ctx, pending_action_id=second_id)
+    assert reloaded_first.status == "approved"
+    assert reloaded_second.status == "pending"
+
+
+async def test_expiry_window_is_configuration_not_a_constant(app_settings, database_urls):
+    """#37 AC5: two pending actions created under two different configured expiry windows expire
+    at different offsets from their own creation time -- the window is the caller's own
+    configuration, never a hard-coded duration inside the repository."""
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.repositories.pending_actions import PendingActionRepository
+
+    tenant_id, membership_id, identity_id = await _seed_pending_action_fixture(
+        database_urls["superuser"]
+    )
+    ctx = RequestContext(tenant_id=tenant_id, identity_id=identity_id)
+    repo = PendingActionRepository()
+
+    async with tenant_session(ctx) as session:
+        short_lived = await repo.create(
+            session,
+            ctx,
+            conversation_id="conv-1",
+            tool_name="delete_document",
+            arguments={"document_id": "doc-short"},
+            asking_membership_id=membership_id,
+            expires_in=timedelta(seconds=30),
+        )
+        long_lived = await repo.create(
+            session,
+            ctx,
+            conversation_id="conv-1",
+            tool_name="delete_document",
+            arguments={"document_id": "doc-long"},
+            asking_membership_id=membership_id,
+            expires_in=timedelta(seconds=3000),
+        )
+        await session.refresh(short_lived, ["created_at"])
+        await session.refresh(long_lived, ["created_at"])
+        short_offset = short_lived.expires_at - _aware(short_lived.created_at)
+        long_offset = long_lived.expires_at - _aware(long_lived.created_at)
+
+    assert long_offset > short_offset
+    assert abs(short_offset - timedelta(seconds=30)) < timedelta(seconds=5)
+    assert abs(long_offset - timedelta(seconds=3000)) < timedelta(seconds=5)

@@ -37,7 +37,7 @@
 <text x="615.0" y="526.1" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'JetBrains Mono', Consolas, monospace" font-size="14" font-weight="500" fill="#4b5563">app/tools</text>
 <path d="M 230 444 L 230 468" fill="none" stroke="#f59e0b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#ahf59e0b)"/>
 <path d="M 397 509 L 446 509" fill="none" stroke="#8b5cf6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#ah8b5cf6)"/>
-<text x="70" y="578" text-anchor="start" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="500" fill="#7c6f9e">Tools run with the logged-in user's permissions — never DB credentials to the model.</text>
+<text x="70" y="578" text-anchor="start" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="500" fill="#7c6f9e">Tenant-wide visibility, roles gate actions — never DB credentials to the model.</text>
 <rect x="40" y="632" width="760" height="208" rx="14" fill="#f0fdf4" stroke="#86efac" stroke-width="1.5" stroke-dasharray="6 5" opacity="0.95"/>
 <text x="60" y="657" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="700" letter-spacing="1.4" fill="#15803d">DATA</text>
 <rect x="450" y="668" width="330" height="64" rx="11" fill="#cffafe" stroke="#06b6d4" stroke-width="2"/>

@@ -1,10 +1,15 @@
 """Mint and revoke a tenant's gateway credential (Spec 7 / #53, ADR-0009, ADR-0011).
 
 Two plain, importable functions -- `provision_gateway_credential` and
-`revoke_gateway_credential` -- with no operator-command wrapper of their own: Spec 9's future
-`create`/`suspend`/`erase` operator tool imports and calls these unchanged. Until that tool
-exists, `scripts/seed.py` calls `provision_gateway_credential` directly so the documented
-quickstart keeps producing a tenant that can actually call the assistant.
+`revoke_gateway_credential` -- with no operator-command wrapper of their own, kept usable
+standalone (e.g. a future `rotate` command). The operator tool's `create` command (Spec 9 / #70,
+`app/operator/create.py`) does not call `provision_gateway_credential` itself -- it needs the
+control-plane write, the membership write, and the credential mint to share one database
+transaction, which an engine-per-call function cannot join -- but reuses this module's lower-level
+primitives (`GatewayAdminClient`, `GatewayCredentialLimits`, `GATEWAY_MODEL_ALIASES_BY_RESIDENCY`,
+`generate_gateway_credential_alias`, `write_gateway_credential_file`, `build_admin_client`)
+directly. `revoke_gateway_credential` remains the one call site for revocation (a future `erase`
+command's job, #9).
 
 Provisioning does three things, in order, for a given tenant id:
 
@@ -142,7 +147,11 @@ def _require_setting(value: str | None, name: str) -> str:
     return value
 
 
-def _build_admin_client(settings: Settings) -> GatewayAdminClient:
+def build_admin_client(settings: Settings) -> GatewayAdminClient:
+    """Public (Spec 9 / #70): the operator tool's `create` command builds its own
+    `GatewayAdminClient` the same way this module's own orchestration functions do, but inline
+    within its own single database transaction rather than through `provision_gateway_credential`
+    (which manages its own engine/transaction and therefore cannot share one)."""
     base_url = _require_setting(settings.litellm_base_url, "LITELLM_BASE_URL")
     master_key = settings.litellm_master_key
     if master_key is None:
@@ -259,7 +268,7 @@ async def provision_gateway_credential(
         )
 
     owns_admin_client = admin_client is None
-    admin_client = admin_client or _build_admin_client(settings)
+    admin_client = admin_client or build_admin_client(settings)
     owns_owner_engine = owner_engine is None
     owner_engine = owner_engine or _build_owner_engine()
     try:
@@ -304,7 +313,7 @@ async def revoke_gateway_credential(
             credential = None  # the file is already gone; still revoke at the gateway if we can
 
         if credential is not None:
-            admin_client = admin_client or _build_admin_client(settings)
+            admin_client = admin_client or build_admin_client(settings)
             await admin_client.revoke_key(credential.get_secret_value())
 
         remove_gateway_credential_file(alias, settings=settings)
