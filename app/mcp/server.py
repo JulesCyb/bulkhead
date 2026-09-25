@@ -48,7 +48,7 @@ from app.config import Settings, get_settings
 from app.context import RequestContext
 from app.deps import get_key_source
 from app.startup_checks import run_startup_checks
-from app.tenant_suspension import ensure_tenant_not_suspended
+from app.tenant_suspension import TenantSuspendedError, ensure_tenant_not_suspended
 from app.token_verifier import (
     AGENT_IDENTITY_ISSUER,
     TenantTokenVerificationError,
@@ -126,18 +126,22 @@ GENERIC_TOOL_ERROR = "This tool call failed. The error has been logged."
 
 
 def _masked(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
-    """Wraps a tool function so any exception but `PermissionError` is logged server-side and
-    replaced with a single generic message before it ever reaches
+    """Wraps a tool function so any exception but `PermissionError`/`TenantSuspendedError` is
+    logged server-side and replaced with a single generic message before it ever reaches
     `MCPServer._handle_call_tool`'s own catch-all (which otherwise answers with the exception's
     own `str(e)` -- see that method's source). `PermissionError` is deliberately let through
     unmasked: issue #27 already relies on its exact message (the missing role) reaching the
-    caller, the same way the HTTP API's 403 body names it."""
+    caller, the same way the HTTP API's 403 body names it. `TenantSuspendedError` (issue #69) is
+    the same kind of controlled, expected rejection -- `resolve_context()` above already raises it
+    before this wrapper's own function body ever runs, and every other place a context is resolved
+    (`app/deps.py`, `app/api/chat.py`, `app/api/agents.py`) lets it propagate as itself rather than
+    folding it into a generic 500/masked error."""
 
     @functools.wraps(fn)
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
         try:
             return await fn(*args, **kwargs)
-        except PermissionError:
+        except (PermissionError, TenantSuspendedError):
             raise
         except Exception:
             log.exception("MCP tool call raised an exception -- masked from the client")
