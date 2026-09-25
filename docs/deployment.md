@@ -56,9 +56,11 @@ Every host a content-bearing path can reach — the database, the model gateway,
 sink — must be inside the deployment's residency, the same requirement for all three: a EU
 deployment's `DATABASE_URL`/gateway host and its `LANGFUSE_HOST` must both resolve inside the EU,
 just as a US deployment's must both resolve inside the US. `RESIDENCY` in `.env` names which one
-this deployment is; `RESIDENCY_ALLOW_LIST` in `app/config.py` is the single place that lists each
-residency's allowed hosts — add a residency there, not by editing a host string in one of these
-sections.
+this deployment is; `RESIDENCY_ALLOW_LIST` (loaded by `app/config.py` from
+[`config/residency.toml`](../config/residency.toml), path overridable with
+`RESIDENCY_CONFIG_PATH`) is the single place that lists each residency's allowed hosts — add a
+residency there (a new `[residency.<name>]` table, see `docs/residency.md`), not by editing a host
+string in one of these sections. Malformed or missing, the process refuses to start.
 
 `api` and `migrate` each name `LANGFUSE_HOST` (and `RESIDENCY`) explicitly in their own
 `environment:` block in `docker-compose.yml` (#18 dropped the blanket `env_file: .env` both used

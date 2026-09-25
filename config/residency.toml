@@ -1,0 +1,40 @@
+# Residency allow-list (ADR-0008, Spec 8 / #63).
+#
+# Loaded once at process startup by app.config.load_residency_config (path overridable with the
+# RESIDENCY_CONFIG_PATH environment variable). This file *is* the allow-list -- there is no
+# second, hand-maintained copy in Python for `app/llm.py`, `app/embeddings.py`,
+# `app/observability.py`, `app/startup_checks.py`, or `app/operator/` to drift from. Malformed or
+# missing, the process refuses to start (`app.config.ResidencyConfigError`) -- never a partial or
+# default allow-list.
+#
+# How to add a residency (see docs/residency.md for the full worked example):
+#   1. Add a new [residency.<name>] table below, following the shape of [residency.eu]/[residency.us].
+#   2. Point `model_host_patterns` and `embedding_endpoint` at THAT residency's own LiteLLM
+#      gateway host(s) -- never a raw provider domain such as "*.anthropic.com" or
+#      "*.openai.com". Every model/embedding call goes through the gateway (ADR-0009); a host
+#      that is reachable from every jurisdiction enforces nothing, and the loader below actively
+#      rejects a file where two residencies name the same host.
+#   3. Point `trace_sink_host` at a Langfuse instance actually running in that jurisdiction.
+#   4. List the gateway model aliases (`docker/litellm/config.yaml`'s `model_name` entries) this
+#      residency's tenants may use under `models` -- add a matching `model_list` entry there too,
+#      routed to that residency's own provider region.
+#   5. No code change anywhere else: `app.llm`, `app.embeddings`, and `app.observability` all
+#      resolve their route from this file's data, never a per-residency branch.
+#
+# NOTE: docker-compose.yml's default deployment runs a single, shared LiteLLM gateway container
+# reachable at the hostname "litellm" (LITELLM_BASE_URL=http://litellm:4000) and defaults
+# RESIDENCY=eu -- "litellm" is therefore listed under [residency.eu] so that default deployment
+# starts cleanly. "gateway-eu.internal"/"gateway-us.internal" are placeholders for a deployment
+# that runs one gateway per residency (e.g. in different regions/VPCs) instead.
+
+[residency.eu]
+model_host_patterns = ["litellm", "gateway-eu.internal", "*.eu.litellm.internal"]
+embedding_endpoint = "https://gateway-eu.internal/v1"
+trace_sink_host = "eu.cloud.langfuse.com"
+models = ["claude-eu", "embeddings"]
+
+[residency.us]
+model_host_patterns = ["gateway-us.internal", "*.us.litellm.internal"]
+embedding_endpoint = "https://gateway-us.internal/v1"
+trace_sink_host = "us.cloud.langfuse.com"
+models = ["claude", "embeddings"]

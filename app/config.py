@@ -3,20 +3,26 @@
 Tenant-specific things (model choice, prompts, limits) do NOT belong here — they live in
 tenants.settings. This holds process-wide settings only.
 
-Residency allow-list (ADR-0008): each entry in ``RESIDENCY_ALLOW_LIST`` below names the
-host patterns and endpoints one residency (jurisdiction) may reach on any content-bearing
-path — model/gateway hosts, the embedding endpoint, the trace sink. Adding a residency is a
-new entry in that dict, not a code change scattered across the model-routing, embeddings, and
-observability modules. ``Settings.residency`` (the deployment's own residency, or a tenant's
-``control.tenants.residency`` at the call sites that resolve it) is validated against this
-allow-list's keys, so an unknown residency identifier is rejected here, not discovered later at
-request time. This module only defines the allow-list and validates identifiers against it; the
-startup walk that checks every configured endpoint against its residency's allow-list, and the
-resolver that returns a route for a given residency, are built in the startup-validation and
+Residency allow-list (ADR-0008, Spec 8 / #63): ``RESIDENCY_ALLOW_LIST`` and
+``RESIDENCY_MODEL_ALLOW_LIST`` below name, for each residency (jurisdiction), the host patterns
+and endpoints its content-bearing calls may reach and the gateway model aliases it may use. This
+is configuration data loaded once at import time from ``config/residency.toml`` (path overridable
+with the ``RESIDENCY_CONFIG_PATH`` environment variable, see ``load_residency_config`` below) --
+never a Python literal to edit, so a deployment can change or extend its allow-list without a
+code change, and a config-management tool can template the file directly. Adding a residency is a
+new ``[residency.<name>]`` table in that file, not a code change scattered across the
+model-routing, embeddings, and observability modules. ``Settings.residency`` (the deployment's own
+residency, or a tenant's ``control.tenants.residency`` at the call sites that resolve it) is
+validated against this allow-list's keys, so an unknown residency identifier is rejected here, not
+discovered later at request time. This module only loads/validates the allow-list; the startup
+walk that checks every configured endpoint against its residency's allow-list, and the resolver
+that returns a route for a given residency, are built in the startup-validation and
 residency-resolution modules that consume this data.
 """
 
+import tomllib
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import BaseModel, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -28,6 +34,26 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 ROLE_STATEMENT_TIMEOUT_MS = 60_000
 ROLE_CONNECTION_LIMIT = 50
 
+# Default location of the residency allow-list file, relative to the repository root (this file
+# lives at <repo>/app/config.py). ``RESIDENCY_CONFIG_PATH`` overrides it -- read directly from the
+# environment here, not through `Settings`, because the allow-list must exist as a module-level
+# constant before any `Settings` instance can validate its own `residency` field against it.
+DEFAULT_RESIDENCY_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "residency.toml"
+
+
+class _ResidencyConfigLocation(BaseSettings):
+    """Reads only `RESIDENCY_CONFIG_PATH`, from the same `.env` file (and `/run/secrets`) every
+    other setting uses -- a separate, minimal `BaseSettings` (mirrors `app.migration_settings`'s
+    pattern) because the allow-list itself must be loaded and validated before the main
+    `Settings` class exists, so `Settings._require_known_residency` has something to validate
+    `residency` against."""
+
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", extra="ignore", secrets_dir="/run/secrets"
+    )
+
+    residency_config_path: str = str(DEFAULT_RESIDENCY_CONFIG_PATH)
+
 
 class ResidencyRoute(BaseModel):
     """The endpoints one residency may reach on a content-bearing path."""
@@ -37,35 +63,132 @@ class ResidencyRoute(BaseModel):
     trace_sink_host: str
 
 
-# Data-driven residency allow-list. This is configuration data, not per-provider branching in
-# code: a new residency is a new key here. One embedding model family is shared across every
-# residency (the vector column's dimension is fixed) — residency only ever picks the region an
-# endpoint is served from, never a different embedding model.
-RESIDENCY_ALLOW_LIST: dict[str, ResidencyRoute] = {
-    "eu": ResidencyRoute(
-        model_host_patterns=("*.anthropic.com", "*.openai.com", "*.eu.litellm.internal"),
-        embedding_endpoint="https://api.openai.com/v1",
-        trace_sink_host="eu.cloud.langfuse.com",
-    ),
-    "us": ResidencyRoute(
-        model_host_patterns=("*.anthropic.com", "*.openai.com", "*.us.litellm.internal"),
-        embedding_endpoint="https://api.openai.com/v1",
-        trace_sink_host="us.cloud.langfuse.com",
-    ),
-}
+class ResidencyConfigError(ValueError):
+    """The residency allow-list configuration file is missing, unreadable, malformed, empty, or
+    lets two residencies reach the same host. Fails closed and always names the offending file
+    and the exact problem, so an operator (or an AI agent extending this template) can fix it
+    without reading this module's source. Raised at import time -- a broken allow-list must stop
+    the process from ever starting, never be discovered later at request time."""
 
-# Model allow-list per residency (Spec 7 / #54, ADR-0009): the bare gateway alias names --
-# exactly the `model_name` entries in docker/litellm/config.yaml's `model_list`, never a raw
-# provider model id -- a tenant assigned to one residency may use. `tenants.settings["model"]`
-# (or the deployment default, `Settings.llm_model`) is validated against the entry for that
-# tenant's own residency in `app/llm.py` before any client is constructed: the application-side
-# half of ADR-0009's two-layer defense, with the gateway's own key-scoped models as the second
-# layer. A residency with no configured provider access has no alias here, not an empty tuple
-# meaning "anything goes" -- see the lookup in `app/llm.py`.
-RESIDENCY_MODEL_ALLOW_LIST: dict[str, tuple[str, ...]] = {
-    "eu": ("claude-eu", "embeddings"),
-    "us": ("claude", "embeddings"),
-}
+
+def load_residency_config(
+    path: str | Path | None = None,
+) -> tuple[dict[str, ResidencyRoute], dict[str, tuple[str, ...]]]:
+    """Loads and validates the residency allow-list from a TOML file (ADR-0008, Spec 8 / #63).
+
+    `path` defaults to the `RESIDENCY_CONFIG_PATH` environment variable, then to
+    `DEFAULT_RESIDENCY_CONFIG_PATH`. Each `[residency.<name>]` table must define
+    `model_host_patterns` (a non-empty list of glob host patterns), `embedding_endpoint`, and
+    `trace_sink_host` (both non-empty strings); `models` (a list of gateway alias names) is
+    optional and becomes that residency's entry in the returned model allow-list.
+
+    Every model/embedding call goes through the LiteLLM gateway (ADR-0009), so
+    `model_host_patterns` and `embedding_endpoint` must name *that residency's own* gateway
+    host(s) -- never a raw, globally-reachable provider domain such as `*.anthropic.com` or
+    `*.openai.com`, which is reachable from every jurisdiction and therefore enforces nothing.
+    This function actively rejects a file in which two residencies name the same host or pattern
+    (in `model_host_patterns`, `embedding_endpoint`'s host, or `trace_sink_host`): residencies
+    that can reach the same host are not actually separated, whatever their allow-lists claim.
+
+    Raises `ResidencyConfigError` for every failure mode above -- never a partial or best-effort
+    allow-list, and never a silent fallback to an empty or default configuration.
+    """
+    config_path = (
+        Path(path) if path is not None else Path(_ResidencyConfigLocation().residency_config_path)
+    )
+    try:
+        raw = config_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ResidencyConfigError(
+            f"residency configuration file not found or unreadable: {config_path} ({exc}). "
+            "Set RESIDENCY_CONFIG_PATH, or restore config/residency.toml (see docs/residency.md)."
+        ) from exc
+    try:
+        data = tomllib.loads(raw)
+    except tomllib.TOMLDecodeError as exc:
+        raise ResidencyConfigError(
+            f"residency configuration file {config_path} is not valid TOML: {exc}"
+        ) from exc
+
+    residencies = data.get("residency")
+    if not isinstance(residencies, dict) or not residencies:
+        raise ResidencyConfigError(
+            f"residency configuration file {config_path} must define at least one "
+            "[residency.<name>] table"
+        )
+
+    allow_list: dict[str, ResidencyRoute] = {}
+    model_allow_list: dict[str, tuple[str, ...]] = {}
+    for name, entry in residencies.items():
+        if not isinstance(entry, dict):
+            raise ResidencyConfigError(
+                f"{config_path}: [residency.{name}] must be a table, got {type(entry).__name__}"
+            )
+        required_keys = ("model_host_patterns", "embedding_endpoint", "trace_sink_host")
+        missing = [k for k in required_keys if k not in entry]
+        if missing:
+            raise ResidencyConfigError(
+                f"{config_path}: [residency.{name}] is missing required key(s): {missing}"
+            )
+        host_patterns = entry["model_host_patterns"]
+        if (
+            not isinstance(host_patterns, list)
+            or not host_patterns
+            or not all(isinstance(p, str) and p for p in host_patterns)
+        ):
+            raise ResidencyConfigError(
+                f"{config_path}: [residency.{name}].model_host_patterns must be a non-empty "
+                "list of non-empty strings"
+            )
+        embedding_endpoint = entry["embedding_endpoint"]
+        trace_sink_host = entry["trace_sink_host"]
+        if not isinstance(embedding_endpoint, str) or not embedding_endpoint:
+            raise ResidencyConfigError(
+                f"{config_path}: [residency.{name}].embedding_endpoint must be a non-empty string"
+            )
+        if not isinstance(trace_sink_host, str) or not trace_sink_host:
+            raise ResidencyConfigError(
+                f"{config_path}: [residency.{name}].trace_sink_host must be a non-empty string"
+            )
+        models = entry.get("models", [])
+        if not isinstance(models, list) or not all(isinstance(m, str) and m for m in models):
+            raise ResidencyConfigError(
+                f"{config_path}: [residency.{name}].models must be a list of non-empty strings"
+            )
+
+        allow_list[name] = ResidencyRoute(
+            model_host_patterns=tuple(host_patterns),
+            embedding_endpoint=embedding_endpoint,
+            trace_sink_host=trace_sink_host,
+        )
+        if models:
+            model_allow_list[name] = tuple(models)
+
+    # Fail closed if two residencies could ever reach the same host: that defeats the entire
+    # point of a per-residency allow-list. Compared as literal strings (a glob pattern is only
+    # ever equal to itself here), which is enough to catch the copy-paste mistake this fix
+    # exists for -- two residencies naming the exact same provider host.
+    host_owner: dict[str, str] = {}
+    for name, route in allow_list.items():
+        embedding_host = route.embedding_endpoint.split("//", 1)[-1].split("/", 1)[0]
+        for host in (*route.model_host_patterns, embedding_host, route.trace_sink_host):
+            owner = host_owner.get(host)
+            if owner is not None and owner != name:
+                raise ResidencyConfigError(
+                    f"{config_path}: host/pattern {host!r} is allow-listed for both "
+                    f"{owner!r} and {name!r} -- residencies must never share a host"
+                )
+            host_owner[host] = name
+
+    return allow_list, model_allow_list
+
+
+# Loaded once at import time (ADR-0008, Spec 8 / #63): a broken or misconfigured allow-list file
+# must stop the process before it ever accepts a request, not be discovered when the first tenant
+# request tries to resolve a route.
+RESIDENCY_ALLOW_LIST: dict[str, ResidencyRoute]
+RESIDENCY_MODEL_ALLOW_LIST: dict[str, tuple[str, ...]]
+RESIDENCY_ALLOW_LIST, RESIDENCY_MODEL_ALLOW_LIST = load_residency_config()
 
 
 class Settings(BaseSettings):
@@ -131,6 +254,13 @@ class Settings(BaseSettings):
     # The deployment's (or, at a call site resolving a tenant's own setting, that tenant's)
     # residency. Must be a key of RESIDENCY_ALLOW_LIST — validated below.
     residency: str = "eu"
+
+    # Where the residency allow-list (`RESIDENCY_ALLOW_LIST`/`RESIDENCY_MODEL_ALLOW_LIST` above)
+    # is loaded from -- informational only on this object (the allow-list itself is loaded once
+    # at import time, before any `Settings` instance exists, via the `RESIDENCY_CONFIG_PATH`
+    # environment variable read directly in `load_residency_config`); kept here too so an operator
+    # or a diagnostic endpoint can report which file a running process actually loaded.
+    residency_config_path: str = str(DEFAULT_RESIDENCY_CONFIG_PATH)
 
     # No default (issue #14 / ADR-0011): same reasoning as `environment` above — a deployment
     # must choose an auth mode explicitly rather than silently running header-based tenant

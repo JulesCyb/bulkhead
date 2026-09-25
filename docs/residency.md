@@ -43,49 +43,64 @@ different trace sinks, resolved fresh on every request from `control.tenants.res
 
 ## Sub-processors
 
-Every host any content-bearing path can reach is named in `RESIDENCY_ALLOW_LIST`
-(`app/config.py`) — this list *is* the sub-processor list; there is no second, hand-maintained
-copy for legal to check against a different set of names. As shipped, two residencies are
-configured:
+Every host any content-bearing path can reach is named in `RESIDENCY_ALLOW_LIST`, loaded from
+[`config/residency.toml`](../config/residency.toml) (path overridable with
+`RESIDENCY_CONFIG_PATH`; `app.config.load_residency_config` loads and validates it once at
+process startup) — this file *is* the sub-processor list; there is no second, hand-maintained
+copy for legal to check against a different set of names, and no Python literal to edit. As
+shipped, two residencies are configured, **each reaching its own, disjoint set of hosts** — a
+residency's allow-list names only that residency's own LiteLLM gateway, never a raw,
+globally-reachable provider domain like `*.anthropic.com`/`*.openai.com`, which is reachable from
+every jurisdiction and would enforce nothing:
 
 | Role | Sub-processor | Reached at | Configured for |
 |---|---|---|---|
-| Model provider | Anthropic | `*.anthropic.com` (direct, or the LiteLLM gateway's own regional route to it) | `eu`, `us` |
-| Model provider | OpenAI | `*.openai.com` | `eu`, `us` |
-| Embedding provider | OpenAI | `https://api.openai.com/v1` (`embedding_endpoint`) | `eu`, `us` |
-| Gateway | LiteLLM (self-hosted, `docker/litellm/config.yaml`) | `*.eu.litellm.internal` / `*.us.litellm.internal` | `eu`, `us` |
+| Gateway / model provider | LiteLLM (self-hosted, `docker/litellm/config.yaml`), routing to Anthropic (direct or Bedrock) per alias | `litellm` / `gateway-eu.internal` / `*.eu.litellm.internal` | `eu` only |
+| Gateway / model provider | LiteLLM (self-hosted), routing to Anthropic per alias | `gateway-us.internal` / `*.us.litellm.internal` | `us` only |
+| Embedding provider | OpenAI, via the LiteLLM gateway | `https://gateway-eu.internal/v1` (`embedding_endpoint`, `eu`) | `eu` only |
+| Embedding provider | OpenAI, via the LiteLLM gateway | `https://gateway-us.internal/v1` (`embedding_endpoint`, `us`) | `us` only |
 | Tracing host | Langfuse | `eu.cloud.langfuse.com` (`eu`) / `us.cloud.langfuse.com` (`us`) (`trace_sink_host`) | `eu`, `us` |
 
-The embedding provider is shared across every residency by design (ADR-0008): the vector column
-has one fixed dimension, so a residency picks the provider's *region*, never a different
-embedding model. A model provider or gateway host not in this table is unreachable on a
-content-bearing path — the startup check refuses to start otherwise, and
-`app.llm.resolve_tenant_chat_model` refuses a model name outside `RESIDENCY_MODEL_ALLOW_LIST` for
-the tenant's own residency before ever building a client.
+`litellm` is the docker-compose default deployment's own gateway hostname
+(`LITELLM_BASE_URL=http://litellm:4000`, `RESIDENCY=eu` by default) — that compose deployment runs
+one shared gateway container, so it is listed under `eu` so the default deployment starts
+cleanly. `gateway-eu.internal`/`gateway-us.internal` are placeholders for a deployment that runs
+one gateway per residency (its own host per jurisdiction, e.g. in different regions or VPCs)
+instead. Every model/embedding call goes through the gateway (ADR-0009); the embedding model
+family itself is shared across every residency by design (ADR-0008: the vector column has one
+fixed dimension, so a residency picks the provider's *region* — reached through that residency's
+own gateway — never a different embedding model or a host another residency can also reach). A
+host not in this table is unreachable on a content-bearing path — the startup check refuses to
+start otherwise, `app.llm.resolve_tenant_chat_model` refuses a model name outside
+`RESIDENCY_MODEL_ALLOW_LIST` for the tenant's own residency before ever building a client, and
+`load_residency_config` itself refuses to load a file in which two residencies name the same
+host.
 
 ## Worked example: adding a second residency
 
-Say a customer needs `uk` (its own jurisdiction, distinct from `eu`/`us`). Four things change,
-all data, no branching:
+Say a customer needs `uk` (its own jurisdiction, distinct from `eu`/`us`). Everything below is
+data, in one file, no branching:
 
-1. **The allow-list entry** (`app/config.py`) — add a `RESIDENCY_ALLOW_LIST["uk"]` naming the
-   hosts this residency may reach:
+1. **The allow-list entry** ([`config/residency.toml`](../config/residency.toml)) — add a
+   `[residency.uk]` table naming *that residency's own* gateway host(s) this residency may
+   reach — never a host `eu` or `us` also reach:
 
-   ```python
-   "uk": ResidencyRoute(
-       model_host_patterns=("*.anthropic.com", "*.openai.com", "*.uk.litellm.internal"),
-       embedding_endpoint="https://api.openai.com/v1",
-       trace_sink_host="uk.cloud.langfuse.com",  # a self-hosted UK Langfuse instance, e.g.
-   ),
+   ```toml
+   [residency.uk]
+   model_host_patterns = ["gateway-uk.internal", "*.uk.litellm.internal"]
+   embedding_endpoint = "https://gateway-uk.internal/v1"
+   trace_sink_host = "uk.cloud.langfuse.com"  # a self-hosted UK Langfuse instance, e.g.
+   models = ["claude-uk", "embeddings"]
    ```
 
-2. **The model route** — a `RESIDENCY_MODEL_ALLOW_LIST["uk"]` entry naming the gateway aliases a
-   `uk` tenant may use, and a matching `model_list` entry in `docker/litellm/config.yaml` routing
-   that alias to a UK-region endpoint (e.g. AWS Bedrock `eu-west-2`):
+   `RESIDENCY_ALLOW_LIST` and `RESIDENCY_MODEL_ALLOW_LIST` (`app/config.py`) pick this entry up
+   automatically the next time the process starts — `load_residency_config` also refuses to start
+   if `gateway-uk.internal`/`*.uk.litellm.internal` collide with any host already claimed by `eu`
+   or `us`.
 
-   ```python
-   RESIDENCY_MODEL_ALLOW_LIST["uk"] = ("claude-uk", "embeddings")
-   ```
+2. **The model route** — the `models` list above names the gateway aliases a `uk` tenant may use;
+   add a matching `model_list` entry in `docker/litellm/config.yaml` routing that alias to a
+   UK-region endpoint (e.g. AWS Bedrock `eu-west-2`):
 
    ```yaml
    - model_name: claude-uk
@@ -94,19 +109,19 @@ all data, no branching:
        aws_region_name: eu-west-2
    ```
 
-3. **The embedding endpoint** — nothing to add here unless the customer also requires the
-   embedding call itself to stay in `uk`: the shared embedding model family means every residency
-   reuses the same `embedding_endpoint` (OpenAI) unless a UK-hosted OpenAI-compatible endpoint is
-   substituted in the new entry from step 1.
+3. **The embedding endpoint** — already set in step 1's `embedding_endpoint`: the customer's own
+   `uk` gateway, reached the same way the chat model is. The embedding *model* itself still
+   doesn't change (shared family, see above) — only which gateway serves it.
 
-4. **The trace sink** — point `trace_sink_host` (step 1) at a Langfuse instance actually running
-   in the UK; `app.observability.setup_observability` builds one `TracerProvider` per residency
-   from this same dict, so no further wiring is needed once the host is correct.
+4. **The trace sink** — already set in step 1's `trace_sink_host`, pointed at a Langfuse instance
+   actually running in the UK; `app.observability.setup_observability` builds one
+   `TracerProvider` per residency straight from the loaded allow-list, so no further wiring is
+   needed once the host is correct.
 
-Once these four data changes are made, an operator sets `control.tenants.residency = 'uk'` for
-that tenant (via the operator tool, never a tenant's own request) and `run_startup_checks`
-validates the new entry the same way it validates `eu`/`us` today — nothing about this recipe is
-code that needs a new branch in the model-routing, embedding, or observability modules.
+Once this one file is edited, an operator sets `control.tenants.residency = 'uk'` for that tenant
+(via the operator tool, never a tenant's own request) and `run_startup_checks` validates the new
+entry the same way it validates `eu`/`us` today — nothing about this recipe is code that needs a
+new branch in the model-routing, embedding, or observability modules.
 
 ## The MCP boundary
 
