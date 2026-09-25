@@ -41,7 +41,8 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    passed through every request, agent run, tool call, and job. No global state.
 2. **Every new table** has `tenant_id uuid NOT NULL REFERENCES tenants(id)`, an index on it,
    `ENABLE`/`FORCE ROW LEVEL SECURITY`, and a policy `tenant_id = current_setting('app.tenant_id',
-   true)::uuid` (USING and WITH CHECK) plus a GRANT to the `app` role. Template: `migrations/versions/0001_initial.py`.
+   true)::uuid` (USING and WITH CHECK) plus a GRANT to the `app` role, and must be added to the
+   tenant-table registry (`app/db/tenant_tables.py`). Template: `migrations/versions/0001_initial.py`.
 3. **DB access only through repositories** (`app/repositories/`) with sessions from
    `tenant_session(ctx)`. The app connects as `app` (no superuser, `NOBYPASSRLS`); migrations and
    seed use `DATABASE_URL_MIGRATIONS`.
@@ -92,6 +93,8 @@ scripts/seed.py       first tenant + user
 ## Do not touch without checking first
 
 - RLS policies, roles, and grants in `migrations/` and `docker/postgres/01-init.sh`
+- The tenant-table registry (`app/db/tenant_tables.py`) — it drives RLS migration tooling and,
+  later, tenant erasure; removing a table from it silently drops its RLS/erasure coverage
 - `app/context.py`, `app/deps.py`, `app/db/session.py` — changes here are authorized by
   ADR-0003 (identity and membership) and ADR-0012 (tenant in the path); check those first
   before editing, rather than treating a matching change as an unreviewed edit
