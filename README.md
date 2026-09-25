@@ -92,6 +92,9 @@ In full, with commands and conventions: [`CLAUDE.md`](CLAUDE.md).
    [`docs/mobile.md`](docs/mobile.md) (Android/iOS), [`docs/deployment.md`](docs/deployment.md).
 7. **Implement `AUTH_MODE=jwt` before anything is publicly reachable.** The dev headers are for
    localhost and nowhere else.
+8. **On managed Postgres with no first-boot container hook** (RDS, Neon, Supabase, Cloud SQL),
+   run `uv run python scripts/provision_roles.py <admin-database-url>` once instead of
+   `docker/postgres/01-init.sh` — same `app_owner`/`app` roles and grants, safe to run again.
 
 ## Deliberately not included
 

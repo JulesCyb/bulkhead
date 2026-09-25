@@ -25,6 +25,7 @@ uv sync                                   # environment (+ --extra observability
 docker compose up -d --wait postgres      # database locally
 uv run alembic upgrade head               # migrations (owner role, DATABASE_URL_MIGRATIONS)
 uv run python scripts/seed.py "My Tenant" me@example.com   # first tenant + user
+uv run python scripts/provision_roles.py <admin-database-url>  # managed Postgres, no init hook
 uv run uvicorn app.main:app --reload      # API locally, http://localhost:8000/docs
 uv run pytest                             # tests (must be green before every commit)
 uv run pytest tests/test_rls_integration.py   # real RLS test (needs: uv sync --group dbtest)
