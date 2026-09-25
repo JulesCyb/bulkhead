@@ -2,7 +2,13 @@ import uuid
 
 import pytest
 
-from app.context import RequestContext
+from app.context import ROLES, RequestContext
+
+
+def test_roles_are_the_four_legal_values():
+    """Acceptance (#28): the Python single source of truth names exactly the four roles
+    CONTEXT.md documents, string for string."""
+    assert ROLES == {"admin", "member", "support", "agent"}
 
 
 def test_context_is_immutable_and_checks_roles():

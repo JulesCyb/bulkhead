@@ -11,6 +11,7 @@ statement timeout matches the role-level setting the bootstrap script configures
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -1782,6 +1783,29 @@ async def test_migration_drops_users_and_memberships_has_the_expected_shape(data
             identity_id=other_identity_id,
             role="owner",
         )
+
+
+async def test_role_type_matches_the_database_check_constraint(database_urls):
+    """Acceptance (#28): the `memberships_role_valid` CHECK constraint's legal values match,
+    string for string, `app.context.ROLES` -- the single source of truth the application's role
+    check (`RequestContext.require_role`) is built against. Read from the database itself
+    rather than hard-coded here, so a change to either side without the other fails this test."""
+    from app.context import ROLES
+
+    engine = create_async_engine(database_urls["migrations"])
+    async with engine.connect() as conn:
+        definition = (
+            await conn.execute(
+                text(
+                    "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                    "WHERE conname = 'memberships_role_valid'"
+                )
+            )
+        ).scalar_one()
+    await engine.dispose()
+
+    db_roles = set(re.findall(r"'([^']+)'", definition))
+    assert db_roles == set(ROLES)
 
 
 async def test_memberships_grants_mirror_the_retired_users_grants(database_urls):
