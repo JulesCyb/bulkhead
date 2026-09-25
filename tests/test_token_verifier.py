@@ -104,7 +104,7 @@ async def test_bad_signature_is_invalid_or_expired(monkeypatch):
             tenant_id=tenant_id,
             key_source=_key_source,
             default_issuer=None,
-            algorithms=("HS256",),
+            algorithm_source=lambda issuer: ("HS256",),
         )
     assert exc_info.value.reason is VerificationFailureReason.INVALID_OR_EXPIRED
 
@@ -124,7 +124,7 @@ async def test_expired_token_is_invalid_or_expired(monkeypatch):
             tenant_id=tenant_id,
             key_source=_key_source,
             default_issuer=None,
-            algorithms=("HS256",),
+            algorithm_source=lambda issuer: ("HS256",),
         )
     assert exc_info.value.reason is VerificationFailureReason.INVALID_OR_EXPIRED
 
@@ -139,7 +139,7 @@ async def test_no_issuer_configured_is_invalid_or_expired(monkeypatch):
             tenant_id=tenant_id,
             key_source=_key_source,
             default_issuer=None,
-            algorithms=("HS256",),
+            algorithm_source=lambda issuer: ("HS256",),
         )
     assert exc_info.value.reason is VerificationFailureReason.INVALID_OR_EXPIRED
     assert exc_info.value.issuer is None
@@ -162,7 +162,7 @@ async def test_wrong_audience_is_audience_mismatch(monkeypatch):
             tenant_id=tenant_id,
             key_source=_key_source,
             default_issuer=None,
-            algorithms=("HS256",),
+            algorithm_source=lambda issuer: ("HS256",),
         )
     assert exc_info.value.reason is VerificationFailureReason.AUDIENCE_MISMATCH
 
@@ -182,7 +182,7 @@ async def test_unknown_identity_is_unknown_identity(monkeypatch):
             tenant_id=tenant_id,
             key_source=_key_source,
             default_issuer=None,
-            algorithms=("HS256",),
+            algorithm_source=lambda issuer: ("HS256",),
         )
     assert exc_info.value.reason is VerificationFailureReason.UNKNOWN_IDENTITY
 
@@ -203,7 +203,7 @@ async def test_no_membership_is_missing_membership(monkeypatch):
             tenant_id=tenant_id,
             key_source=_key_source,
             default_issuer=None,
-            algorithms=("HS256",),
+            algorithm_source=lambda issuer: ("HS256",),
         )
     assert exc_info.value.reason is VerificationFailureReason.MISSING_MEMBERSHIP
 
@@ -223,7 +223,7 @@ async def test_success_resolves_identity_and_role(monkeypatch):
         tenant_id=tenant_id,
         key_source=_key_source,
         default_issuer=None,
-        algorithms=("HS256",),
+        algorithm_source=lambda issuer: ("HS256",),
     )
     assert resolved.identity_id == identity_id
     assert resolved.role == "admin"
@@ -288,7 +288,7 @@ async def test_agent_issued_token_bypasses_tenant_auth_settings(monkeypatch):
         tenant_id=tenant_id,
         key_source=_agent_key_source,
         default_issuer=None,
-        algorithms=("HS256",),
+        algorithm_source=lambda issuer: ("HS256",),
     )
 
     assert resolved.identity_id == identity_id
@@ -327,7 +327,7 @@ async def test_agent_issued_token_still_fails_closed_on_a_bad_signature(monkeypa
             tenant_id=tenant_id,
             key_source=_agent_key_source,
             default_issuer=None,
-            algorithms=("HS256",),
+            algorithm_source=lambda issuer: ("HS256",),
         )
     assert exc_info.value.reason is VerificationFailureReason.INVALID_OR_EXPIRED
 
@@ -349,6 +349,6 @@ async def test_success_is_not_affected_by_tenant_suspension(monkeypatch):
         tenant_id=tenant_id,
         key_source=_key_source,
         default_issuer=None,
-        algorithms=("HS256",),
+        algorithm_source=lambda issuer: ("HS256",),
     )
     assert resolved.identity_id == identity_id

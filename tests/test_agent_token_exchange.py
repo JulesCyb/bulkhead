@@ -369,7 +369,7 @@ async def test_issued_token_round_trips_through_the_shared_verifier(monkeypatch,
         tenant_id=tenant_id,
         key_source=_key_source,
         default_issuer=None,
-        algorithms=("HS256",),
+        algorithm_source=lambda issuer: ("HS256",),
     )
 
     assert resolved.identity_id == identity_id

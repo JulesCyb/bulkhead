@@ -23,6 +23,7 @@ signature still fails closed the same way it always did.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final
@@ -35,6 +36,15 @@ from app.db.session import control_session, tenant_session
 from app.jwt_verifier import KeySource, TokenVerificationError, verify_token
 from app.repositories.control import IdentityRepository, TenantAuthSettingsRepository
 from app.repositories.memberships import MembershipRepository
+
+# (issuer) -> the algorithm(s) a token claiming that issuer may be verified with -- the algorithm
+# half of the same per-issuer pinning `KeySource` does for the verification key (see
+# `app.deps.get_key_source` / `get_algorithm_source`, the two real implementations both the HTTP
+# API and the MCP transport use). Never trusts the token's own header for this: `verify_token`
+# always passes whatever this resolves to as an explicit allow-list to `jwt.decode`, so a token
+# cannot pick its own algorithm, and a token minted under one issuer's algorithm/key can never be
+# checked against another issuer's (the algorithm-confusion guard, review finding Spec 6).
+AlgorithmSource = Callable[[str], tuple[str, ...]]
 
 # The fixed issuer `control.create_agent_identity` (migration 0032) synthesizes for every agent
 # identity, and the issuer `app/agent_credential_exchange.py` mints agent tokens under. Never a
@@ -112,7 +122,7 @@ async def verify_tenant_token(
     tenant_id: UUID,
     key_source: KeySource,
     default_issuer: str | None,
-    algorithms: tuple[str, ...],
+    algorithm_source: AlgorithmSource,
 ) -> ResolvedIdentity:
     """Verify `token` against `tenant_id` and resolve it to an identity and its membership.
 
@@ -121,6 +131,12 @@ async def verify_tenant_token(
     membership in `tenant_id` (looked up inside that tenant's own context -- no RLS bypass, and no
     separate "does this tenant exist" query: no membership row means `MISSING_MEMBERSHIP`,
     whether the identity truly isn't a member or the tenant simply doesn't exist).
+
+    `algorithm_source(expected_issuer)` -- called only once `expected_issuer` is resolved (below)
+    -- returns the algorithm(s) that issuer's tokens are allowed to verify against, exactly the
+    same per-issuer pinning `key_source` already does for the key (algorithm-confusion guard,
+    review finding Spec 6): a human issuer never gets checked against the agent algorithm/key, or
+    vice versa, and neither ever accepts an algorithm the token's own header names.
 
     Raises `TenantTokenVerificationError` with a single categorized reason on the first check
     that fails; returns the resolved identity and role on success. Never checks suspension --
@@ -139,6 +155,7 @@ async def verify_tenant_token(
         if not expected_issuer:
             raise TenantTokenVerificationError(VerificationFailureReason.INVALID_OR_EXPIRED)
 
+    algorithms = algorithm_source(expected_issuer)
     try:
         claims = verify_token(
             token, key_source=key_source, expected_issuer=expected_issuer, algorithms=algorithms

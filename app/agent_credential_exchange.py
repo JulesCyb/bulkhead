@@ -102,7 +102,11 @@ async def exchange_agent_credential(
         issuer=identity.issuer,
         audience=str(tenant_id),
         signing_key=settings.agent_token_signing_key.get_secret_value(),
-        algorithm=settings.jwt_algorithm,
+        # Deliberately agent_token_algorithm, never jwt_algorithm (review finding, Spec 6): the
+        # two are independent settings for independent token populations -- see app/config.py's
+        # agent_token_algorithm docstring and app.deps.get_key_source / get_algorithm_source,
+        # which pin the matching key/algorithm pair per issuer at verification time.
+        algorithm=settings.agent_token_algorithm,
         ttl_seconds=ttl_seconds,
         # The credential's own public id, so a caller resolving this token later (the MCP
         # transport, #49) can name it as `RequestContext`'s means without a second lookup.

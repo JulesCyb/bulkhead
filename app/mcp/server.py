@@ -57,7 +57,7 @@ from starlette.responses import JSONResponse
 
 from app.config import Settings, get_settings
 from app.context import RequestContext
-from app.deps import get_key_source
+from app.deps import get_algorithm_source, get_key_source
 from app.startup_checks import run_startup_checks
 from app.tenant_suspension import TenantSuspendedError, ensure_tenant_not_suspended
 from app.token_verifier import (
@@ -254,13 +254,14 @@ class MCPTenantAuthMiddleware:
             return
 
         key_source = get_key_source(self.settings)
+        algorithm_source = get_algorithm_source(self.settings)
         try:
             resolved = await verify_tenant_token(
                 token,
                 tenant_id=tenant_id,
                 key_source=key_source,
                 default_issuer=self.settings.default_identity_issuer,
-                algorithms=(self.settings.jwt_algorithm,),
+                algorithm_source=algorithm_source,
             )
         except TenantTokenVerificationError as exc:
             if exc.reason is VerificationFailureReason.INVALID_OR_EXPIRED:
