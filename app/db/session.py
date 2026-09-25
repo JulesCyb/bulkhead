@@ -9,6 +9,11 @@ when it is checked back in (see `_reset_session_state` below). is_local=true set
 disappear at transaction end on their own, but a future bug that sets context at session scope
 (set_config(..., false) or plain SET, then commits) would otherwise survive in the pool and
 leak into whichever request happens to reuse that physical connection next.
+
+It also sets a per-transaction `statement_timeout` (SET LOCAL, Spec 7 / #55): a runaway query
+raises inside that transaction instead of holding the connection open past a configured deadline,
+so it degrades only the tenant that issued it. The engine's pool size, overflow, timeout, and
+recycle are explicit settings (app/config.py) rather than driver defaults.
 """
 
 from __future__ import annotations
@@ -45,7 +50,15 @@ def _reset_session_state(dbapi_connection: object, connection_record: Connection
 def get_engine() -> AsyncEngine:
     global _engine, _session_factory
     if _engine is None:
-        _engine = create_async_engine(get_settings().database_url, pool_pre_ping=True)
+        settings = get_settings()
+        _engine = create_async_engine(
+            settings.database_url,
+            pool_pre_ping=True,
+            pool_size=settings.db_pool_size,
+            max_overflow=settings.db_max_overflow,
+            pool_timeout=settings.db_pool_timeout,
+            pool_recycle=settings.db_pool_recycle,
+        )
         _session_factory = async_sessionmaker(_engine, expire_on_commit=False)
         event.listen(_engine.sync_engine, "checkin", _reset_session_state)
     return _engine
@@ -70,4 +83,8 @@ async def tenant_session(ctx: RequestContext) -> AsyncIterator[AsyncSession]:
                 text("SELECT set_config('app.user_id', :uid, true)"),
                 {"uid": str(ctx.user_id)},
             )
+            # SET does not accept bind parameters in Postgres; the value is a validated int from
+            # config, never user input, so interpolation here is safe.
+            timeout_ms = int(get_settings().db_statement_timeout_ms)
+            await session.execute(text(f"SET LOCAL statement_timeout = '{timeout_ms}ms'"))
             yield session

@@ -6,6 +6,10 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: app
       APP_DB_PASSWORD: ${APP_DB_PASSWORD:-app}
+      # Role-level settings for the app role, independent of the per-transaction statement
+      # timeout the app sets itself (Spec 7 / #55; see docker/postgres/01-init.sh).
+      APP_STATEMENT_TIMEOUT_MS: ${APP_STATEMENT_TIMEOUT_MS:-60000}
+      APP_CONNECTION_LIMIT: ${APP_CONNECTION_LIMIT:-50}
     volumes:
       - ./docker/postgres/01-init.sh:/docker-entrypoint-initdb.d/01-init.sh:ro
       - pgdata:/var/lib/postgresql/data
