@@ -87,7 +87,8 @@ migrations/           Alembic (async), 0001_initial.py as the template
 tests/                pytest; RLS integration test with pgserver
 docker/               Postgres init (app role), LiteLLM config
 docs/                 adr/, agents/ (skill config), frontend.md, mobile.md, deployment.md
-scripts/seed.py       first tenant + user
+app/operator/          operator tool: audited dispatch, tenant lookup, tenant listing (scripts/operator.py entry point)
+scripts/seed.py       first tenant + user (superseded by the operator tool's `create`, once it ships)
 ```
 
 ## Do not touch without checking first
