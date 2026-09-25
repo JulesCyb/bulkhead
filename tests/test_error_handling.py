@@ -138,13 +138,16 @@ async def test_chunked_body_under_the_cap_still_succeeds(monkeypatch, fake_searc
 
     from app.agents import assistant as assistant_module
     from app.api import chat as chat_module
+    from tests.conftest import resolve_to_model
 
     monkeypatch.setattr(assistant_module.document_tools, "search_documents", fake_search)
     monkeypatch.setattr(
         assistant_module.conversation_tools, "load_conversation_history", fake_history
     )
     monkeypatch.setattr(
-        chat_module, "get_model", lambda name=None: TestModel(call_tools=["search_documents"])
+        chat_module,
+        "resolve_chat_model",
+        resolve_to_model(TestModel(call_tools=["search_documents"])),
     )
     payload = _chat_body_json(text_len=100)
 
@@ -177,6 +180,13 @@ def _settings(environment: str) -> Settings:
         auth_mode="dev-headers" if environment != "prod" else "jwt",
         embedding_provider="openai",
         embedding_model="text-embedding-3-small",
+        # A prod-like environment must configure the networked MCP transport (issue #48 / #49) --
+        # the stdio transport's process-wide identity fallback is dev/test-only, guarded by
+        # check_mcp_mode the same way AUTH_MODE=dev-headers is.
+        mcp_transport="streamable-http" if environment == "prod" else "stdio",
+        jwt_verification_key="prod-like-settings-test-verification-key"
+        if environment == "prod"
+        else None,
     )
 
 

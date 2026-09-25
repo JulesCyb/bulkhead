@@ -1,7 +1,7 @@
 """Correlate a pending action with the model's own tool call (ADR-0007, Spec 5 / #40).
 
 Revision ID: 0038
-Revises: 0035
+Revises: 0024
 Create Date: 2026-09-25
 
 The writing-tool approval flow needs to find, on the *resumed* run, the exact pending action a
@@ -25,7 +25,7 @@ from collections.abc import Sequence
 from alembic import op
 
 revision: str = "0038"
-down_revision: str | None = "0035"
+down_revision: str | None = "0024"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

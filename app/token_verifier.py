@@ -7,19 +7,62 @@ to call this same function instead of writing a second copy of the check.
 Deliberately excluded: tenant suspension. That is not one of the checks this module owns -- each
 caller enforces it itself, wherever it resolves a context (issue #69), rather than having it baked
 into the one shared verification step.
+
+**Gap fix (Spec 6, closing the loop between #46/#47 and this module).** An agent identity's token
+(minted by `app/agent_credential_exchange.py`) is *not* governed by a tenant's own human-IdP
+`identity_issuer` setting: `control.create_agent_identity` (migration 0032) synthesizes every
+agent identity's issuer as the fixed literal `AGENT_IDENTITY_ISSUER` below, the same constant the
+exchange module signs with. This module peeks at a presented token's own (unverified) `iss` claim
+before deciding which issuer/key pair to check it against: `AGENT_IDENTITY_ISSUER` routes to the
+agent-token issuer directly (no tenant auth-settings lookup -- an agent token is tenant-independent
+by construction), and anything else falls back to the tenant's own configured issuer exactly as
+before. The peek is never trusted on its own: `verify_token` re-checks the real `iss` claim against
+whichever issuer this picks, under signature, so a forged `iss` that does not match its own
+signature still fails closed the same way it always did.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Final
 from uuid import UUID
+
+import jwt as _pyjwt
 
 from app.context import RequestContext
 from app.db.session import control_session, tenant_session
 from app.jwt_verifier import KeySource, TokenVerificationError, verify_token
 from app.repositories.control import IdentityRepository, TenantAuthSettingsRepository
 from app.repositories.memberships import MembershipRepository
+
+# The fixed issuer `control.create_agent_identity` (migration 0032) synthesizes for every agent
+# identity, and the issuer `app/agent_credential_exchange.py` mints agent tokens under. Never a
+# tenant's own (human-IdP) issuer -- an agent token is tenant-independent by construction, the
+# same credential-issuing tenant is instead enforced via the token's audience (below).
+AGENT_IDENTITY_ISSUER: Final[str] = "agent"
+
+
+def _peek_unverified_issuer(token: str) -> str | None:
+    """Read the `iss` claim without verifying signature/expiry -- used only to pick which
+    issuer/key pair to check the token against for real (see module docstring). Never used to
+    make a security decision by itself: `verify_token` re-verifies `iss` under signature
+    immediately afterward, so a token whose real `iss` disagrees with what this peek returned
+    (or whose signature does not match the key this later resolves to) still fails closed."""
+    try:
+        claims = _pyjwt.decode(
+            token,
+            options={
+                "verify_signature": False,
+                "verify_exp": False,
+                "verify_aud": False,
+                "verify_iss": False,
+            },
+        )
+    except _pyjwt.PyJWTError:
+        return None
+    issuer = claims.get("iss")
+    return issuer if isinstance(issuer, str) else None
 
 
 class VerificationFailureReason(StrEnum):
@@ -49,11 +92,18 @@ class TenantTokenVerificationError(Exception):
 
 @dataclass(frozen=True, slots=True)
 class ResolvedIdentity:
-    """What a token resolves to, once verified against one specific tenant."""
+    """What a token resolves to, once verified against one specific tenant.
+
+    `credential_public_id` is set only for an agent-identity token (issuer ==
+    `AGENT_IDENTITY_ISSUER`) that carries the `cred` claim `app/agent_credential_exchange.py`
+    embeds -- the credential that authenticated it, for a caller (the MCP transport, #49) that
+    needs to name it as `RequestContext`'s means. `None` for a person's token, which has no
+    credential to name."""
 
     identity_id: UUID
     role: str
     issuer: str
+    credential_public_id: str | None = None
 
 
 async def verify_tenant_token(
@@ -76,13 +126,18 @@ async def verify_tenant_token(
     that fails; returns the resolved identity and role on success. Never checks suspension --
     see module docstring.
     """
-    async with control_session() as session:
-        auth_settings = await TenantAuthSettingsRepository().get(
-            session, tenant_id=tenant_id, default_issuer=default_issuer
-        )
-    expected_issuer = auth_settings.issuer if auth_settings else default_issuer
-    if not expected_issuer:
-        raise TenantTokenVerificationError(VerificationFailureReason.INVALID_OR_EXPIRED)
+    if _peek_unverified_issuer(token) == AGENT_IDENTITY_ISSUER:
+        # An agent identity's token: tenant-independent issuer (see module docstring) -- skip the
+        # tenant auth-settings lookup entirely, since it has nothing to say about this issuer.
+        expected_issuer = AGENT_IDENTITY_ISSUER
+    else:
+        async with control_session() as session:
+            auth_settings = await TenantAuthSettingsRepository().get(
+                session, tenant_id=tenant_id, default_issuer=default_issuer
+            )
+        expected_issuer = auth_settings.issuer if auth_settings else default_issuer
+        if not expected_issuer:
+            raise TenantTokenVerificationError(VerificationFailureReason.INVALID_OR_EXPIRED)
 
     try:
         claims = verify_token(
@@ -119,4 +174,9 @@ async def verify_tenant_token(
             VerificationFailureReason.MISSING_MEMBERSHIP, issuer=expected_issuer
         )
 
-    return ResolvedIdentity(identity_id=identity.id, role=role, issuer=expected_issuer)
+    return ResolvedIdentity(
+        identity_id=identity.id,
+        role=role,
+        issuer=expected_issuer,
+        credential_public_id=claims.extra.get("cred"),
+    )

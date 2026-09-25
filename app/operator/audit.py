@@ -29,7 +29,15 @@ UNSCOPED_TENANT_ID = UUID(int=0)
 
 # Argument keys never written to the log, even under an operator's own audit trail -- secrets
 # never touch a database row (ADR-0011), only files.
-_REDACTED_ARG_KEYS = {"password", "secret", "token", "credential", "dsn", "database_url"}
+_REDACTED_ARG_KEYS = {
+    "password",
+    "secret",
+    "token",
+    "credential",
+    "dsn",
+    "database_url",
+    "dedicated_db_admin_url",
+}
 
 
 def redact_args(args: dict[str, Any]) -> dict[str, Any]:

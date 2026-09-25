@@ -9,7 +9,7 @@ import time
 import jwt
 import pytest
 
-from app.jwt_verifier import TokenVerificationError, verify_token
+from app.jwt_verifier import TokenVerificationError, mint_token, verify_token
 
 SECRET = "unit-test-shared-secret-at-least-32-bytes-long"
 ISSUER = "https://idp.example.com"
@@ -91,3 +91,47 @@ def test_verify_token_does_not_check_audience():
         token, key_source=_key_source, expected_issuer=ISSUER, algorithms=("HS256",)
     )
     assert claims.audience == "some-other-tenant"
+
+
+# --- mint_token / VerifiedClaims.extra (gap fix, Spec 6 / #49) ---
+
+
+def test_verify_token_has_no_extra_claims_by_default():
+    token = _make_token()
+    claims = verify_token(
+        token, key_source=_key_source, expected_issuer=ISSUER, algorithms=("HS256",)
+    )
+    assert claims.extra == {}
+
+
+def test_mint_token_round_trips_the_four_required_claims():
+    token = mint_token(
+        subject="sub-123",
+        issuer=ISSUER,
+        audience="tenant-abc",
+        signing_key=SECRET,
+        algorithm="HS256",
+        ttl_seconds=300,
+    )
+    claims = verify_token(
+        token, key_source=_key_source, expected_issuer=ISSUER, algorithms=("HS256",)
+    )
+    assert claims.subject == "sub-123"
+    assert claims.audience == "tenant-abc"
+    assert claims.extra == {}
+
+
+def test_mint_token_extra_claims_round_trip_through_verify_token():
+    token = mint_token(
+        subject="sub-123",
+        issuer=ISSUER,
+        audience="tenant-abc",
+        signing_key=SECRET,
+        algorithm="HS256",
+        ttl_seconds=300,
+        extra_claims={"cred": "agt_abc123"},
+    )
+    claims = verify_token(
+        token, key_source=_key_source, expected_issuer=ISSUER, algorithms=("HS256",)
+    )
+    assert claims.extra == {"cred": "agt_abc123"}

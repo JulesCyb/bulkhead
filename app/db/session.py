@@ -33,12 +33,21 @@ process-wide pooled engine and session factory as before this ticket; a dedicate
 served from its own engine, built and cached by the registry from its alias's tenant-secret
 file. Every caller keeps the exact same signature and transaction behaviour either way -- no
 repository, tool, or agent run needs to know or change anything.
+
+That same read is also where suspension is enforced (Spec 9 / #69, ADR-0010): `control.tenants_
+view` (migration 0024) now exposes `suspended_at` alongside isolation tier and database alias, and
+`_resolve_tenant_alias` raises `TenantSuspendedError` the moment it sees one set, before ever
+opening the tenant's session -- the same query every live request already makes to route the
+session, so this is the one seam every caller of `tenant_session()` shares (the HTTP API, the MCP
+server's tools, and an agent run alike), with no separate check for any of them to forget. A
+tenant with no control-plane row at all is not suspended (ADR-0002's pooled default).
 """
 
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from uuid import UUID
 
 from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import (
@@ -54,6 +63,17 @@ from app.context import RequestContext
 
 _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
+
+
+class TenantSuspendedError(RuntimeError):
+    """Raised by `tenant_session()` (and `app.tenant_suspension.ensure_tenant_not_suspended`,
+    which reuses this same exception type) when `tenant_id` is currently suspended. Callers map
+    this to their own transport's documented rejection status -- 403 for the HTTP API, a tool
+    error for the MCP server -- never to a raw 500."""
+
+    def __init__(self, tenant_id: UUID) -> None:
+        self.tenant_id = tenant_id
+        super().__init__(f"tenant {tenant_id} is suspended")
 
 
 def _reset_session_state(dbapi_connection: object, connection_record: ConnectionPoolEntry) -> None:
@@ -98,6 +118,10 @@ async def _resolve_tenant_alias(ctx: RequestContext) -> str:
     `isolation_tier` of `'pooled'`, both resolve to the pooled alias -- ADR-0002 defaults every
     tenant to pooled until an operator marks it dedicated, and the current test suite's tenants
     (seeded only in `public.tenants`, not `control.tenants`) rely on exactly that default.
+
+    Raises `TenantSuspendedError` if the tenant is currently suspended (Spec 9 / #69) -- before
+    this function, or its caller `tenant_session()`, ever opens a session against the tenant's
+    actual data.
     """
     from app.db.engine_registry import POOLED_ALIAS  # local import: avoids a circular import
 
@@ -111,8 +135,8 @@ async def _resolve_tenant_alias(ctx: RequestContext) -> str:
                 (
                     await session.execute(
                         text(
-                            "SELECT isolation_tier, database_alias FROM control.tenants_view "
-                            "WHERE tenant_id = :tid"
+                            "SELECT isolation_tier, database_alias, suspended_at "
+                            "FROM control.tenants_view WHERE tenant_id = :tid"
                         ),
                         {"tid": str(ctx.tenant_id)},
                     )
@@ -120,6 +144,9 @@ async def _resolve_tenant_alias(ctx: RequestContext) -> str:
                 .mappings()
                 .one_or_none()
             )
+
+    if row is not None and row["suspended_at"] is not None:
+        raise TenantSuspendedError(ctx.tenant_id)
 
     if row is None or row["isolation_tier"] == "pooled":
         return POOLED_ALIAS

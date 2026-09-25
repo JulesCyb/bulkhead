@@ -18,7 +18,7 @@ import httpx
 import jwt
 import pytest
 
-import app.deps as deps_module
+import app.tenant_suspension as tenant_suspension_module
 import app.token_verifier as token_verifier_module
 import app.tools.memberships as memberships_tools_module
 from app.config import Settings, get_settings
@@ -208,8 +208,9 @@ def _install_fake_control_plane(monkeypatch, *, auth_settings, identities, membe
         async def get_role(self, session, ctx: RequestContext, *, identity_id):
             return memberships.get((ctx.tenant_id, identity_id))
 
-    # The token check lives in app.token_verifier (#44); app.deps keeps only the suspension read.
-    for module in (deps_module, token_verifier_module):
+    # The token check lives in app.token_verifier (#44); the suspension check app.deps calls lives
+    # in app.tenant_suspension (#69) -- app.deps keeps neither copy itself.
+    for module in (tenant_suspension_module, token_verifier_module):
         monkeypatch.setattr(module, "control_session", _fake_session)
         monkeypatch.setattr(
             module, "TenantAuthSettingsRepository", FakeTenantAuthSettingsRepository

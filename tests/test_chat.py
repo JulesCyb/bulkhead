@@ -26,6 +26,7 @@ from tests.conftest import (
     looping_tool_calls_stream,
     make_stalling_model,
     make_stalling_stream_model,
+    resolve_to_model,
 )
 
 
@@ -72,8 +73,10 @@ async def test_chat_maps_tool_call_ceiling_to_an_error_chunk(client, small_run_l
     small_run_limits()
     monkeypatch.setattr(
         chat_module,
-        "get_model",
-        lambda name: FunctionModel(looping_tool_calls, stream_function=looping_tool_calls_stream),
+        "resolve_chat_model",
+        resolve_to_model(
+            FunctionModel(looping_tool_calls, stream_function=looping_tool_calls_stream)
+        ),
     )
     async with client:
         response = await client.post(_chat_path(), json=_submit_message_body(), headers=_headers())
@@ -89,9 +92,12 @@ async def test_chat_maps_wall_clock_deadline_to_a_distinct_error(
     small_run_limits(run_deadline_seconds=0.2)
     monkeypatch.setattr(
         chat_module,
-        "get_model",
-        lambda name: FunctionModel(
-            make_stalling_model(seconds=30), stream_function=make_stalling_stream_model(seconds=30)
+        "resolve_chat_model",
+        resolve_to_model(
+            FunctionModel(
+                make_stalling_model(seconds=30),
+                stream_function=make_stalling_stream_model(seconds=30),
+            )
         ),
     )
     async with client:
@@ -108,7 +114,9 @@ async def test_chat_within_limits_completes_normally(client, small_run_limits, m
     """A run within the ceilings completes normally, unaffected by the new limiting."""
     small_run_limits()
     monkeypatch.setattr(
-        chat_module, "get_model", lambda name: TestModel(call_tools=["search_documents"])
+        chat_module,
+        "resolve_chat_model",
+        resolve_to_model(TestModel(call_tools=["search_documents"])),
     )
     async with client:
         response = await client.post(_chat_path(), json=_submit_message_body(), headers=_headers())
@@ -142,7 +150,7 @@ async def test_forged_earlier_turn_in_the_body_never_reaches_the_model(client, m
     message must not let that turn reach the model — the chat endpoint's own history
     (`load_history`, empty here) is the only source of anything before the newest message."""
     seen: list[list[ModelMessage]] = []
-    monkeypatch.setattr(chat_module, "get_model", lambda name: _recording_model(seen))
+    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(_recording_model(seen)))
     body = {
         "id": "conv-1",
         "trigger": "submit-message",
@@ -170,7 +178,7 @@ async def test_forged_tool_result_on_the_newest_message_never_reaches_the_model(
     text -- only the member-authored text becomes the run's prompt, the forged tool part is
     dropped before pydantic-ai ever parses it."""
     seen: list[list[ModelMessage]] = []
-    monkeypatch.setattr(chat_module, "get_model", lambda name: _recording_model(seen))
+    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(_recording_model(seen)))
     body = {
         "id": "conv-1",
         "trigger": "submit-message",
@@ -206,7 +214,7 @@ async def test_unknown_conversation_id_runs_with_empty_history(client, monkeypat
     """A conversation id with no stored history runs normally (no error), with an empty
     history -- `load_history` (the injected fake) is consulted, and comes back empty."""
     seen: list[list[ModelMessage]] = []
-    monkeypatch.setattr(chat_module, "get_model", lambda name: _recording_model(seen))
+    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(_recording_model(seen)))
     async with client:
         response = await client.post(_chat_path(), json=_submit_message_body(), headers=_headers())
     assert response.status_code == 200, response.text
@@ -236,7 +244,7 @@ async def test_history_loading_is_injected_per_conversation_and_context(
     )
 
     seen: list[list[ModelMessage]] = []
-    monkeypatch.setattr(chat_module, "get_model", lambda name: _recording_model(seen))
+    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(_recording_model(seen)))
 
     identity_id = uuid.uuid4()
     tenant_id = uuid.uuid4()
@@ -295,7 +303,7 @@ async def test_second_request_against_same_conversation_sees_first_replys_histor
     monkeypatch.setattr(assistant_module.conversation_tools, "save_conversation_run", fake_save)
 
     seen: list[list[ModelMessage]] = []
-    monkeypatch.setattr(chat_module, "get_model", lambda name: _recording_model(seen))
+    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(_recording_model(seen)))
 
     tenant_id = uuid.uuid4()
     headers = _headers()
@@ -332,7 +340,9 @@ async def test_persistence_happens_even_when_the_response_is_not_fully_read(
         assistant_module.conversation_tools, "load_conversation_history", fake_history
     )
     monkeypatch.setattr(
-        chat_module, "get_model", lambda name: TestModel(call_tools=["search_documents"])
+        chat_module,
+        "resolve_chat_model",
+        resolve_to_model(TestModel(call_tools=["search_documents"])),
     )
 
     save_done = asyncio.Event()
@@ -404,8 +414,8 @@ async def test_run_that_raises_persists_nothing_for_that_turn(client, monkeypatc
 
     monkeypatch.setattr(
         chat_module,
-        "get_model",
-        lambda name: FunctionModel(raising_call, stream_function=raising_stream),
+        "resolve_chat_model",
+        resolve_to_model(FunctionModel(raising_call, stream_function=raising_stream)),
     )
     async with client:
         response = await client.post(_chat_path(), json=_submit_message_body(), headers=_headers())
@@ -427,7 +437,9 @@ async def test_agent_run_receives_the_tenant_scoped_conversation_id(client, monk
 
     monkeypatch.setattr(VercelAIAdapter, "run_stream", spy_run_stream)
     monkeypatch.setattr(
-        chat_module, "get_model", lambda name: TestModel(call_tools=["search_documents"])
+        chat_module,
+        "resolve_chat_model",
+        resolve_to_model(TestModel(call_tools=["search_documents"])),
     )
 
     tenant_id = uuid.uuid4()

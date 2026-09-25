@@ -1,14 +1,19 @@
-"""The MCP server's development-only context provider (identity_id naming, env-based) and its
-startup transport guard (issue #48 / ADR-0005)."""
+"""The MCP server's development-only context provider (identity_id naming, env-based), its
+suspension check (Spec 9 / #69, ADR-0010), and its startup transport guard (issue #48 /
+ADR-0005)."""
 
 from __future__ import annotations
 
 import uuid
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
 import pytest
 
+import app.tenant_suspension as tenant_suspension_module
 from app.config import Settings
 from app.mcp import server as mcp_server
+from app.tenant_suspension import TenantSuspendedError
 
 _VALID_KWARGS = {"embedding_provider": "openai", "embedding_model": "text-embedding-3-small"}
 
@@ -35,6 +40,43 @@ def test_retired_mcp_user_id_setting_is_not_silently_accepted(monkeypatch):
     monkeypatch.setattr(mcp_server, "get_settings", lambda: settings)
     with pytest.raises(RuntimeError):
         mcp_server._context_from_env()
+
+
+async def test_resolve_context_rejects_a_suspended_tenant_before_any_tool_runs(monkeypatch):
+    """The MCP connection handler's own, independent suspension check (#69, ADR-0010): raised by
+    `resolve_context()`, which every tool calls instead of `context_provider()` directly, before
+    any tool body -- here `search_documents` -- ever runs."""
+    tenant_id, identity_id = uuid.uuid4(), uuid.uuid4()
+    monkeypatch.setattr(
+        mcp_server,
+        "context_provider",
+        lambda: SimpleNamespace(tenant_id=tenant_id, identity_id=identity_id),
+    )
+
+    @asynccontextmanager
+    async def _fake_control_session():
+        yield None
+
+    class _FakeTenantAuthSettingsRepository:
+        async def get(self, session, *, tenant_id, default_issuer=None):
+            return SimpleNamespace(issuer=default_issuer, suspended=True)
+
+    monkeypatch.setattr(tenant_suspension_module, "control_session", _fake_control_session)
+    monkeypatch.setattr(
+        tenant_suspension_module,
+        "TenantAuthSettingsRepository",
+        _FakeTenantAuthSettingsRepository,
+    )
+
+    with pytest.raises(TenantSuspendedError):
+        await mcp_server.resolve_context()
+
+    async def _boom(*args, **kwargs):
+        pytest.fail("search_documents' tool body must not run for a suspended tenant")
+
+    monkeypatch.setattr(mcp_server.document_tools, "search_documents", _boom)
+    with pytest.raises(TenantSuspendedError):
+        await mcp_server.search_documents("query")
 
 
 # --- MCP transport setting (issue #48 / ADR-0005) ---
@@ -112,6 +154,32 @@ def test_check_mcp_mode_does_not_raise_for_stdio_in_dev_or_test():
                 **_VALID_KWARGS,
             )
         )  # no raise
+
+
+def test_main_still_serves_stdio_unchanged_in_development(monkeypatch):
+    """Issue #49's acceptance criterion 5: the local development entrypoint (`uv run python -m
+    app.mcp.server`) still starts and serves its tool over stdio, with no token involved, exactly
+    as it did before the networked transport existed -- `main()` never touches
+    `build_streamable_http_app`/`MCPTenantAuthMiddleware` for the stdio transport."""
+    settings = Settings(
+        _env_file=None,
+        environment="dev",
+        auth_mode="dev-headers",
+        mcp_transport="stdio",
+        **_VALID_KWARGS,
+    )
+    monkeypatch.setattr(mcp_server, "get_settings", lambda: settings)
+    monkeypatch.setattr(mcp_server, "run_startup_checks", lambda s: None)
+
+    calls: list[str] = []
+    monkeypatch.setattr(mcp_server.server, "run", lambda transport: calls.append(transport))
+
+    mcp_server.main()  # must not raise -- check_mcp_mode passes for stdio in dev
+
+    assert calls == ["stdio"]
+    # The stdio path's context provider is unchanged: still the process-wide env fallback, never
+    # the per-connection contextvar the networked transport uses.
+    assert mcp_server.context_provider is mcp_server._context_from_env
 
 
 def test_check_mcp_mode_does_not_raise_for_streamable_http_with_a_verifier_configured():

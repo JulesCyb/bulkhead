@@ -8,6 +8,18 @@ identifier, a wrong secret, and a revoked credential all resolve to `None` there
 same "tenant as audience" shape ADR-0012 already applies to person tokens applies here too, and a
 single module (`app/token_verifier.py`) verifies both kinds later.
 
+**Gap fix (Spec 6 / #49):** the minted token's issuer is the agent identity's *own* issuer
+(`token_verifier.AGENT_IDENTITY_ISSUER`, the fixed literal `control.create_agent_identity`
+synthesizes every agent identity's `issuer` column as) -- never the requesting tenant's own
+human-IdP issuer. The two used to be conflated here, which meant a real agent token could never
+verify: `verify_tenant_token` resolved the tenant's human issuer and checked the token's signature
+against `jwt_verification_key`, while this module signed with the separate
+`agent_token_signing_key`. Signing under the agent identity's real issuer lets the shared verifier
+recognize it (by peeking `iss`, see `app/token_verifier.py`) and check it against the matching key
+instead. The credential's own public id travels along as an extra `cred` claim so a caller
+resolving the token later (the MCP transport, #49) can name it as `RequestContext`'s means without
+a second lookup.
+
 This module raises exactly one exception, `AgentCredentialExchangeError`, for every way an
 exchange can fail -- the caller (`app/api/agent_tokens.py`) maps it to one generic response,
 never revealing which part of a bad attempt was wrong. The exception message is for logs only.
@@ -24,7 +36,8 @@ from app.context import RequestContext
 from app.db.session import control_session, tenant_session
 from app.jwt_verifier import mint_token
 from app.repositories.agent_credentials import AgentCredentialRepository
-from app.repositories.control import IdentityRepository, TenantAuthSettingsRepository
+from app.repositories.control import IdentityRepository
+from app.token_verifier import AGENT_IDENTITY_ISSUER
 
 # A well-known nil UUID, never a real identity: this exchange has no caller identity yet -- it is
 # how one is first obtained. It only ever scopes the one tenant-bound transaction that checks the
@@ -68,27 +81,31 @@ async def exchange_agent_credential(
 
     async with control_session() as session:
         identity = await IdentityRepository().get_by_id(session, identity_id=verified.identity_id)
-        auth_settings = await TenantAuthSettingsRepository().get(
-            session, tenant_id=tenant_id, default_issuer=settings.default_identity_issuer
-        )
     if identity is None:
         # Should not happen in practice (the credential's own FK guarantees the identity exists),
         # but never mint a token for an identity this exchange could not itself resolve.
         raise AgentCredentialExchangeError("credential's identity does not resolve")
 
-    issuer = auth_settings.issuer if auth_settings is not None else settings.default_identity_issuer
-    if not issuer:
-        raise AgentCredentialExchangeError("no token issuer configured for this tenant")
+    # Gap fix (see module docstring): the agent identity's own issuer, never the tenant's
+    # human-IdP one -- `control.create_agent_identity` (migration 0032) is the only writer of
+    # `identity.issuer` for an identity of kind agent, and it always synthesizes exactly this
+    # value. A mismatch here would mean this credential does not actually belong to an agent
+    # identity at all -- fail closed rather than mint a token nothing can later verify correctly.
+    if identity.issuer != AGENT_IDENTITY_ISSUER:
+        raise AgentCredentialExchangeError("credential's identity is not an agent identity")
     if settings.agent_token_signing_key is None:
         raise AgentCredentialExchangeError("no agent token signing key configured")
 
     ttl_seconds = settings.agent_token_ttl_seconds
     access_token = mint_token(
         subject=identity.subject,
-        issuer=issuer,
+        issuer=identity.issuer,
         audience=str(tenant_id),
         signing_key=settings.agent_token_signing_key.get_secret_value(),
         algorithm=settings.jwt_algorithm,
         ttl_seconds=ttl_seconds,
+        # The credential's own public id, so a caller resolving this token later (the MCP
+        # transport, #49) can name it as `RequestContext`'s means without a second lookup.
+        extra_claims={"cred": public_id},
     )
     return IssuedAgentToken(access_token=access_token, token_type="bearer", expires_in=ttl_seconds)

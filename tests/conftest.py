@@ -6,6 +6,7 @@ import asyncio
 import os
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 import pytest
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
@@ -27,7 +28,9 @@ os.environ.setdefault("EMBEDDING_MODEL", "text-embedding-3-small")
 os.environ.setdefault("ENVIRONMENT", "dev")
 os.environ.setdefault("AUTH_MODE", "dev-headers")
 
+from app.agents import assistant as assistant_module
 from app.agents.assistant import AssistantDeps, chat_assistant, one_shot_assistant
+from app.api import chat as chat_module
 from app.context import RequestContext
 from app.repositories.documents import DocumentHit
 
@@ -36,6 +39,35 @@ from app.repositories.documents import DocumentHit
 def ctx() -> RequestContext:
     return RequestContext(
         tenant_id=uuid.uuid4(), identity_id=uuid.uuid4(), roles=frozenset({"member"})
+    )
+
+
+@pytest.fixture(autouse=True)
+def not_suspended(monkeypatch):
+    """Default fake for `app.tenant_suspension.ensure_tenant_not_suspended`'s one control-plane
+    read (Spec 9 / #69): no test in this file-free suite has a real database, so by default every
+    tenant looks unsuspended -- mirroring the real repository's own "no control-plane row -> not
+    suspended" default (ADR-0002). Every caller (app/deps.py's dev-headers branch,
+    app/mcp/server.py, app/agents/assistant.py, app/api/chat.py) shares this one seam, so patching
+    it here once is enough for the whole ASGI/MCP/agent-run test suite; a test that wants a
+    suspended tenant re-patches `TenantAuthSettingsRepository.get` (or `control_session`) itself,
+    after this fixture runs, to report one before making its request.
+    """
+    import app.tenant_suspension as tenant_suspension_module
+
+    @asynccontextmanager
+    async def _fake_control_session():
+        yield None
+
+    class _FakeTenantAuthSettingsRepository:
+        async def get(self, session, *, tenant_id, default_issuer=None):
+            return None
+
+    monkeypatch.setattr(tenant_suspension_module, "control_session", _fake_control_session)
+    monkeypatch.setattr(
+        tenant_suspension_module,
+        "TenantAuthSettingsRepository",
+        _FakeTenantAuthSettingsRepository,
     )
 
 
@@ -104,8 +136,25 @@ def deps(ctx, fake_search, fake_history, fake_save) -> AssistantDeps:
     return AssistantDeps(ctx=ctx, search=fake_search, load_history=fake_history, save_run=fake_save)
 
 
+def resolve_to_model(model):
+    """Wraps `model` as a fake `resolve_chat_model` (Spec 8 / #61): the per-tenant, residency-
+    routed model resolver `app.agents.assistant.run_assistant`/`stream_assistant` and
+    `app.api.chat.chat` now call in place of the old, deployment-wide `app.llm.get_model()`.
+    Ignores `deps` entirely and always returns `model` — the test seam every ASGI test in this
+    suite uses to inject a `TestModel`/`FunctionModel` without a real database or gateway
+    credential file on disk. Patch both `app.agents.assistant.resolve_chat_model` (used by the
+    one-shot run/stream entry points) and `app.api.chat.resolve_chat_model` (its own
+    `from ... import` binding, a separate name to patch) to cover every entry point a test drives.
+    """
+
+    async def _resolve(deps):
+        return model
+
+    return _resolve
+
+
 @pytest.fixture
-def test_model():
+def test_model(monkeypatch):
     """TestModel calls every named tool once and answers deterministically.
 
     Overrides both agents (Spec 5 / #36 split) since a test may exercise either the one-shot
@@ -115,9 +164,14 @@ def test_model():
     own `args_validator` needs a real tenant-bound database session (it writes a pending action),
     which a test using this fixture is not set up to provide. A test that specifically exercises
     the writing tool builds its own `TestModel`/`FunctionModel` against a real database instead
-    (see `tests/test_writing_tool_approval_integration.py`).
+    (see `tests/test_writing_tool_approval_integration.py`). Also patches out per-tenant
+    residency-based model resolution (`resolve_to_model`, above) so no real database connection is
+    attempted before the override even takes effect.
     """
     tm = TestModel(call_tools=["search_documents"])
+    resolver = resolve_to_model(tm)
+    monkeypatch.setattr(assistant_module, "resolve_chat_model", resolver)
+    monkeypatch.setattr(chat_module, "resolve_chat_model", resolver)
     with one_shot_assistant.override(model=tm), chat_assistant.override(model=tm):
         yield tm
 

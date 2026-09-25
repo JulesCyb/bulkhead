@@ -100,6 +100,49 @@ async def test_a_denied_call_does_not_affect_a_later_unrelated_call(monkeypatch)
     assert healthy.is_error is False
 
 
+async def test_a_generic_exception_is_masked_and_never_reaches_the_caller(monkeypatch, caplog):
+    """Issue #49's acceptance criterion 4: a non-`PermissionError` exception raised inside a tool
+    (a database error, a model provider's raw error body, anything) comes back as the one generic
+    message (`mcp_server.GENERIC_TOOL_ERROR`), never its own text -- the real error is only in the
+    server-side log."""
+    monkeypatch.setattr(mcp_server, "context_provider", lambda: _context_with_role("member"))
+
+    async def _boom(ctx, query, limit=5):
+        raise RuntimeError('column "secret_column" does not exist -- a raw DB error')
+
+    monkeypatch.setattr(mcp_server.document_tools, "search_documents", _boom)
+
+    with caplog.at_level("ERROR"):
+        result = await _call("search_documents", {"query": "hello"})
+
+    assert result.is_error is True
+    # The MCP SDK's own tool dispatch (`ToolManager.call_tool`) wraps whatever text a raised
+    # exception carries as "Error executing tool <name>: <text>" -- what matters here is that the
+    # wrapped text is our generic message, never the original exception's.
+    assert mcp_server.GENERIC_TOOL_ERROR in result.content[0].text
+    assert "secret_column" not in result.content[0].text
+    # The real error is only in the server-side log (via `log.exception`, exc_info + traceback).
+    assert "secret_column" in caplog.text
+
+
+async def test_a_masked_exception_does_not_affect_a_later_unrelated_call(monkeypatch):
+    """The wrapper only replaces this one call's outcome -- a completely different, healthy tool
+    call on the same server instance afterward is unaffected."""
+    monkeypatch.setattr(mcp_server, "context_provider", lambda: _context_with_role("admin"))
+    _install_fake_memberships(monkeypatch, [])
+
+    async def _boom(ctx, query, limit=5):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(mcp_server.document_tools, "search_documents", _boom)
+    masked = await _call("search_documents", {"query": "hello"})
+    assert masked.is_error is True
+    assert mcp_server.GENERIC_TOOL_ERROR in masked.content[0].text
+
+    healthy = await _call("list_memberships")
+    assert healthy.is_error is False
+
+
 async def test_admin_call_still_succeeds_through_the_same_wrapper(monkeypatch):
     """The wrapper only intercepts a raised exception -- it never mangles a healthy result."""
     identity_id = uuid.uuid4()

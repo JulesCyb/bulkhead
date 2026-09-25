@@ -12,9 +12,10 @@ together across two real HTTP requests against a real database, in the exact ord
 see it.
 
 The model is swapped in the same way `tests/test_chat.py` already does --
-`monkeypatch.setattr(chat_module, "get_model", ...)` -- rather than `chat_assistant.override(...)`:
-the chat endpoint always passes an explicit `model=get_model(...)` into `adapter.run_stream(...)`,
-which shadows an agent-level `.override(model=...)` entirely.
+`monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(...))` -- rather than
+`chat_assistant.override(...)`: the chat endpoint always resolves an explicit model
+(`app.agents.assistant.resolve_chat_model`, per-tenant/residency routed, Spec 8 / #61) and passes
+it into `adapter.run_stream(...)`, which shadows an agent-level `.override(model=...)` entirely.
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from app.api import chat as chat_module
 from app.config import ROLE_STATEMENT_TIMEOUT_MS
 from app.main import app
+from tests.conftest import resolve_to_model
 
 pgserver = pytest.importorskip("pgserver")
 
@@ -443,7 +445,7 @@ async def test_pending_action_exists_before_the_deferred_approval_reaches_the_cl
     )
 
     model = _rename_model(document_id=document_id, title=NEW_TITLE)
-    monkeypatch.setattr(chat_module, "get_model", lambda name: model)
+    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(model))
 
     async with client:
         seen_chunk = False
@@ -483,7 +485,7 @@ async def test_approving_executes_exactly_once_and_response_reflects_the_change(
     )
 
     model = _rename_model(document_id=document_id, title=NEW_TITLE)
-    monkeypatch.setattr(chat_module, "get_model", lambda name: model)
+    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(model))
 
     async with client:
         await _propose(client, tenant_id, identity_id)
@@ -516,7 +518,7 @@ async def test_refusing_never_executes_and_the_conversation_continues(
     )
 
     model = _rename_model(document_id=document_id, title=NEW_TITLE)
-    monkeypatch.setattr(chat_module, "get_model", lambda name: model)
+    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(model))
 
     async with client:
         await _propose(client, tenant_id, identity_id)
@@ -560,7 +562,7 @@ async def test_tampered_arguments_on_approval_are_refused_nothing_executed(
     )
 
     model = _rename_model(document_id=document_id, title=NEW_TITLE)
-    monkeypatch.setattr(chat_module, "get_model", lambda name: model)
+    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(model))
 
     async with client:
         await _propose(client, tenant_id, identity_id)
@@ -608,7 +610,7 @@ async def test_role_downgraded_between_request_and_resume_is_refused(
     )
 
     model = _rename_model(document_id=document_id, title=NEW_TITLE)
-    monkeypatch.setattr(chat_module, "get_model", lambda name: model)
+    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(model))
 
     async with client:
         await _propose(client, tenant_id, identity_id)
@@ -648,7 +650,7 @@ async def test_expired_approval_is_refused_and_marked_expired(
     )
 
     model = _rename_model(document_id=document_id, title=NEW_TITLE)
-    monkeypatch.setattr(chat_module, "get_model", lambda name: model)
+    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(model))
 
     async with client:
         await _propose(client, tenant_id, identity_id)
@@ -690,7 +692,7 @@ async def test_writing_tool_goes_through_the_shared_repository_layer(
     )
 
     model = _rename_model(document_id=document_id, title=NEW_TITLE)
-    monkeypatch.setattr(chat_module, "get_model", lambda name: model)
+    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(model))
 
     async with client:
         await _propose(client, tenant_id, identity_id)
