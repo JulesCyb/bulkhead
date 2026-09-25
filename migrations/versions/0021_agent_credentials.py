@@ -1,7 +1,7 @@
 """Agent identity credentials (ADR-0005, Spec 6 / #45).
 
 Revision ID: 0021
-Revises: 0016
+Revises: 0012
 Create Date: 2026-09-25
 
 An agent identity's issued credential lives in its own tenant-scoped, durable record --
@@ -48,7 +48,7 @@ from collections.abc import Sequence
 from alembic import op
 
 revision: str = "0021"
-down_revision: str | None = "0016"
+down_revision: str | None = "0012"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
