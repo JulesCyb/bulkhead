@@ -41,6 +41,11 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
         PASSWORD '${APP_OWNER_DB_PASSWORD}';
     GRANT CONNECT ON DATABASE ${POSTGRES_DB} TO app_owner;
     ALTER SCHEMA public OWNER TO app_owner;
+    -- Schema-level ownership alone (above) does not let app_owner create a *new* schema:
+    -- that needs CREATE on the database itself. The control-plane schema (Spec 1 / #12) is
+    -- created by a migration running as app_owner, so this grant is the narrowest one that
+    -- makes that possible -- it does not hand app_owner anything beyond "may create schemas".
+    GRANT CREATE ON DATABASE ${POSTGRES_DB} TO app_owner;
 
     CREATE ROLE app LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE
         PASSWORD '${APP_DB_PASSWORD}' CONNECTION LIMIT ${APP_CONNECTION_LIMIT};

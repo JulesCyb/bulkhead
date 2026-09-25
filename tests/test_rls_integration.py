@@ -62,6 +62,7 @@ def database_urls():
         "CREATE EXTENSION IF NOT EXISTS vector; "
         "CREATE ROLE app_owner LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE; "
         "ALTER SCHEMA public OWNER TO app_owner; "
+        "GRANT CREATE ON DATABASE postgres TO app_owner; "
         "CREATE ROLE app LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE; "
         "GRANT USAGE ON SCHEMA public TO app; "
         f"ALTER ROLE app SET statement_timeout = '{ROLE_STATEMENT_TIMEOUT_MS}ms';",
@@ -308,6 +309,151 @@ async def test_new_table_gets_no_default_privileges(database_urls):
             await conn.execute(text("DROP TABLE IF EXISTS scratch_no_default_grants"))
         await engine.dispose()
     assert grants == []
+
+
+async def test_app_has_no_dml_on_control_schema_only_select_on_the_view(database_urls):
+    """The control-plane schema (#12): `app` gets no INSERT/UPDATE/DELETE anywhere in
+    `control`, only SELECT on the exposed read-only view."""
+    engine = create_async_engine(database_urls["app"])
+    async with engine.connect() as conn:
+        table_grants = (
+            await conn.execute(
+                text(
+                    "SELECT table_name, privilege_type FROM information_schema.table_privileges "
+                    "WHERE table_schema = 'control' AND grantee = 'app'"
+                )
+            )
+        ).all()
+    await engine.dispose()
+    assert set(table_grants) == {("tenants_view", "SELECT")}
+
+
+async def test_app_can_update_own_settings_but_not_other_tenant_columns(
+    app_settings, database_urls
+):
+    """Column-level grant (#12): `app` may UPDATE tenants.settings but nothing else on that
+    row -- rejected by Postgres's own privilege check, not by RLS/policy."""
+    from sqlalchemy.exc import DBAPIError
+
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+
+    tenant_a, _ = await _seed(database_urls["superuser"])
+    ctx_a = RequestContext(tenant_id=tenant_a, user_id=uuid.uuid4())
+
+    async with tenant_session(ctx_a) as session:
+        await session.execute(
+            text("UPDATE tenants SET settings = :s WHERE id = :tid"),
+            {"s": '{"k": "v"}', "tid": str(tenant_a)},
+        )
+        await session.commit()
+
+    with pytest.raises(DBAPIError):
+        async with tenant_session(ctx_a) as session:
+            await session.execute(
+                text("UPDATE tenants SET name = 'renamed' WHERE id = :tid"),
+                {"tid": str(tenant_a)},
+            )
+
+
+async def test_tenants_self_only_policy_validates_writes_too(database_urls):
+    """`tenants_self_only` (#12) now carries a WITH CHECK matching its USING clause: a write
+    that would move a row out of the caller's own tenant is rejected by the policy itself.
+
+    Runs as `app_owner`, not `app`: `app`'s column-level grant only permits UPDATE of
+    `settings`, which can never violate this check (it never touches `id`), so the check's own
+    enforcement can only be observed with a role that is allowed to update `id` in the first
+    place -- `app_owner` is such a role, and FORCE ROW LEVEL SECURITY (set in 0001) makes the
+    policy apply to the table owner too, not only to `app`.
+    """
+    from sqlalchemy.exc import DBAPIError
+
+    superuser_engine = create_async_engine(database_urls["superuser"])
+    tenant_a, tenant_b = uuid.uuid4(), uuid.uuid4()
+    async with superuser_engine.begin() as conn:
+        for tenant_id, name in ((tenant_a, "A"), (tenant_b, "B")):
+            await conn.execute(
+                text("INSERT INTO tenants (id, name) VALUES (:id, :name)"),
+                {"id": tenant_id, "name": name},
+            )
+    await superuser_engine.dispose()
+
+    engine = create_async_engine(database_urls["migrations"])
+    async with engine.connect() as conn:
+        await conn.execute(
+            text("SELECT set_config('app.tenant_id', :t, false)"), {"t": str(tenant_a)}
+        )
+        # Within its own tenant, an update that keeps id unchanged still satisfies WITH CHECK.
+        result = await conn.execute(
+            text("UPDATE tenants SET name = 'still A' WHERE id = :tid RETURNING id"),
+            {"tid": str(tenant_a)},
+        )
+        assert result.scalar_one() == tenant_a
+        await conn.commit()
+
+        # Re-pointing the row's own id away from the caller's tenant violates WITH CHECK: the
+        # USING clause lets the update reach the row (id still matches app.tenant_id going in),
+        # but the resulting row would no longer satisfy the same expression.
+        with pytest.raises(DBAPIError):
+            await conn.execute(
+                text("UPDATE tenants SET id = :new_id WHERE id = :tid"),
+                {"new_id": str(uuid.uuid4()), "tid": str(tenant_a)},
+            )
+    await engine.dispose()
+
+
+async def test_control_tenants_owned_by_app_owner_never_app(database_urls):
+    """The control-plane schema and its table are owned by `app_owner`, never `app` (#12)."""
+    engine = create_async_engine(database_urls["migrations"])
+    async with engine.connect() as conn:
+        schema_owner = (
+            await conn.execute(
+                text(
+                    "SELECT r.rolname FROM pg_namespace n "
+                    "JOIN pg_roles r ON r.oid = n.nspowner WHERE n.nspname = 'control'"
+                )
+            )
+        ).scalar_one()
+        table_owner = (
+            await conn.execute(
+                text(
+                    "SELECT tableowner FROM pg_tables "
+                    "WHERE schemaname = 'control' AND tablename = 'tenants'"
+                )
+            )
+        ).scalar_one()
+    await engine.dispose()
+    assert schema_owner == "app_owner"
+    assert table_owner == "app_owner"
+
+
+async def test_control_tenants_has_forced_rls_with_using_and_check(database_urls):
+    """`control.tenants` carries forced RLS with a policy that both restricts and validates,
+    the same shape as every other tenant-scoped table (#12)."""
+    engine = create_async_engine(database_urls["migrations"])
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text(
+                    "SELECT c.relrowsecurity, c.relforcerowsecurity FROM pg_class c "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE n.nspname = 'control' AND c.relname = 'tenants'"
+                )
+            )
+        ).one()
+        policy = (
+            await conn.execute(
+                text(
+                    "SELECT qual IS NOT NULL, with_check IS NOT NULL FROM pg_policies "
+                    "WHERE schemaname = 'control' AND tablename = 'tenants'"
+                )
+            )
+        ).one()
+    await engine.dispose()
+    assert row.relrowsecurity is True
+    assert row.relforcerowsecurity is True
+    assert policy[0] is True
+    assert policy[1] is True
 
 
 async def test_app_statement_timeout_matches_bootstrap(database_urls):
