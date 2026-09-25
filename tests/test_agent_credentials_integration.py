@@ -19,12 +19,16 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.config import ROLE_STATEMENT_TIMEOUT_MS  # noqa: E402
 from app.context import RequestContext  # noqa: E402
 from app.db.session import tenant_session  # noqa: E402
-from app.repositories.agent_credentials import AgentCredentialRepository  # noqa: E402
+from app.repositories.agent_credentials import (  # noqa: E402
+    AgentCredentialRepository,
+    UnknownAgentIdentity,
+)
 
 pgserver = pytest.importorskip("pgserver")
 
@@ -90,21 +94,37 @@ def app_settings(database_urls, monkeypatch):
 async def _seed_tenant_admin_and_agent(url: str) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
     """A tenant, an admin identity (the creator/actor), and an agent identity (what the
     credential belongs to) -- as the superuser, the same way test_rls_integration.py seeds
-    fixtures that need real control.identities rows in place before a tenant_session() write."""
+    fixtures that need real control.identities rows in place before a tenant_session() write.
+
+    The agent identity also gets a real `agent`-role membership in this tenant (and `kind =
+    'agent'` on its identity row) -- `AgentCredentialRepository.create` now requires exactly that
+    (review of #46, see `app/repositories/agent_credentials.py`), so a fixture that skipped it
+    would make every test below fail at the first `repo.create(...)` call, not exercise what it
+    claims to."""
     engine = create_async_engine(url)
     tenant_id, admin_id, agent_identity_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     async with engine.begin() as conn:
         await conn.execute(
             text("INSERT INTO tenants (id, name) VALUES (:id, 'Acme')"), {"id": tenant_id}
         )
-        for identity_id in (admin_id, agent_identity_id):
-            await conn.execute(
-                text(
-                    "INSERT INTO control.identities (id, issuer, subject) "
-                    "VALUES (:id, 'seed', :sub)"
-                ),
-                {"id": identity_id, "sub": str(identity_id)},
-            )
+        await conn.execute(
+            text("INSERT INTO control.identities (id, issuer, subject) VALUES (:id, 'seed', :sub)"),
+            {"id": admin_id, "sub": str(admin_id)},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO control.identities (id, issuer, subject, kind) "
+                "VALUES (:id, 'seed', :sub, 'agent')"
+            ),
+            {"id": agent_identity_id, "sub": str(agent_identity_id)},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO memberships (tenant_id, identity_id, role) "
+                "VALUES (:tenant_id, :identity_id, 'agent')"
+            ),
+            {"tenant_id": tenant_id, "identity_id": agent_identity_id},
+        )
     await engine.dispose()
     return tenant_id, admin_id, agent_identity_id
 
@@ -321,3 +341,130 @@ async def test_table_has_forced_rls_with_tenant_policy_and_no_delete_grant(
             )
         ).first()
     assert row is None
+
+
+# --- Review finding (#46, 2026-09-25): a credential must name an agent identity of the caller's
+# own tenant -- checked in the repository, and again by the database as a backstop. ---
+
+
+async def test_repository_refuses_a_cross_tenant_agent_identity(app_settings, database_urls):
+    """An admin of tenant A cannot mint a credential for tenant B's agent identity: the
+    repository's own membership check (not RLS, which never sees `identity_id` cross-tenant in
+    the first place -- this is a check against `memberships`, not `agent_credentials`) refuses it
+    before any row is written."""
+    tenant_a, admin_a, _ = await _seed_tenant_admin_and_agent(database_urls["superuser"])
+    _tenant_b, _admin_b, agent_b = await _seed_tenant_admin_and_agent(database_urls["superuser"])
+
+    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=admin_a)
+    repo = AgentCredentialRepository()
+    async with tenant_session(ctx_a) as session:
+        with pytest.raises(UnknownAgentIdentity):
+            await repo.create(session, ctx_a, identity_id=agent_b, name="should never exist")
+
+    engine = create_async_engine(database_urls["superuser"])
+    async with engine.connect() as conn:
+        count = (
+            await conn.execute(
+                text("SELECT count(*) FROM agent_credentials WHERE tenant_id = :tid"),
+                {"tid": tenant_a},
+            )
+        ).scalar_one()
+    await engine.dispose()
+    assert count == 0
+
+
+async def test_repository_refuses_a_person_identity_in_the_callers_own_tenant(
+    app_settings, database_urls
+):
+    """A membership that exists in the caller's own tenant but carries a role other than `agent`
+    (an ordinary person) is refused exactly like an unknown id -- `UnknownAgentIdentity` either
+    way, and no row written."""
+    tenant_id, admin_id, _ = await _seed_tenant_admin_and_agent(database_urls["superuser"])
+
+    engine = create_async_engine(database_urls["superuser"])
+    person_id = uuid.uuid4()
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("INSERT INTO control.identities (id, issuer, subject) VALUES (:id, 'seed', :sub)"),
+            {"id": person_id, "sub": str(person_id)},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO memberships (tenant_id, identity_id, role) "
+                "VALUES (:tenant_id, :identity_id, 'member')"
+            ),
+            {"tenant_id": tenant_id, "identity_id": person_id},
+        )
+    await engine.dispose()
+
+    ctx = RequestContext(tenant_id=tenant_id, identity_id=admin_id)
+    repo = AgentCredentialRepository()
+    async with tenant_session(ctx) as session:
+        with pytest.raises(UnknownAgentIdentity):
+            await repo.create(session, ctx, identity_id=person_id, name="should never exist")
+
+
+async def test_db_trigger_refuses_an_insert_that_bypasses_the_repository(
+    app_settings, database_urls
+):
+    """The migration-0041 trigger is the backstop: even a raw `INSERT` against `agent_credentials`
+    (as the `app` role, bypassing `AgentCredentialRepository.create` entirely) is refused unless
+    `identity_id` carries an `agent`-role membership in the same `tenant_id`. Proves the invariant
+    holds even if a future writer of this table never reads the repository's docstring."""
+    tenant_id, admin_id, _ = await _seed_tenant_admin_and_agent(database_urls["superuser"])
+
+    engine = create_async_engine(database_urls["superuser"])
+    person_id = uuid.uuid4()
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("INSERT INTO control.identities (id, issuer, subject) VALUES (:id, 'seed', :sub)"),
+            {"id": person_id, "sub": str(person_id)},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO memberships (tenant_id, identity_id, role) "
+                "VALUES (:tenant_id, :identity_id, 'member')"
+            ),
+            {"tenant_id": tenant_id, "identity_id": person_id},
+        )
+    await engine.dispose()
+
+    ctx = RequestContext(tenant_id=tenant_id, identity_id=admin_id)
+    async with tenant_session(ctx) as session:
+        with pytest.raises(DBAPIError):
+            await session.execute(
+                text(
+                    "INSERT INTO agent_credentials "
+                    "(tenant_id, identity_id, name, public_id, secret_hash) "
+                    "VALUES (:tenant_id, :identity_id, 'raw insert', 'agt_raw', repeat('a', 64))"
+                ),
+                {"tenant_id": tenant_id, "identity_id": person_id},
+            )
+        await session.rollback()
+
+
+async def test_db_trigger_allows_an_insert_for_a_real_agent_membership(app_settings, database_urls):
+    """The same trigger must not reject a legitimate insert -- proven directly, independent of
+    the repository, so the trigger's own logic (not just the repository's) is what is tested."""
+    tenant_id, admin_id, agent_id = await _seed_tenant_admin_and_agent(database_urls["superuser"])
+
+    ctx = RequestContext(tenant_id=tenant_id, identity_id=admin_id)
+    async with tenant_session(ctx) as session:
+        await session.execute(
+            text(
+                "INSERT INTO agent_credentials "
+                "(tenant_id, identity_id, name, public_id, secret_hash) "
+                "VALUES (:tenant_id, :identity_id, 'raw insert', 'agt_raw2', repeat('a', 64))"
+            ),
+            {"tenant_id": tenant_id, "identity_id": agent_id},
+        )
+
+    engine = create_async_engine(database_urls["superuser"])
+    async with engine.connect() as conn:
+        count = (
+            await conn.execute(
+                text("SELECT count(*) FROM agent_credentials WHERE public_id = 'agt_raw2'")
+            )
+        ).scalar_one()
+    await engine.dispose()
+    assert count == 1

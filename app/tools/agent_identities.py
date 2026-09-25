@@ -5,6 +5,13 @@ Each function checks `ctx.require_role("admin")` first, before any data access -
 pattern `app/tools/memberships.py` established (ADR-0004, S3-T1 / #26): a failed check raises
 `PermissionError`, turned into a 403 by the registered exception handler
 (`app.main.handle_permission_error`), never a 500.
+
+`issue_agent_credential` additionally relies on `AgentCredentialRepository.create` to raise
+`app.repositories.agent_credentials.UnknownAgentIdentity` (never letting a bad `identity_id`
+reach the database as anything other than that one exception, see that module's docstring) --
+turned into a 404 by `app.main.handle_unknown_agent_identity`, identical regardless of whether
+`identity_id` names nothing at all, another tenant's identity, or a person's identity in this
+tenant.
 """
 
 from __future__ import annotations

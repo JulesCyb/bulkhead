@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import uuid
 from urllib.parse import parse_qs, urlparse
 
 import httpx
@@ -171,8 +172,14 @@ async def _seed_every_tenant_table(url: str, *, tenant_id, identity_id, membersh
     `memberships` -- `create_tenant` already wrote the admin membership this helper's own foreign
     keys (`membership_id`) reuse. As the superuser: bypasses RLS entirely, exactly like `_seed` in
     `tests/test_rls_integration.py`, so this helper works unmodified against either the pooled
-    database or a dedicated tenant's own database."""
+    database or a dedicated tenant's own database.
+
+    `agent_credentials.identity_id` gets its own identity and `agent`-role membership here,
+    distinct from `identity_id` (the tenant's admin): migration 0041's trigger (review of #46)
+    refuses an `agent_credentials` row whose `identity_id` is not an `agent`-role membership of
+    the same tenant, and the admin's own membership is `admin`-role, not `agent`."""
     engine = create_async_engine(url)
+    agent_identity_id = uuid.uuid4()
     try:
         async with engine.begin() as conn:
             # documents.created_by/updated_by (migration 0010) default from the
@@ -193,11 +200,25 @@ async def _seed_every_tenant_table(url: str, *, tenant_id, identity_id, membersh
             )
             await conn.execute(
                 text(
+                    "INSERT INTO control.identities (id, issuer, subject, kind) "
+                    "VALUES (:aid, 'seed', :sub, 'agent')"
+                ),
+                {"aid": agent_identity_id, "sub": str(agent_identity_id)},
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO memberships (tenant_id, identity_id, role) "
+                    "VALUES (:tid, :aid, 'agent')"
+                ),
+                {"tid": tenant_id, "aid": agent_identity_id},
+            )
+            await conn.execute(
+                text(
                     "INSERT INTO agent_credentials "
                     "(tenant_id, identity_id, name, public_id, secret_hash, created_by) "
-                    "VALUES (:tid, :iid, 'Agent', 'pub-1', 'hash-1', :iid)"
+                    "VALUES (:tid, :aid, 'Agent', 'pub-1', 'hash-1', :iid)"
                 ),
-                {"tid": tenant_id, "iid": identity_id},
+                {"tid": tenant_id, "aid": agent_identity_id, "iid": identity_id},
             )
             await conn.execute(
                 text(

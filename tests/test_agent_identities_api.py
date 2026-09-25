@@ -21,7 +21,11 @@ import app.tools.agent_identities as agent_identities_tools_module
 import app.tools.memberships as memberships_tools_module
 from app.context import RequestContext
 from app.main import app
-from app.repositories.agent_credentials import CredentialRecord, IssuedCredential
+from app.repositories.agent_credentials import (
+    CredentialRecord,
+    IssuedCredential,
+    UnknownAgentIdentity,
+)
 from app.repositories.agent_identities import AgentIdentity
 from app.repositories.memberships import MembershipRecord
 
@@ -71,6 +75,24 @@ def _install_fakes(monkeypatch, world: _World):
         async def create(
             self, session, ctx: RequestContext, *, identity_id: uuid.UUID, name: str
         ) -> IssuedCredential:
+            # Mirrors the real `AgentCredentialRepository.create`'s own invariant (review of
+            # #46): `identity_id` must carry an `agent`-role membership in `ctx.tenant_id`,
+            # checked against this fake's own tenant-keyed dict the same way RLS would scope a
+            # real query -- an identity from another tenant's dict entry, or a person's
+            # membership in this tenant's own entry, is exactly as invisible here as it would be
+            # to the real repository.
+            role = next(
+                (
+                    m.role
+                    for m in world.memberships.get(ctx.tenant_id, [])
+                    if m.identity_id == identity_id
+                ),
+                None,
+            )
+            if role != "agent":
+                raise UnknownAgentIdentity(
+                    f"identity {identity_id} has no agent membership in this tenant"
+                )
             cred = _Credential(
                 id=uuid.uuid4(),
                 identity_id=identity_id,
@@ -304,3 +326,83 @@ async def test_identity_and_credential_are_isolated_per_tenant(monkeypatch):
     assert any(m["identity_id"] == identity_id for m in memberships_a)
     credentials_a = (await _list_credentials(tenant_a, admin_a)).json()["credentials"]
     assert len(credentials_a) == 1
+
+
+# --- Review finding (#46, 2026-09-25): issuing a credential must check identity_id is an agent
+# identity belonging to the caller's own tenant, not only that the caller is an admin ---
+
+
+async def test_issuing_credential_for_another_tenants_agent_identity_is_404_like_unknown_id(
+    monkeypatch,
+):
+    """An admin of tenant A must not be able to mint a credential naming tenant B's agent
+    identity -- and the response must be indistinguishable from asking about an id that does not
+    exist anywhere at all."""
+    world = _World()
+    _install_fakes(monkeypatch, world)
+    tenant_a = uuid.uuid4()
+    tenant_b = uuid.uuid4()
+    admin_a = _headers(uuid.uuid4(), "admin")
+    admin_b = _headers(uuid.uuid4(), "admin")
+
+    other_tenants_agent_id = (await _create_identity(tenant_b, admin_b)).json()["identity_id"]
+    unknown_id = str(uuid.uuid4())
+
+    cross_tenant_resp = await _issue_credential(tenant_a, other_tenants_agent_id, admin_a)
+    unknown_resp = await _issue_credential(tenant_a, unknown_id, admin_a)
+
+    for response in (cross_tenant_resp, unknown_resp):
+        assert response.status_code == 404, response.text
+        assert response.json() == {
+            "error": "not_found",
+            "message": "No such agent identity in this tenant.",
+        }
+    # And the same fixed body for both -- nothing distinguishes "exists, wrong tenant" from
+    # "doesn't exist anywhere".
+    assert cross_tenant_resp.json() == unknown_resp.json()
+
+    # Tenant B's own credential listing is untouched: no row was ever written for its identity.
+    credentials_b = (await _list_credentials(tenant_b, admin_b)).json()["credentials"]
+    assert credentials_b == []
+
+
+async def test_issuing_credential_for_a_person_identity_in_own_tenant_is_404(monkeypatch):
+    """A membership that exists in the caller's own tenant but is not `agent`-role (a person)
+    must be refused the same way an unknown id is -- never distinguished from it."""
+    world = _World()
+    _install_fakes(monkeypatch, world)
+    tenant_id = uuid.uuid4()
+    admin_headers = _headers(uuid.uuid4(), "admin")
+    person_identity_id = uuid.uuid4()
+    world.memberships.setdefault(tenant_id, []).append(
+        MembershipRecord(
+            id=uuid.uuid4(),
+            identity_id=person_identity_id,
+            role="member",
+            created_at=datetime.now(UTC),
+        )
+    )
+
+    resp = await _issue_credential(tenant_id, person_identity_id, admin_headers)
+
+    assert resp.status_code == 404, resp.text
+    assert resp.json() == {
+        "error": "not_found",
+        "message": "No such agent identity in this tenant.",
+    }
+    assert (await _list_credentials(tenant_id, admin_headers)).json()["credentials"] == []
+
+
+async def test_issuing_credential_for_the_tenants_own_agent_identity_still_works(monkeypatch):
+    """Happy path unchanged: an agent identity created and issued a credential in the same
+    tenant still succeeds exactly as before."""
+    world = _World()
+    _install_fakes(monkeypatch, world)
+    tenant_id = uuid.uuid4()
+    admin_headers = _headers(uuid.uuid4(), "admin")
+
+    identity_id = (await _create_identity(tenant_id, admin_headers)).json()["identity_id"]
+    resp = await _issue_credential(tenant_id, identity_id, admin_headers, name="prod-key")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["secret"] == "plaintext-secret-shown-exactly-once"
