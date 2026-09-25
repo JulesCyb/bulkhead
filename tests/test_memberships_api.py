@@ -19,6 +19,7 @@ import jwt
 import pytest
 
 import app.deps as deps_module
+import app.token_verifier as token_verifier_module
 import app.tools.memberships as memberships_tools_module
 from app.config import Settings, get_settings
 from app.context import RequestContext
@@ -207,13 +208,15 @@ def _install_fake_control_plane(monkeypatch, *, auth_settings, identities, membe
         async def get_role(self, session, ctx: RequestContext, *, identity_id):
             return memberships.get((ctx.tenant_id, identity_id))
 
-    monkeypatch.setattr(deps_module, "control_session", _fake_session)
-    monkeypatch.setattr(deps_module, "tenant_session", lambda ctx: _fake_session())
-    monkeypatch.setattr(
-        deps_module, "TenantAuthSettingsRepository", FakeTenantAuthSettingsRepository
-    )
-    monkeypatch.setattr(deps_module, "IdentityRepository", FakeIdentityRepository)
-    monkeypatch.setattr(deps_module, "MembershipRepository", FakeMembershipRepository)
+    # The token check lives in app.token_verifier (#44); app.deps keeps only the suspension read.
+    for module in (deps_module, token_verifier_module):
+        monkeypatch.setattr(module, "control_session", _fake_session)
+        monkeypatch.setattr(
+            module, "TenantAuthSettingsRepository", FakeTenantAuthSettingsRepository
+        )
+    monkeypatch.setattr(token_verifier_module, "tenant_session", lambda ctx: _fake_session())
+    monkeypatch.setattr(token_verifier_module, "IdentityRepository", FakeIdentityRepository)
+    monkeypatch.setattr(token_verifier_module, "MembershipRepository", FakeMembershipRepository)
 
 
 @pytest.fixture
