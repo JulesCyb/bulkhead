@@ -1874,3 +1874,30 @@ async def test_list_for_tenant_returns_every_role_unfiltered(app_settings, datab
 
     assert {record.role for record in records} == {"admin", "member", "support", "agent"}
     assert len(records) == 4
+
+
+async def test_app_cannot_widen_its_control_plane_view_with_the_migration_read_flag(
+    database_urls,
+):
+    """0016's migration-read policy exists for the owner-role migration runner only. `app` can
+    set any custom setting itself, so setting `app.control_migration_read` must still leave it
+    seeing nothing but its own tenant's control-plane row."""
+    tenant_a, tenant_b = uuid.uuid4(), uuid.uuid4()
+    owner = create_async_engine(database_urls["superuser"])
+    async with owner.begin() as conn:
+        for tid, name in ((tenant_a, "Flag A"), (tenant_b, "Flag B")):
+            await _insert_public_tenant(conn, tid, name)
+            await _insert_control_tenant(conn, tid, isolation_tier="pooled", database_alias=None)
+    await owner.dispose()
+
+    app = create_async_engine(database_urls["app"])
+    async with app.begin() as conn:
+        await conn.execute(text("SELECT set_config('app.control_migration_read', 'true', true)"))
+        await conn.execute(
+            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": str(tenant_a)}
+        )
+        visible = (
+            (await conn.execute(text("SELECT tenant_id FROM control.tenants_view"))).scalars().all()
+        )
+    await app.dispose()
+    assert visible == [tenant_a]

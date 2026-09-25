@@ -1,7 +1,7 @@
 """A migration-runner-only way to enumerate every database alias across all tenants.
 
 Revision ID: 0016
-Revises: 0008
+Revises: 0009
 Create Date: 2026-09-25
 
 `control.database_aliases` (0005/#73) is a plain, `security_invoker` view over `control.tenants`,
@@ -37,7 +37,7 @@ from collections.abc import Sequence
 from alembic import op
 
 revision: str = "0016"
-down_revision: str | None = "0008"
+down_revision: str | None = "0009"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -47,7 +47,14 @@ def upgrade() -> None:
         """
         CREATE POLICY control_tenants_migration_read ON control.tenants
             FOR SELECT
-            USING (current_setting('app.control_migration_read', true) = 'true')
+            -- session_user, not current_user: any role may set a custom setting, and
+            -- control.tenants_view runs with its owner's rights, so the flag alone would let
+            -- `app` read every tenant's row through the view. Only a login as app_owner (the
+            -- migration runner) can ever satisfy this policy.
+            USING (
+                session_user = 'app_owner'
+                AND current_setting('app.control_migration_read', true) = 'true'
+            )
         """
     )
 
