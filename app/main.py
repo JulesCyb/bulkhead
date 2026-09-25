@@ -9,7 +9,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import APIRouter, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import agents, chat, health
@@ -67,9 +67,14 @@ def create_app() -> FastAPI:
             response.headers["X-Request-Id"] = request_id
         return response
 
+    # ADR-0012: every tenant-scoped route lives under /v1/t/{tenant_id}/ — the path segment is
+    # the request's sole statement of intent. `health` is not tenant-scoped and stays outside it.
+    tenant_router = APIRouter(prefix="/v1/t/{tenant_id}")
+    tenant_router.include_router(agents.router)
+    tenant_router.include_router(chat.router)
+
     app.include_router(health.router)
-    app.include_router(agents.router)
-    app.include_router(chat.router)
+    app.include_router(tenant_router)
     return app
 
 

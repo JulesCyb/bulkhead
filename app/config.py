@@ -100,8 +100,9 @@ class Settings(BaseSettings):
     mcp_tenant_id: str | None = None
     mcp_identity_id: str | None = None
 
-    # Per-membership request limit on the agent-facing routes (/agents/assistant/run,
-    # /agents/assistant/stream, /api/chat): a single-process, best-effort backstop against a
+    # Per-membership request limit on the agent-facing routes
+    # (/v1/t/{tenant_id}/agents/assistant/run, /v1/t/{tenant_id}/agents/assistant/stream,
+    # /v1/t/{tenant_id}/api/chat): a single-process, best-effort backstop against a
     # stuck client or a scripted flood, keyed on (tenant_id, identity_id). It is NOT the enforcement
     # of record for spend — that is the model gateway's own per-tenant budget; this only keeps a
     # single member's flood from denting that budget before the gateway ever notices, and only

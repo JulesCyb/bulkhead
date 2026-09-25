@@ -36,9 +36,9 @@ uv run uvicorn app.main:app --reload
 First call (dev headers are enough locally):
 
 ```bash
-curl -X POST localhost:8000/agents/assistant/run \
+curl -X POST localhost:8000/v1/t/<TENANT>/agents/assistant/run \
   -H 'Content-Type: application/json' \
-  -H 'X-Tenant-Id: <TENANT>' -H 'X-Identity-Id: <IDENTITY>' \
+  -H 'X-Identity-Id: <IDENTITY>' \
   -d '{"prompt": "What do my documents say about notice periods?"}'
 ```
 
@@ -49,14 +49,14 @@ Tests: `uv run pytest` — the RLS integration test is skipped when `pgserver` i
 | Building block | File | Purpose |
 |---|---|---|
 | Context object | `app/context.py` | `tenant_id`, `identity_id`, roles — passed through everywhere |
-| Auth (dev) | `app/deps.py` | `X-Tenant-Id`/`X-Identity-Id` headers locally; JWT slot prepared |
+| Auth (dev) | `app/deps.py` | tenant from the URL path, `X-Identity-Id` header locally; JWT slot prepared |
 | Tenant session | `app/db/session.py` | `set_config('app.tenant_id', …)` per transaction |
 | Schema + RLS | `migrations/versions/0001_initial.py` | tenants, users, documents (vector 1536), policies, grants |
 | App role | `docker/postgres/01-init.sh` | `app` without superuser/BYPASSRLS — otherwise RLS is void |
 | Repository | `app/repositories/documents.py` | the only path to the DB, vector search |
 | Tools | `app/tools/documents.py` | context-aware search, shared by agent and MCP |
 | Agent | `app/agents/assistant.py` | PydanticAI agent, model resolved at runtime, tracing metadata |
-| API | `app/api/` | `/agents/assistant/run`, `/agents/assistant/stream` (SSE), `/api/chat` (Vercel AI SDK) |
+| API | `app/api/` | `/v1/t/{tenant_id}/agents/assistant/run`, `/v1/t/{tenant_id}/agents/assistant/stream` (SSE), `/v1/t/{tenant_id}/api/chat` (Vercel AI SDK) |
 | MCP server | `app/mcp/server.py` | the same tools for Claude Code / Claude Desktop |
 | Models | `app/llm.py`, `app/embeddings.py` | provider abstraction, LiteLLM option |
 | Tracing | `app/observability.py` | Langfuse via OTel (optional) |

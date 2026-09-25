@@ -15,7 +15,7 @@ ADR wins — then update this file.
 - Models: `LLM_MODEL` in `<provider>:<model>` format, optionally through the LiteLLM gateway (`app/llm.py`)
 - Data: PostgreSQL 17 + pgvector, RLS on, app role `app` (no superuser)
 - Observability: Langfuse via OTel (`app/observability.py`, optionally `logfire`)
-- Frontend: none in this repo — Next.js + Vercel AI SDK against `POST /api/chat`, see `docs/frontend.md`; a mobile app as another client, see `docs/mobile.md`
+- Frontend: none in this repo — Next.js + Vercel AI SDK against `POST /v1/t/{tenant_id}/api/chat`, see `docs/frontend.md`; a mobile app as another client, see `docs/mobile.md`
 - Operations: Docker Compose (`docker-compose.yml`), hosted in an EU region
 
 ## Commands
@@ -78,7 +78,7 @@ app/db/               engine, tenant_session(), models
 app/repositories/     data access (the only path to the DB)
 app/tools/            tool functions (agent + MCP)
 app/agents/           PydanticAI agents
-app/api/              routers: /health, /agents/assistant/{run,stream}, /api/chat
+app/api/              routers: /health, /v1/t/{tenant_id}/agents/assistant/{run,stream}, /v1/t/{tenant_id}/api/chat
 app/mcp/server.py     MCP server (stdio)
 app/llm.py            provider abstraction; app/embeddings.py; app/observability.py
 migrations/           Alembic (async), 0001_initial.py as the template

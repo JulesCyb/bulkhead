@@ -40,13 +40,17 @@ def client(monkeypatch, captured_ctx, test_model):
 
 
 def _headers() -> dict[str, str]:
-    return {"X-Tenant-Id": str(uuid.uuid4()), "X-Identity-Id": str(uuid.uuid4())}
+    return {"X-Identity-Id": str(uuid.uuid4())}
+
+
+def _tenant_path(suffix: str) -> str:
+    return f"/v1/t/{uuid.uuid4()}{suffix}"
 
 
 async def test_run_endpoint_carries_request_id_header(client, captured_ctx):
     async with client:
         response = await client.post(
-            "/agents/assistant/run", json={"prompt": "Hi"}, headers=_headers()
+            _tenant_path("/agents/assistant/run"), json={"prompt": "Hi"}, headers=_headers()
         )
     assert response.status_code == 200, response.text
     assert captured_ctx
@@ -56,7 +60,10 @@ async def test_run_endpoint_carries_request_id_header(client, captured_ctx):
 async def test_stream_endpoint_carries_request_id_header(client, captured_ctx):
     async with client:
         async with client.stream(
-            "POST", "/agents/assistant/stream", json={"prompt": "Hi"}, headers=_headers()
+            "POST",
+            _tenant_path("/agents/assistant/stream"),
+            json={"prompt": "Hi"},
+            headers=_headers(),
         ) as response:
             assert response.status_code == 200
             header_value = response.headers[HEADER]
@@ -75,7 +82,7 @@ async def test_chat_endpoint_carries_request_id_header(monkeypatch):
         "messages": [{"id": "m1", "role": "user", "parts": [{"type": "text", "text": "Hi"}]}],
     }
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.post("/api/chat", json=body, headers=_headers())
+        response = await client.post(_tenant_path("/api/chat"), json=body, headers=_headers())
     assert response.status_code == 200, response.text
     assert response.headers.get(HEADER)
 
@@ -85,14 +92,14 @@ async def test_one_shot_endpoints_stay_stateless_shape(client, captured_ctx):
     and their response shape (`{"output": ...}` only) is unchanged by this header addition."""
     async with client:
         run_response = await client.post(
-            "/agents/assistant/run",
+            _tenant_path("/agents/assistant/run"),
             json={"prompt": "What does the contract say?"},
             headers=_headers(),
         )
         stream_headers = _headers()
         async with client.stream(
             "POST",
-            "/agents/assistant/stream",
+            _tenant_path("/agents/assistant/stream"),
             json={"prompt": "What does the contract say?"},
             headers=stream_headers,
         ) as stream_response:
@@ -110,6 +117,6 @@ async def test_one_shot_endpoints_stay_stateless_shape(client, captured_ctx):
 
 async def test_missing_context_fails_before_header_logic(client):
     async with client:
-        response = await client.post("/agents/assistant/run", json={"prompt": "Hi"})
+        response = await client.post(_tenant_path("/agents/assistant/run"), json={"prompt": "Hi"})
     assert response.status_code == 401
     assert HEADER not in response.headers

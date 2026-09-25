@@ -1,12 +1,14 @@
 """Two agents, split by what they are allowed to attempt (ADR-0007, Spec 5 / #36).
 
 - **one_shot_assistant**: reading tools only. Used exclusively by the one-shot endpoints
-  (`/agents/assistant/run`, `/agents/assistant/stream`). No writing tool is ever registered on
+  (`/v1/t/{tenant_id}/agents/assistant/run`, `/v1/t/{tenant_id}/agents/assistant/stream`). No
+  writing tool is ever registered on
   it, so those endpoints cannot propose a write by construction — they have no way to carry an
   approval round-trip across requests, so the guarantee has to come from the agent itself, not
   from a convention someone could forget.
 - **chat_assistant**: every reading tool, plus (from a later ticket) the example writing tool.
-  Used exclusively by `/api/chat`, where a conversation and an approval round-trip both exist.
+  Used exclusively by `/v1/t/{tenant_id}/api/chat`, where a conversation and an approval
+  round-trip both exist.
 
 Kept as two separate `Agent` objects (not one agent with a flag) so that wiring a writing tool
 into the one-shot agent is a change to code that doesn't exist, not a config toggle to flip back.
@@ -94,7 +96,7 @@ _register_reading_tools(chat_assistant)
 
 
 async def run_assistant(prompt: str, deps: AssistantDeps) -> str:
-    """Runs the one-shot (reading-only) agent — backs `/agents/assistant/run`."""
+    """Runs the one-shot (reading-only) agent — backs `/v1/t/{tenant_id}/agents/assistant/run`."""
     result = await one_shot_assistant.run(
         prompt,
         deps=deps,
@@ -107,7 +109,7 @@ async def run_assistant(prompt: str, deps: AssistantDeps) -> str:
 def stream_assistant(prompt: str, deps: AssistantDeps):
     """Async context manager yielding a StreamedRunResult; use it via `async with` in routes.
 
-    Backs `/agents/assistant/stream` — runs the one-shot (reading-only) agent.
+    Backs `/v1/t/{tenant_id}/agents/assistant/stream` — runs the one-shot (reading-only) agent.
     """
     return one_shot_assistant.run_stream(
         prompt,
