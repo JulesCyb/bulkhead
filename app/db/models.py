@@ -93,6 +93,37 @@ class Membership(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class AgentCredential(Base):
+    """A credential issued for an agent identity's automation (ADR-0005, Spec 6 / #45).
+
+    `identity_id` is the *agent* identity the credential authenticates as; `created_by` is the
+    (typically human, admin-role) identity that issued it -- the same actor/means split
+    documents' created_by/updated_by draws, applied here to who-issued vs. who-it-is-for instead
+    of who-wrote vs. who-last-touched. `public_id` and `secret_hash` are deliberately separate
+    columns: verification is a direct lookup by `public_id` (UNIQUE with tenant_id, indexed),
+    never a scan comparing a presented secret against every hash a tenant has issued."""
+
+    __tablename__ = "agent_credentials"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "public_id"),
+        Index("agent_credentials_tenant_idx", "tenant_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[UUID] = mapped_column(ForeignKey("tenants.id"))
+    identity_id: Mapped[UUID] = mapped_column(ForeignKey("control.identities.id"))
+    name: Mapped[str] = mapped_column(String(200))
+    public_id: Mapped[str] = mapped_column(String(64))
+    secret_hash: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_by: Mapped[UUID] = mapped_column(
+        ForeignKey("control.identities.id"),
+        server_default=text("current_setting('app.identity_id', true)::uuid"),
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class Document(Base):
     __tablename__ = "documents"
     __table_args__ = (Index("documents_tenant_idx", "tenant_id"),)
