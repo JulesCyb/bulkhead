@@ -767,3 +767,31 @@ async def test_app_statement_timeout_matches_bootstrap(database_urls):
         ).scalar_one()
     await engine.dispose()
     assert int(timeout_ms) == ROLE_STATEMENT_TIMEOUT_MS
+
+
+async def test_tenant_auth_settings_does_not_switch_the_callers_tenant_context(
+    app_settings, database_urls
+):
+    """control.tenant_auth_settings() sets app.tenant_id internally to satisfy the forced RLS
+    policy on control.tenants. It must restore the caller's context before returning —
+    otherwise calling it for tenant B inside tenant A's session would leave the rest of that
+    transaction running as tenant B."""
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.repositories.documents import DocumentRepository
+
+    tenant_a, tenant_b = await _seed(database_urls["superuser"])
+    query = [0.0] * DIM
+    query[0] = 1.0
+
+    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
+    async with tenant_session(ctx_a) as session:
+        await session.execute(
+            text("SELECT * FROM control.tenant_auth_settings(:tid)"), {"tid": tenant_b}
+        )
+        still_a = (
+            await session.execute(text("SELECT current_setting('app.tenant_id', true)"))
+        ).scalar_one()
+        hits = await DocumentRepository().search(session, query, limit=10)
+    assert still_a == str(tenant_a)
+    assert [h.title for h in hits] == ["Document A"]

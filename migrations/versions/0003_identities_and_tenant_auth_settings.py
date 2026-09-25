@@ -21,8 +21,9 @@ sets no tenant context (app/db/session.py's `control_session()`), so a SECURITY 
 owned by `app_owner` would still see zero rows for that same reason. `control.tenant_auth_settings`
 works around this the one way that stays narrow: it sets `app.tenant_id` to its own
 `p_tenant_id` argument, transaction-local only (`is_local=true`), immediately before reading --
-satisfying the policy for exactly the one named tenant the caller asked about, never any other,
-and never as a session-wide setting a later query in the same transaction could ride along on.
+satisfying the policy for exactly the one named tenant the caller asked about -- and restores the
+caller's previous value before returning, so a later query in the same transaction never rides
+along on it.
 This function, plus `control.identity_lookup`, are the only two narrow reads a control-plane
 session may make (see `control_session()`'s docstring); neither is ever used against a tenant's
 own tables.
@@ -79,12 +80,18 @@ def upgrade() -> None:
         SECURITY DEFINER
         SET search_path = control, pg_temp
         AS $$
+        DECLARE
+            caller_tenant text := current_setting('app.tenant_id', true);
         BEGIN
             PERFORM set_config('app.tenant_id', p_tenant_id::text, true);
             RETURN QUERY
                 SELECT t.identity_issuer, t.suspended_at
                 FROM control.tenants t
                 WHERE t.tenant_id = p_tenant_id;
+            -- Restore the caller's tenant context: without this, calling the function for
+            -- tenant B inside tenant A's session would leave the rest of that transaction
+            -- running as tenant B.
+            PERFORM set_config('app.tenant_id', coalesce(caller_tenant, ''), true);
         END;
         $$
         """
