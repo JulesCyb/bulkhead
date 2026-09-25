@@ -20,6 +20,7 @@ import argparse
 import asyncio
 import os
 from datetime import UTC, datetime
+from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
@@ -27,6 +28,7 @@ from app.migration_settings import get_migration_settings
 from app.operator.audit import UNSCOPED_TENANT_ID, record_action
 from app.operator.create import create_tenant
 from app.operator.listing import list_tenants
+from app.operator.suspend import set_tenant_suspended
 
 OPERATOR_IDENTITY_ENV_VAR = "OPERATOR_IDENTITY"
 
@@ -38,7 +40,7 @@ def _operator_identity() -> str:
     return os.environ.get(OPERATOR_IDENTITY_ENV_VAR) or os.environ.get("USER", "unknown")
 
 
-async def _run_list(conn: AsyncConnection, args: argparse.Namespace) -> str:
+async def _run_list(conn: AsyncConnection, args: argparse.Namespace) -> tuple[str, None]:
     tenants = await list_tenants(conn)
     if not tenants:
         print("No tenants in the control plane.")
@@ -48,45 +50,81 @@ async def _run_list(conn: AsyncConnection, args: argparse.Namespace) -> str:
             f"residency={t.residency or '-':6}  alias={t.database_alias or '-':12}  "
             f"suspended={t.suspended}"
         )
-    return f"ok: listed {len(tenants)} tenant(s)"
+    # `list` has no single target tenant -- it targets every tenant -- so its audit row uses the
+    # documented sentinel (see app.operator.audit), not a real id.
+    return f"ok: listed {len(tenants)} tenant(s)", None
 
 
-async def _run_create(conn: AsyncConnection, args: argparse.Namespace) -> str:
+async def _run_suspend_or_unsuspend(
+    conn: AsyncConnection, args: argparse.Namespace, *, suspended: bool
+) -> tuple[str, UUID]:
+    verb = "suspended" if suspended else "unsuspended"
+    result = await set_tenant_suspended(conn, args.identifier, suspended=suspended)
+    if not result.changed:
+        outcome = f"no-op: {result.name!r} ({result.tenant_id}) was already {verb}"
+    else:
+        outcome = f"ok: {result.name!r} ({result.tenant_id}) is now {verb}"
+    print(outcome)
+    return outcome, result.tenant_id
+
+
+async def _run_suspend(conn: AsyncConnection, args: argparse.Namespace) -> tuple[str, UUID]:
+    return await _run_suspend_or_unsuspend(conn, args, suspended=True)
+
+
+async def _run_unsuspend(conn: AsyncConnection, args: argparse.Namespace) -> tuple[str, UUID]:
+    return await _run_suspend_or_unsuspend(conn, args, suspended=False)
+
+
+async def _run_create(conn: AsyncConnection, args: argparse.Namespace) -> tuple[str, UUID]:
     result = await create_tenant(
         conn,
         tenant_name=args.tenant_name,
         residency=args.residency,
         admin_email=args.admin_email,
         model=args.model,
+        isolation_tier=args.isolation_tier,
+        dedicated_db_admin_url=args.dedicated_db_admin_url,
         issuer=args.issuer,
         subject=args.subject,
     )
     print(f"MCP_TENANT_ID={result.tenant_id}")
     print(f"MCP_IDENTITY_ID={result.identity_id}")
     print(f"Gateway credential alias: {result.gateway_credential_alias}")
+    if result.isolation_tier == "dedicated":
+        print(f"Database alias: {result.database_alias}")
     print(
         f"control-plane record: {result.control_plane}; "
         f"gateway credential: {result.gateway_credential}; "
         f"admin membership: {result.admin_membership}"
+        + (
+            f"; dedicated database: {result.dedicated_database}"
+            if result.isolation_tier == "dedicated"
+            else ""
+        )
     )
     print(
         f"\ncurl -H 'X-Identity-Id: {result.identity_id}' "
         f"http://localhost:8000/v1/t/{result.tenant_id}/agents/assistant/run ..."
     )
-    return (
+    outcome = (
         f"ok: tenant {result.tenant_id} "
         f"(control-plane: {result.control_plane}, "
+        f"isolation tier: {result.isolation_tier}, "
         f"gateway: {result.gateway_credential}, "
         f"membership: {result.admin_membership})"
     )
+    return outcome, result.tenant_id
 
 
 # Every command's target tenant id for the audit log. `list` has none -- it targets every
-# tenant, not one -- so it uses the documented sentinel (see app.operator.audit). `create`
-# resolves or mints its own tenant id as part of the command itself, so it uses the same
-# sentinel here too rather than threading a second return value through this dispatch table.
+# tenant, not one -- so it uses the documented sentinel (see app.operator.audit). Every other
+# command resolves or mints a real tenant id as part of its own work, so it returns that id here
+# rather than the sentinel.
 _COMMANDS = {
     "list": _run_list,
+    "suspend": _run_suspend,
+    "unsuspend": _run_unsuspend,
     "create": _run_create,
 }
 
@@ -96,13 +134,17 @@ async def _run(command: str, args: argparse.Namespace) -> int:
     engine = create_async_engine(dsn)
     started_at = datetime.now(UTC)
     outcome = "error"
+    target_tenant_id: UUID | None = None
     error: str | None = None
     exit_code = 1
     try:
         async with engine.begin() as conn:
-            outcome = await _COMMANDS[command](conn, args)
+            outcome, target_tenant_id = await _COMMANDS[command](conn, args)
         exit_code = 0
     except Exception as exc:  # noqa: BLE001 - recorded below, then re-raised as a nonzero exit
+        # A lookup failure (TenantNotFoundError/AmbiguousTenantNameError) never resolved a real
+        # tenant, so `target_tenant_id` stays None here -- the sentinel below is the only honest
+        # target id for this row, same as any other failure.
         error = f"{type(exc).__name__}: {exc}"
         outcome = "error"
     finally:
@@ -112,7 +154,9 @@ async def _run(command: str, args: argparse.Namespace) -> int:
                 audit_conn,
                 operator=_operator_identity(),
                 command=command,
-                target_tenant_id=UNSCOPED_TENANT_ID,
+                target_tenant_id=(
+                    target_tenant_id if target_tenant_id is not None else UNSCOPED_TENANT_ID
+                ),
                 args=vars(args),
                 outcome=outcome,
                 started_at=started_at,
@@ -135,6 +179,16 @@ def build_parser() -> argparse.ArgumentParser:
         "list",
         help="List every tenant's isolation tier, residency, database alias, and suspension state.",
     )
+    suspend_parser = sub.add_parser(
+        "suspend",
+        help="Suspend a tenant (id or unambiguous name); a no-op if already suspended.",
+    )
+    suspend_parser.add_argument("identifier", help="tenant id or unambiguous name")
+    unsuspend_parser = sub.add_parser(
+        "unsuspend",
+        help="Un-suspend a tenant (id or unambiguous name); a no-op if already active.",
+    )
+    unsuspend_parser.add_argument("identifier", help="tenant id or unambiguous name")
 
     create_parser = sub.add_parser(
         "create",
@@ -156,6 +210,24 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="optional tenants.settings['model'] override, validated against the residency's "
         "model allow-list before anything is written",
+    )
+    create_parser.add_argument(
+        "--isolation-tier",
+        dest="isolation_tier",
+        default="pooled",
+        choices=["pooled", "dedicated"],
+        help="'pooled' (default) shares the deployment's one database; 'dedicated' provisions "
+        "this tenant its own physical database (#71, ADR-0002) -- needs "
+        "--dedicated-db-admin-url the first time",
+    )
+    create_parser.add_argument(
+        "--dedicated-db-admin-url",
+        dest="dedicated_db_admin_url",
+        default=None,
+        help="required only when --isolation-tier=dedicated and this tenant's database has not "
+        "already been provisioned: an admin connection string (CREATEDB privilege) to the "
+        "Postgres server that will host it. Used only for this invocation, never stored; "
+        "redacted from the operator-action log.",
     )
     create_parser.add_argument(
         "--issuer",

@@ -14,7 +14,8 @@ from pydantic import BaseModel, Field
 from pydantic_ai.exceptions import UsageLimitExceeded
 
 from app.agents.assistant import AssistantDeps, run_assistant, stream_assistant
-from app.deps import Context
+from app.db.session import TenantSuspendedError
+from app.deps import FORBIDDEN_DETAIL, Context
 from app.gateway_credentials import GatewayCredentialUnavailable
 from app.llm import ModelNotAllowedForResidency
 from app.observability import resolve_tenant_tracing, tenant_span_attributes
@@ -72,6 +73,8 @@ async def run(body: RunRequest, ctx: Context, _limit: RequestLimit) -> RunRespon
     )
     try:
         output = await run_assistant(body.prompt, deps)
+    except TenantSuspendedError as exc:
+        raise HTTPException(status_code=403, detail=FORBIDDEN_DETAIL) from exc
     except UsageLimitExceeded as exc:
         raise HTTPException(
             status_code=429,
@@ -107,6 +110,9 @@ async def stream(body: RunRequest, ctx: Context, _limit: RequestLimit) -> Stream
                     async with stream_assistant(body.prompt, deps, limits) as result:
                         async for delta in result.stream_text(delta=True):
                             yield _sse(delta)
+        except TenantSuspendedError:
+            yield _sse_error("forbidden", FORBIDDEN_DETAIL)
+            return
         except UsageLimitExceeded as exc:
             yield _sse_error("run_limit_exceeded", str(exc))
             return

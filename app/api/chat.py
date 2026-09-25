@@ -46,7 +46,8 @@ from pydantic_ai.ui.vercel_ai.request_types import FileUIPart, TextUIPart, UIMes
 from app.agents.assistant import AssistantDeps, chat_assistant, resolve_chat_model
 from app.api.agents import ROUTING_ERRORS, routing_error_detail
 from app.context import RequestContext
-from app.deps import Context
+from app.db.session import TenantSuspendedError
+from app.deps import FORBIDDEN_DETAIL, Context
 from app.observability import (
     instrumentation_capabilities,
     resolve_tenant_tracing,
@@ -54,6 +55,7 @@ from app.observability import (
 )
 from app.request_limit import RequestLimit
 from app.run_limits import RunDeadlineExceeded, RunLimits, build_run_limits, run_deadline
+from app.tenant_suspension import ensure_tenant_not_suspended
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
@@ -157,6 +159,12 @@ async def _bounded_by_deadline(
 async def chat(request: Request, ctx: Context, _limit: RequestLimit) -> Response:
     if int(request.headers.get("content-length") or 0) > MAX_BODY_BYTES:
         raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "Request body too large")
+    # Independent of deps.py's own check (Spec 9 / #69, ADR-0010): this is "the agent-run entry
+    # point", checked on its own before the chat-capable (writing-tool) agent ever dispatches.
+    try:
+        await ensure_tenant_not_suspended(ctx.tenant_id)
+    except TenantSuspendedError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, FORBIDDEN_DETAIL) from exc
     tracing = await resolve_tenant_tracing(ctx)
     deps = AssistantDeps(
         ctx=ctx,

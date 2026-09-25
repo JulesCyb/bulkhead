@@ -3,6 +3,8 @@ the cluster superuser. See `app/operator/` for the implementation (audited dispa
 tenant-lookup helper, and each command).
 
     uv run python scripts/operator.py list
+    uv run python scripts/operator.py suspend <tenant-id-or-name>
+    uv run python scripts/operator.py unsuspend <tenant-id-or-name>
 """
 
 from __future__ import annotations
