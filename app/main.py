@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse
 from app.api import agent_identities, agent_tokens, agents, chat, health, memberships
 from app.config import Settings, get_settings
 from app.db.guard import run_role_rls_guard
+from app.mcp.server import build_streamable_http_app, check_mcp_mode
 from app.observability import setup_observability
 from app.startup_checks import run_startup_checks
 
@@ -54,6 +55,11 @@ def check_auth_mode(settings: Settings) -> None:
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     check_auth_mode(settings)
+    # The MCP transport's own fail-closed startup guard (issue #48 / ADR-0005) runs alongside
+    # check_auth_mode above -- same reasoning, same moment: a way of launching the process that
+    # never fires lifespan events must not be the only thing standing between a half-finished
+    # MCP_TRANSPORT configuration and a request.
+    check_mcp_mode(settings)
     # Fail-closed residency/model-allow-list guard (issue #59 / ADR-0008), same reasoning as
     # check_auth_mode above: run again here, independent of the construction-time call in
     # create_app, so a way of launching the process that constructs the app once and only later
@@ -194,6 +200,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # way of building the application object — including a test harness that never fires ASGI
     # lifespan events — can skip this guard.
     check_auth_mode(settings)
+    # Same reasoning, for the MCP transport's own guard (issue #48 / ADR-0005): construction time,
+    # not only lifespan -- see the matching call in `lifespan` above.
+    check_mcp_mode(settings)
     # Same reasoning, for the residency/model-allow-list guard (issue #59 / ADR-0008): a
     # deliberately mismatched configuration must never construct an application object that
     # could later accept a request, regardless of whether lifespan ever fires.
@@ -249,6 +258,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.include_router(health.router)
     app.include_router(tenant_router)
+
+    # The MCP server's networked transport (issue #49 / ADR-0005): mounted inside this same API
+    # service, under the tenant's own path prefix (ADR-0012) -- never a second service, and never
+    # reachable at all under the stdio (local-development) transport, which never touches this
+    # FastAPI app in the first place. `check_mcp_mode` above has already refused to let this
+    # branch be reached with `mcp_transport == "streamable-http"` and no verifier configured.
+    if settings.mcp_transport == "streamable-http":
+        app.mount(
+            "/v1/t/{tenant_id}/mcp", build_streamable_http_app(settings), name="mcp-streamable-http"
+        )
+
     return app
 
 

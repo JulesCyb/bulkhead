@@ -16,7 +16,9 @@ import pytest
 
 import app.token_verifier as token_verifier_module
 from app.context import RequestContext
+from app.jwt_verifier import mint_token
 from app.token_verifier import (
+    AGENT_IDENTITY_ISSUER,
     TenantTokenVerificationError,
     VerificationFailureReason,
     verify_tenant_token,
@@ -226,6 +228,108 @@ async def test_success_resolves_identity_and_role(monkeypatch):
     assert resolved.identity_id == identity_id
     assert resolved.role == "admin"
     assert resolved.issuer == ISSUER
+
+
+AGENT_SIGNING_KEY = "agent-token-signing-key-at-least-32-bytes-long"
+
+
+def _agent_key_source(issuer: str, kid: str | None) -> str:
+    """A caller (app/deps.py::get_key_source, app/mcp/server.py) that routes on issuer -- a
+    minimal stand-in proving `verify_tenant_token` really does pass `AGENT_IDENTITY_ISSUER`
+    through to the key source for an agent token, distinct from the human-issuer key."""
+    if issuer == AGENT_IDENTITY_ISSUER:
+        return AGENT_SIGNING_KEY
+    return SECRET
+
+
+async def test_agent_issued_token_bypasses_tenant_auth_settings(monkeypatch):
+    """Gap fix (Spec 6 / #49): an agent identity's token (iss == AGENT_IDENTITY_ISSUER) is
+    verified without ever consulting the tenant's own auth settings -- proven here by making that
+    repository raise if it is called at all."""
+    tenant_id = uuid.uuid4()
+    identity_id = uuid.uuid4()
+
+    class ExplodingTenantAuthSettingsRepository:
+        async def get(self, session, *, tenant_id, default_issuer=None):
+            raise AssertionError("must not be consulted for an agent-issuer token")
+
+    class FakeIdentityRepository:
+        async def find_by_issuer_and_subject(self, session, *, issuer, subject):
+            if (issuer, subject) != (AGENT_IDENTITY_ISSUER, "agent-sub-1"):
+                return None
+            return SimpleNamespace(id=identity_id, issuer=issuer, subject=subject)
+
+    class FakeMembershipRepository:
+        async def get_role(self, session, ctx: RequestContext, *, identity_id):
+            return "agent"
+
+    monkeypatch.setattr(token_verifier_module, "control_session", _fake_session)
+    monkeypatch.setattr(token_verifier_module, "tenant_session", lambda ctx: _fake_session())
+    monkeypatch.setattr(
+        token_verifier_module,
+        "TenantAuthSettingsRepository",
+        ExplodingTenantAuthSettingsRepository,
+    )
+    monkeypatch.setattr(token_verifier_module, "IdentityRepository", FakeIdentityRepository)
+    monkeypatch.setattr(token_verifier_module, "MembershipRepository", FakeMembershipRepository)
+
+    token = mint_token(
+        subject="agent-sub-1",
+        issuer=AGENT_IDENTITY_ISSUER,
+        audience=str(tenant_id),
+        signing_key=AGENT_SIGNING_KEY,
+        algorithm="HS256",
+        ttl_seconds=300,
+        extra_claims={"cred": "agt_xyz"},
+    )
+
+    resolved = await verify_tenant_token(
+        token,
+        tenant_id=tenant_id,
+        key_source=_agent_key_source,
+        default_issuer=None,
+        algorithms=("HS256",),
+    )
+
+    assert resolved.identity_id == identity_id
+    assert resolved.role == "agent"
+    assert resolved.issuer == AGENT_IDENTITY_ISSUER
+    assert resolved.credential_public_id == "agt_xyz"
+
+
+async def test_agent_issued_token_still_fails_closed_on_a_bad_signature(monkeypatch):
+    """The unverified issuer peek is never trusted on its own: a token claiming
+    AGENT_IDENTITY_ISSUER but signed with the wrong key still fails verification."""
+    tenant_id = uuid.uuid4()
+
+    class ExplodingTenantAuthSettingsRepository:
+        async def get(self, session, *, tenant_id, default_issuer=None):
+            raise AssertionError("must not be consulted for an agent-issuer token")
+
+    monkeypatch.setattr(
+        token_verifier_module,
+        "TenantAuthSettingsRepository",
+        ExplodingTenantAuthSettingsRepository,
+    )
+
+    token = mint_token(
+        subject="agent-sub-1",
+        issuer=AGENT_IDENTITY_ISSUER,
+        audience=str(tenant_id),
+        signing_key="a-completely-different-signing-key-32-bytes",
+        algorithm="HS256",
+        ttl_seconds=300,
+    )
+
+    with pytest.raises(TenantTokenVerificationError) as exc_info:
+        await verify_tenant_token(
+            token,
+            tenant_id=tenant_id,
+            key_source=_agent_key_source,
+            default_issuer=None,
+            algorithms=("HS256",),
+        )
+    assert exc_info.value.reason is VerificationFailureReason.INVALID_OR_EXPIRED
 
 
 async def test_success_is_not_affected_by_tenant_suspension(monkeypatch):

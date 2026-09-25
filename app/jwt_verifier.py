@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import jwt
@@ -38,11 +38,21 @@ class TokenVerificationError(Exception):
     client (the response body must stay generic, per ADR-0012's ASGI-seam acceptance criteria)."""
 
 
+# The four claims verify_token always requires/returns, plus `iat` -- anything else in a
+# decoded token's claims is an "extra" claim (see VerifiedClaims.extra below).
+_STANDARD_CLAIMS = frozenset({"iss", "sub", "aud", "exp", "iat"})
+
+
 @dataclass(frozen=True, slots=True)
 class VerifiedClaims:
     issuer: str
     subject: str
     audience: str
+    # Any claim beyond iss/sub/aud/exp/iat -- e.g. `mint_token`'s `extra_claims` (Spec 6 / gap
+    # fix: the credential's public id, so a caller can name it as the request context's means).
+    # Never trusted for anything security-relevant on its own; the signature/issuer/audience
+    # checks above already ran before this is populated.
+    extra: dict[str, str] = field(default_factory=dict)
 
 
 def verify_token(
@@ -86,7 +96,12 @@ def verify_token(
     if not isinstance(audience, str) or not audience:
         raise TokenVerificationError("token missing a usable aud claim")
 
-    return VerifiedClaims(issuer=expected_issuer, subject=subject, audience=audience)
+    extra = {
+        key: value
+        for key, value in claims.items()
+        if key not in _STANDARD_CLAIMS and isinstance(value, str)
+    }
+    return VerifiedClaims(issuer=expected_issuer, subject=subject, audience=audience, extra=extra)
 
 
 def mint_token(
@@ -97,6 +112,7 @@ def mint_token(
     signing_key: str,
     algorithm: str = "RS256",
     ttl_seconds: int,
+    extra_claims: dict[str, str] | None = None,
 ) -> str:
     """Mint a short-lived, signed token (Spec 6 / #47) -- the counterpart to `verify_token`
     above, used only for tokens this application mints itself (today: an agent identity
@@ -108,14 +124,18 @@ def mint_token(
     literally the same secret value; no key/algorithm negotiation happens here.
 
     Carries exactly the four claims `verify_token` requires (`iss`, `sub`, `aud`, `exp`) plus
-    `iat` -- nothing else, so a minted token reveals no more than what verification needs.
+    `iat` -- nothing else, unless `extra_claims` names more (Spec 6 / gap fix: the credential's
+    public id, so a caller can name it as the request context's means without a second lookup at
+    verification time).
     """
     now = int(time.time())
-    claims = {
+    claims: dict[str, Any] = {
         "iss": issuer,
         "sub": subject,
         "aud": audience,
         "iat": now,
         "exp": now + ttl_seconds,
     }
+    if extra_claims:
+        claims.update(extra_claims)
     return jwt.encode(claims, signing_key, algorithm=algorithm)
