@@ -8,8 +8,8 @@ covered end to end against a real, RLS-scoped database in `tests/test_residency.
 the remaining, distinct claim: that the *running* assistant (`/agents/assistant/run`,
 `/agents/assistant/stream`, `/api/chat`) and the document-search tool actually call those
 resolvers and use whatever they return -- for two tenants of different residencies, and for a
-tenant with no resolvable residency -- rather than reaching `app.llm.get_model()`'s or a removed
-`app.embeddings.embed()`'s deployment-wide default.
+tenant with no resolvable residency -- rather than reaching the removed, deployment-wide
+`app.llm.get_model()` or `app.embeddings.embed()` defaults.
 
 No real database, no real model/provider call: `resolve_chat_model`
 (`app.agents.assistant`/`app.api.chat`) and `resolve_tenant_embedding_client`

@@ -19,14 +19,21 @@ This never touches a tenant's own `control.tenants.residency` (that is resolved 
 `app.residency.resolve_residency_route`, fails closed there with `ResidencyUnresolved`) -- this
 module only checks what the deployment itself is configured to reach.
 
+The gateway/model/embedding checks below are unconditional, not "run only when a gateway is
+configured" (ai-app-starter#7 review finding, ADR-0009): `Settings` itself now refuses to
+construct with an unset or empty `LITELLM_BASE_URL`
+(`app.config.Settings._require_gateway_configured`) -- every deployment's compose stack always
+runs its own LiteLLM gateway, so by the time a `Settings` object reaches this function,
+`settings.litellm_base_url` is guaranteed truthy. This function does not re-check that it is
+set (that would just duplicate the `Settings` validator); it checks that the gateway host that
+*is* configured sits inside this deployment's residency allow-list, which is the one thing
+`Settings` construction cannot know on its own.
+
 Deliberately no fallback to a hard-coded "default" embedding/model host (there used to be one,
-`https://api.openai.com/v1`, checked when no gateway was configured -- removed in #63): a
-provider's global endpoint is reachable from every jurisdiction, so allowing it under every
-residency's allow-list made this check unable to ever reject a genuinely out-of-residency host.
-With no gateway configured there is nothing this deployment is actually configured to reach on
-the model/embedding path, so there is nothing to check here -- `app.embeddings` itself refuses to
-build an embedding client without a gateway configured (ADR-0009), so that path fails closed at
-call time instead.
+`https://api.openai.com/v1`, checked when no gateway was configured -- removed in #63, and made
+moot entirely once #7 made the gateway mandatory at `Settings` construction): a provider's global
+endpoint is reachable from every jurisdiction, so allowing it under every residency's allow-list
+made this check unable to ever reject a genuinely out-of-residency host.
 """
 
 from __future__ import annotations
@@ -64,22 +71,21 @@ def run_startup_checks(settings: Settings) -> None:
     - this deployment's own residency (`settings.residency`) has no entry in
       `RESIDENCY_ALLOW_LIST` (defensive -- `Settings` construction already rejects an unknown
       residency, but this function never trusts that as its only guard);
-    - a configured model/gateway host (`settings.litellm_base_url`) is not on that residency's
-      allow-listed model host patterns;
+    - the configured model/gateway host (`settings.litellm_base_url`) is not on that residency's
+      allow-listed model host patterns -- checked unconditionally: `Settings` construction itself
+      already refuses to leave `litellm_base_url` unset (ADR-0009,
+      `app.config.Settings._require_gateway_configured`), so there is no "no gateway configured"
+      branch here to skip;
     - the deployment's default model (`settings.llm_model`) is not on that residency's model
-      allow-list (`RESIDENCY_MODEL_ALLOW_LIST`, checked only when a gateway is configured -- a
-      bare gateway alias is only ever meaningful against the gateway's own `model_list`, never
-      against a direct-provider `<provider>:<model>` id);
-    - a gateway is configured and the embedding endpoint it will actually reach (the same gateway
-      host, the only path `app.embeddings` ever calls) is not that residency's allow-listed
-      embedding endpoint, and not otherwise covered by its model host patterns;
+      allow-list (`RESIDENCY_MODEL_ALLOW_LIST`) -- a bare gateway alias is only ever meaningful
+      against the gateway's own `model_list`;
+    - the embedding endpoint the deployment will actually reach (the same gateway host, the only
+      path `app.embeddings` ever calls) is not that residency's allow-listed embedding endpoint,
+      and not otherwise covered by its model host patterns;
     - a configured trace sink (`settings.langfuse_host`) is not that residency's allow-listed
       trace sink host.
 
-    A fully valid, allow-listed configuration (including the common case of no gateway and no
-    tracing configured at all) returns without raising. With no gateway configured there is no
-    model/embedding host for this deployment to actually reach, so neither check runs -- see the
-    module docstring for why this is deliberate, not a gap.
+    A fully valid, allow-listed configuration returns without raising.
     """
     residency = settings.residency
     route = RESIDENCY_ALLOW_LIST.get(residency)
@@ -89,36 +95,35 @@ def run_startup_checks(settings: Settings) -> None:
             f"(configured residencies: {sorted(RESIDENCY_ALLOW_LIST)})"
         )
 
-    if settings.litellm_base_url:
-        gateway_host = _host(settings.litellm_base_url)
-        if not _host_matches_any(gateway_host, route.model_host_patterns):
-            raise ResidencyConfigurationError(
-                f"residency {residency!r}: model/gateway host {gateway_host!r} "
-                f"(LITELLM_BASE_URL={settings.litellm_base_url!r}) is not on its allow-listed "
-                f"host patterns {route.model_host_patterns}"
-            )
-        # Model allow-list check (S7-T4 / #54), run in this same pass: a bare gateway alias is
-        # only checkable once we know a gateway is actually configured.
-        try:
-            validate_model_for_residency(settings.llm_model, residency)
-        except ModelNotAllowedForResidency as exc:
-            raise ResidencyConfigurationError(
-                f"residency {residency!r}: default model {settings.llm_model!r} is not on its "
-                f"model allow-list -- {exc}"
-            ) from exc
+    # Unconditional (ai-app-starter#7 review finding, ADR-0009): `settings.litellm_base_url` is
+    # guaranteed truthy here -- `Settings` refuses to construct without it -- so there is no
+    # "gateway not configured" branch to skip past.
+    gateway_host = _host(settings.litellm_base_url)  # type: ignore[arg-type]
+    if not _host_matches_any(gateway_host, route.model_host_patterns):
+        raise ResidencyConfigurationError(
+            f"residency {residency!r}: model/gateway host {gateway_host!r} "
+            f"(LITELLM_BASE_URL={settings.litellm_base_url!r}) is not on its allow-listed "
+            f"host patterns {route.model_host_patterns}"
+        )
+    # Model allow-list check (S7-T4 / #54), run in this same pass.
+    try:
+        validate_model_for_residency(settings.llm_model, residency)
+    except ModelNotAllowedForResidency as exc:
+        raise ResidencyConfigurationError(
+            f"residency {residency!r}: default model {settings.llm_model!r} is not on its "
+            f"model allow-list -- {exc}"
+        ) from exc
 
-        # Embeddings are only ever reachable through this same gateway host (ADR-0009,
-        # app/embeddings.py refuses to build a client with no gateway configured) -- so this
-        # check only ever runs once we know that host, never against some other, unconfigured
-        # "default" endpoint.
-        embedding_host = gateway_host
-        if embedding_host != _host(route.embedding_endpoint) and not _host_matches_any(
-            embedding_host, route.model_host_patterns
-        ):
-            raise ResidencyConfigurationError(
-                f"residency {residency!r}: embedding endpoint host {embedding_host!r} is not "
-                f"its allow-listed embedding endpoint {route.embedding_endpoint!r}"
-            )
+    # Embeddings are only ever reachable through this same gateway host (ADR-0009,
+    # app/embeddings.py refuses to build a client with no gateway configured).
+    embedding_host = gateway_host
+    if embedding_host != _host(route.embedding_endpoint) and not _host_matches_any(
+        embedding_host, route.model_host_patterns
+    ):
+        raise ResidencyConfigurationError(
+            f"residency {residency!r}: embedding endpoint host {embedding_host!r} is not "
+            f"its allow-listed embedding endpoint {route.embedding_endpoint!r}"
+        )
 
     if settings.langfuse_host:
         trace_host = _host(settings.langfuse_host)

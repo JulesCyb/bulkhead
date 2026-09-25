@@ -2,15 +2,14 @@
 
 Model name in PydanticAI format "<provider>:<model>" (LLM_MODEL). The gateway is a required
 service, not an optional profile (ADR-0009): a deployment always routes through it
-(OpenAI-compatible), which is what makes switching providers one config line.
-Per tenant, tenants.settings["model"] can override the default (the model_name argument).
+(OpenAI-compatible), which is what makes switching providers one config line. `Settings`
+construction itself refuses to succeed with no `LITELLM_BASE_URL` configured
+(`app.config.Settings._require_gateway_configured`) -- there is no direct-provider fallback
+anywhere in this module, and there must never be one added. Per tenant,
+tenants.settings["model"] can override the default (the model_name argument).
 
-Two entry points live here:
+The one entry point that builds a chat client lives here:
 
-- `get_model()` — the pre-existing, deployment-wide resolver: no tenant, no residency check, no
-  per-tenant credential. Kept for the deployment default and for tests that don't need a tenant;
-  its own LITELLM_BASE_URL check is a historical fallback for that narrow case, not a second,
-  supported way to skip the gateway in production.
 - `resolve_tenant_chat_model()` — the per-tenant entry point (Spec 7 / #54, ADR-0009): before a
   chat client is ever built, the tenant's chosen model name is validated against the allow-list
   for its residency (`RESIDENCY_MODEL_ALLOW_LIST`, app/config.py) and rejected with
@@ -19,6 +18,16 @@ Two entry points live here:
   tenant's own gateway credential (`app.gateway_credentials`, #52) and cached per tenant id, so
   two tenants never share a connection; every call it makes carries an explicit wall-clock
   deadline (`model_settings.timeout`) instead of the client library's multi-minute default.
+
+There used to be a second entry point here, `get_model()` — a deployment-wide resolver with its
+own, separate `LITELLM_BASE_URL` check that fell back to returning a bare `"<provider>:<model>"`
+string (a direct-provider call, bypassing the gateway entirely) when no gateway was configured.
+It was removed (ai-app-starter#7 review finding, ADR-0009): `Settings` now refuses to construct
+without a gateway URL at all, so that fallback branch could never legitimately run, and its mere
+presence was a second, unsupervised way for future code to skip the gateway. Do not re-add a
+function that builds a model/client from `Settings` without going through
+`resolve_tenant_chat_model()` (or `build_tenant_chat_model()`, which it calls) — both require a
+gateway credential and a configured `litellm_base_url`, by construction.
 """
 
 from __future__ import annotations
@@ -27,7 +36,6 @@ from uuid import UUID
 
 import httpx
 from pydantic import SecretStr
-from pydantic_ai.models import Model
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings
@@ -38,18 +46,6 @@ from app.context import RequestContext
 from app.gateway_credentials import resolve_gateway_credential
 from app.repositories.control import ControlRepository
 from app.residency import ResidencyUnresolved
-
-
-def get_model(model_name: str | None = None) -> Model | str:
-    s = get_settings()
-    name = model_name or s.llm_model
-    if s.litellm_base_url:
-        # Through the gateway: the bare model name from litellm/config.yaml, no provider prefix.
-        bare = name.split(":", 1)[1] if ":" in name else name
-        api_key = s.litellm_api_key.get_secret_value() if s.litellm_api_key else "litellm"
-        provider = OpenAIProvider(base_url=s.litellm_base_url, api_key=api_key)
-        return OpenAIChatModel(bare, provider=provider)
-    return name
 
 
 class ModelNotAllowedForResidency(Exception):
@@ -168,7 +164,6 @@ async def resolve_tenant_chat_model(
 __all__ = [
     "ModelNotAllowedForResidency",
     "build_tenant_chat_model",
-    "get_model",
     "reset_tenant_chat_model_cache",
     "resolve_tenant_chat_model",
     "validate_model_for_residency",

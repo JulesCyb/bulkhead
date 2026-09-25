@@ -374,12 +374,17 @@ async def test_revoke_handles_a_missing_secret_file_gracefully(settings, control
 
 
 async def test_provisioning_without_a_base_url_raises_before_any_call(tmp_path):
+    """Defense-in-depth: `Settings` itself now refuses to *construct* without
+    `LITELLM_BASE_URL` (ADR-0009, ai-app-starter#7, `Settings._require_gateway_configured`), so
+    this constructs a valid `Settings` and clears the field afterwards to prove
+    `provision_gateway_credential` has its own, independent guard too."""
     settings = Settings(
         database_url="postgresql+asyncpg://app:app@localhost:5432/app",
         gateway_credentials_dir=str(tmp_path),
-        litellm_base_url=None,
+        litellm_base_url="http://litellm:4000",
         litellm_master_key="sk-master-test",
     )
+    settings.litellm_base_url = None
     with pytest.raises(GatewayProvisioningError):
         await provision_gateway_credential(
             uuid.uuid4(), residency="eu", limits=LIMITS, settings=settings, owner_engine=object()

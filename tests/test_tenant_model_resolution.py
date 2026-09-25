@@ -189,10 +189,18 @@ def test_the_same_tenant_twice_reuses_one_embedding_client(settings):
 
 
 def test_building_a_chat_client_with_no_gateway_configured_refuses(tmp_path):
+    """Defense-in-depth: `Settings` itself now refuses to *construct* without
+    `LITELLM_BASE_URL` (ADR-0009, ai-app-starter#7, `app.config.Settings._require_gateway_
+    configured`), so this constructs a valid `Settings` and then clears the field to simulate a
+    value that somehow became unset later (e.g. a stale/attacker-controlled object) -- proving
+    `build_tenant_chat_model` has its own, independent guard and never trusts `Settings`
+    construction as its only line of defense."""
     settings_without_gateway = Settings(
         database_url="postgresql+asyncpg://app:app@localhost:5432/app",
         gateway_credentials_dir=str(tmp_path),
+        litellm_base_url="http://litellm:4000",
     )
+    settings_without_gateway.litellm_base_url = None
     with pytest.raises(RuntimeError):
         build_tenant_chat_model(
             uuid.uuid4(), "claude-eu", SecretStr("secret"), settings=settings_without_gateway

@@ -266,7 +266,23 @@ class Settings(BaseSettings):
     # runaway query is cut off inside that tenant's transaction and the connection is freed.
     db_statement_timeout_ms: int = 30_000
 
-    llm_model: str = "anthropic:claude-sonnet-4-5"
+    # Default is a *gateway alias* (docker/litellm/config.yaml's `model_name`), not a
+    # "<provider>:<model>" id -- it must match the deployment's own default residency ("eu" here)
+    # so a fresh deployment's default configuration passes `app.startup_checks.run_startup_checks`
+    # unmodified (ai-app-starter#7 review finding): `RESIDENCY_MODEL_ALLOW_LIST["eu"]` only allows
+    # "claude-eu"/"embeddings" (config/residency.toml, ADR-0009), never a raw provider id such as
+    # "anthropic:claude-sonnet-4-5" (that used to be this field's default, back when the gateway
+    # was optional and the model check only ran once one was configured). A `<provider>:<model>`
+    # value still works too -- `validate_model_for_residency`/`_bare_model_name` strip any
+    # "<provider>:" prefix before checking -- but the gateway's own bare alias is the common case.
+    llm_model: str = "claude-eu"
+    # No default (ADR-0009, ai-app-starter#7 review finding): the LiteLLM gateway is a required
+    # service, not an optional profile -- every deployment's compose stack runs it, and every
+    # model/embedding call must go through it, never a provider directly. Typed `str | None` only
+    # so an explicitly empty/unset value can be told apart from a real URL and rejected with a
+    # clear message (`_require_gateway_configured` below) instead of failing on the wrong field.
+    # Nothing in this codebase may construct a provider client without first reading this value --
+    # `app.llm`, the only module that builds a chat client, has no code path around it.
     litellm_base_url: str | None = None
     litellm_api_key: SecretStr | None = None
     # The gateway's admin credential (Spec 7 / #53, ADR-0009): mints and revokes per-tenant
@@ -279,8 +295,12 @@ class Settings(BaseSettings):
     embedding_provider: str | None = None
     embedding_model: str | None = None
     embedding_dimensions: int = 1536
-    openai_api_key: SecretStr | None = None
-    anthropic_api_key: SecretStr | None = None
+    # Deliberately NOT fields here (ai-app-starter#7 review finding, ADR-0009): a raw provider API
+    # key on this object would be exactly the escape hatch that lets application code build a
+    # client that skips the gateway. `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` are real environment
+    # variables in `.env`/compose, but they belong to the `litellm` gateway service alone
+    # (`docker-compose.yml`'s `litellm:` service, `docker/litellm/config.yaml`) -- the long-running
+    # API process this class configures never receives them and has no field to hold them in.
 
     # The deployment's (or, at a call site resolving a tenant's own setting, that tenant's)
     # residency. Must be a key of RESIDENCY_ALLOW_LIST — validated below.
@@ -413,6 +433,26 @@ class Settings(BaseSettings):
     # onto each erasure record -- the tool documents this date, it never acts on it (no automatic
     # purge), so nobody tells a tenant "your data is gone" while a backup still holds a copy.
     backup_retention_days: int = 30
+
+    @model_validator(mode="after")
+    def _require_gateway_configured(self) -> "Settings":
+        """Fails closed (ADR-0009, ai-app-starter#7 review finding): the LiteLLM gateway is
+        mandatory in every environment -- the compose stack always runs it (`docker-compose.yml`'s
+        `litellm:` service) -- so an unset or empty `LITELLM_BASE_URL` must refuse to construct a
+        `Settings` object at all, not just skip a check further downstream. This is what makes
+        `app.startup_checks.run_startup_checks`'s own gateway-host/residency check unconditional:
+        by the time that function runs, `settings.litellm_base_url` is always truthy. Do not
+        relax this to `str | None` being an accepted "no gateway" profile again -- that was the
+        exact finding (ADR-0009, Spec 7 / #57/#63 follow-up) this validator closes."""
+        if not self.litellm_base_url:
+            raise ValueError(
+                "LITELLM_BASE_URL is required and has no default -- every deployment's compose "
+                "stack runs its own LiteLLM gateway (docker-compose.yml's `litellm` service) and "
+                "every model/embedding call must go through it, never a provider directly "
+                "(ADR-0009). Set it explicitly (e.g. http://litellm:4000 in docker compose; see "
+                ".env.example)."
+            )
+        return self
 
     @model_validator(mode="after")
     def _require_embedding_config(self) -> "Settings":

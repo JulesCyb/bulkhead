@@ -176,7 +176,7 @@ async def chat(request: Request, ctx: Context, _limit: RequestLimit) -> Response
 
     # Resolved before the adapter even parses the body (Spec 8 / #61, ADR-0008): a tenant with no
     # usable residency, an unlisted model, or no gateway credential is refused cleanly, never
-    # silently served from `app.llm.get_model()`'s deployment-wide default.
+    # silently served from the removed, deployment-wide `app.llm.get_model()` (ai-app-starter#7).
     try:
         model = await resolve_chat_model(deps)
     except ROUTING_ERRORS as exc:

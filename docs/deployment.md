@@ -95,6 +95,13 @@ Required (ADR-0009): it runs by default, against its own database and role (`gat
 in `docker/postgres/01-init.sh`) that can never see the application's tenant tables, and
 receives only its own database URL, `LITELLM_MASTER_KEY`, and the model-provider credentials its
 configured aliases call — never the application's database credential or the tracing secret.
+Enforced at startup, not only documented (ai-app-starter#7): `app.config.Settings` refuses to
+construct at all with `LITELLM_BASE_URL` unset or empty, in every environment — the `api`
+container and `app.mcp.server`'s own entry point both fail before accepting a single request or
+tool call — and `app.startup_checks.run_startup_checks` then checks the configured gateway host
+against the deployment's residency allow-list unconditionally (`config/residency.toml`). There is
+no direct-provider fallback in `app/llm.py`; `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` are read only by
+this `litellm` service below, never by `api` (`app.config.Settings` has no field for either).
 Maintain `docker/litellm/config.yaml`; set `LITELLM_MASTER_KEY` in `.env` (rendering
 `docker-compose.yml` fails if it is unset). The operator tool's `create` command
 (`scripts/operator.py create ...`, Spec 9 / #70) mints every tenant's virtual key automatically,

@@ -42,7 +42,7 @@ def client(monkeypatch, fake_search, fake_history, test_model):
 @pytest.fixture
 def raw_client(monkeypatch, fake_search, fake_history):
     """Like `client`, but without the `test_model` override — for tests that need to inject their
-    own model via `resolve_chat_model` (patched per-test, in place of the deployment-wide
+    own model via `resolve_chat_model` (patched per-test, in place of the removed, deployment-wide
     `get_model()`), so the `run_limits` wiring in `app/agents/assistant.py` and
     `app/api/agents.py` is genuinely exercised rather than bypassed.
     """

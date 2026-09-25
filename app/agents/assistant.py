@@ -17,7 +17,8 @@ into the one-shot agent is a change to code that doesn't exist, not a config tog
 
 - No model hard-wired: `resolve_chat_model()` resolves it per request, routed through the
   requesting tenant's own residency (Spec 8 / #61, ADR-0008) via
-  `app.llm.resolve_tenant_chat_model` — never `app.llm.get_model()`'s deployment-wide default.
+  `app.llm.resolve_tenant_chat_model` — never the removed, deployment-wide
+  `app.llm.get_model()` (ai-app-starter#7).
   Tests override with TestModel/FunctionModel — no real model call.
 - Tools are thin wrappers around app/tools/* that take the context from ctx.deps.
 - LangGraph only once a flow becomes a state machine (checkpoints, human-in-the-loop) —
@@ -185,7 +186,8 @@ _register_writing_tools(chat_assistant)
 async def resolve_chat_model(deps: AssistantDeps) -> Model:
     """Resolves `deps.ctx`'s own per-tenant chat model, routed through its residency
     (Spec 8 / #61, ADR-0008) -- the one seam `run_assistant`, `stream_assistant`, and
-    `app/api/chat.py` all use instead of `app.llm.get_model()`'s deployment-wide default.
+    `app/api/chat.py` all use instead of the removed, deployment-wide
+    `app.llm.get_model()` (ai-app-starter#7).
 
     Opens a short tenant-bound session purely to resolve the route and the tenant's own gateway
     credential (`app.llm.resolve_tenant_chat_model`), then closes it -- the resolved model

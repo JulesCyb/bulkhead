@@ -21,6 +21,13 @@ from pydantic_ai.models.test import TestModel
 # bypasses these env vars entirely.
 os.environ.setdefault("EMBEDDING_PROVIDER", "openai")
 os.environ.setdefault("EMBEDDING_MODEL", "text-embedding-3-small")
+# LITELLM_BASE_URL has no default either (app/config.py, ADR-0009, ai-app-starter#7): the gateway
+# is mandatory in every environment, so `Settings()` refuses to construct without it. Set a
+# process-wide test default here -- the compose default host ("litellm", allow-listed under
+# residency "eu" in config/residency.toml) -- so the suite never depends on a real gateway and
+# never makes a network call; a test exercising the "unset" failure constructs
+# Settings(litellm_base_url=None, ...) directly, bypassing this env var entirely.
+os.environ.setdefault("LITELLM_BASE_URL", "http://litellm:4000")
 # ENVIRONMENT/AUTH_MODE have no default either (issue #14 / ADR-0011): a `.env` copied and left
 # unedited must fail to start rather than silently choosing `dev`/`dev-headers`. Same pattern as
 # above — tests that exercise the fail-closed default itself delete these from the environment
@@ -139,7 +146,8 @@ def deps(ctx, fake_search, fake_history, fake_save) -> AssistantDeps:
 def resolve_to_model(model):
     """Wraps `model` as a fake `resolve_chat_model` (Spec 8 / #61): the per-tenant, residency-
     routed model resolver `app.agents.assistant.run_assistant`/`stream_assistant` and
-    `app.api.chat.chat` now call in place of the old, deployment-wide `app.llm.get_model()`.
+    `app.api.chat.chat` now call in place of the removed, deployment-wide
+    `app.llm.get_model()` (ai-app-starter#7).
     Ignores `deps` entirely and always returns `model` — the test seam every ASGI test in this
     suite uses to inject a `TestModel`/`FunctionModel` without a real database or gateway
     credential file on disk. Patch both `app.agents.assistant.resolve_chat_model` (used by the

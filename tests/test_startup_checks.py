@@ -1,4 +1,5 @@
-"""Fail-closed residency and model-allow-list startup checks (ADR-0008, Spec 8 / #59).
+"""Fail-closed residency and model-allow-list startup checks (ADR-0008, Spec 8 / #59, and the
+mandatory-gateway follow-up, ai-app-starter#7 / ADR-0009).
 
 Configuration-property tests only: no network call, no database. Mirrors
 tests/test_hardening.py's existing residency/embedding configuration tests and the
@@ -8,16 +9,56 @@ construction-time/lifespan pattern used there for issue #15.
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from app.config import Settings
 from app.startup_checks import ResidencyConfigurationError, run_startup_checks
 
-_VALID_KWARGS = {"embedding_provider": "openai", "embedding_model": "text-embedding-3-small"}
+_EMBEDDING_KWARGS = {
+    "embedding_provider": "openai",
+    "embedding_model": "text-embedding-3-small",
+}
+# Includes the compose default gateway host and a model that is actually allow-listed for it
+# ("litellm" -> residency "eu" -> ["claude-eu", "embeddings"], config/residency.toml) so tests
+# that don't care about a specific `litellm_base_url`/`llm_model` value don't each have to supply
+# one -- `Settings()` now refuses to construct without a gateway URL at all (ADR-0009), and with
+# one configured, `run_startup_checks` always validates the default model against it too.
+_VALID_KWARGS = {
+    **_EMBEDDING_KWARGS,
+    "litellm_base_url": "http://litellm:4000",
+    "llm_model": "claude-eu",
+}
 
 
-def test_fully_valid_configuration_starts_cleanly_no_gateway_no_tracing():
-    """The common case: no gateway, no tracing configured, deployment residency's default model
-    used directly against the provider. Must not raise."""
+def test_missing_gateway_url_fails_settings_construction_in_every_environment():
+    """ai-app-starter#7 review finding (ADR-0009): the gateway is mandatory, not an optional
+    profile -- `Settings()` must refuse to construct at all with no `LITELLM_BASE_URL`, before
+    `run_startup_checks` (or anything else) ever runs. Not conditioned on `environment` or
+    `auth_mode`: every deployment's compose stack runs the gateway."""
+    with pytest.raises(ValidationError, match="LITELLM_BASE_URL"):
+        Settings(
+            residency="eu",
+            litellm_base_url=None,
+            embedding_provider="openai",
+            embedding_model="text-embedding-3-small",
+        )
+
+
+def test_empty_gateway_url_also_fails_settings_construction():
+    """An explicitly empty string is treated the same as unset -- not a valid "no gateway" value
+    (ADR-0009)."""
+    with pytest.raises(ValidationError, match="LITELLM_BASE_URL"):
+        Settings(
+            residency="eu",
+            litellm_base_url="",
+            embedding_provider="openai",
+            embedding_model="text-embedding-3-small",
+        )
+
+
+def test_fully_valid_configuration_with_compose_default_gateway_starts_cleanly_no_tracing():
+    """The common case: the compose stack's own default gateway host ("litellm", allow-listed
+    under residency "eu"), no tracing configured. Must not raise."""
     settings = Settings(residency="eu", **_VALID_KWARGS)
     run_startup_checks(settings)  # no raise
 
@@ -27,7 +68,7 @@ def test_fully_valid_configuration_with_gateway_and_matching_model_starts_cleanl
         residency="eu",
         litellm_base_url="https://gateway.eu.litellm.internal",
         llm_model="claude-eu",
-        **_VALID_KWARGS,
+        **_EMBEDDING_KWARGS,
     )
     run_startup_checks(settings)  # no raise
 
@@ -43,7 +84,7 @@ def test_mismatched_gateway_host_raises_naming_residency_and_endpoint():
     settings = Settings(
         residency="eu",
         litellm_base_url="https://gateway.us.litellm.internal",
-        **_VALID_KWARGS,
+        **_EMBEDDING_KWARGS,
     )
     with pytest.raises(ResidencyConfigurationError) as exc_info:
         run_startup_checks(settings)
@@ -59,7 +100,7 @@ def test_us_gateway_host_is_rejected_under_eu_residency():
     settings = Settings(
         residency="eu",
         litellm_base_url=f"https://{us_route.model_host_patterns[0].lstrip('*.')}",
-        **_VALID_KWARGS,
+        **_EMBEDDING_KWARGS,
     )
     with pytest.raises(ResidencyConfigurationError, match="eu"):
         run_startup_checks(settings)
@@ -73,7 +114,7 @@ def test_eu_gateway_host_is_rejected_under_us_residency():
     settings = Settings(
         residency="us",
         litellm_base_url=f"https://{eu_host_pattern.lstrip('*.')}",
-        **_VALID_KWARGS,
+        **_EMBEDDING_KWARGS,
     )
     with pytest.raises(ResidencyConfigurationError, match="us"):
         run_startup_checks(settings)
@@ -84,14 +125,16 @@ def test_a_global_provider_host_is_rejected_under_eu_residency():
     pass a residency's allow-list check -- this is exactly the original finding: `eu`'s
     model_host_patterns must not also cover a global provider domain."""
     settings = Settings(
-        residency="eu", litellm_base_url="https://api.anthropic.com", **_VALID_KWARGS
+        residency="eu", litellm_base_url="https://api.anthropic.com", **_EMBEDDING_KWARGS
     )
     with pytest.raises(ResidencyConfigurationError, match="eu"):
         run_startup_checks(settings)
 
 
 def test_a_global_provider_host_is_rejected_under_us_residency():
-    settings = Settings(residency="us", litellm_base_url="https://api.openai.com", **_VALID_KWARGS)
+    settings = Settings(
+        residency="us", litellm_base_url="https://api.openai.com", **_EMBEDDING_KWARGS
+    )
     with pytest.raises(ResidencyConfigurationError, match="us"):
         run_startup_checks(settings)
 
@@ -112,7 +155,7 @@ def test_model_not_on_residency_allow_list_raises_in_the_same_pass():
         residency="eu",
         litellm_base_url="https://gateway.eu.litellm.internal",
         llm_model="mistral-large",
-        **_VALID_KWARGS,
+        **_EMBEDDING_KWARGS,
     )
     with pytest.raises(ResidencyConfigurationError) as exc_info:
         run_startup_checks(settings)
@@ -128,7 +171,7 @@ def test_model_allowed_in_us_but_not_eu_is_residency_specific():
         residency="eu",
         litellm_base_url="https://gateway.eu.litellm.internal",
         llm_model="claude",
-        **_VALID_KWARGS,
+        **_EMBEDDING_KWARGS,
     )
     with pytest.raises(ResidencyConfigurationError):
         run_startup_checks(settings)
@@ -137,7 +180,7 @@ def test_model_allowed_in_us_but_not_eu_is_residency_specific():
         residency="us",
         litellm_base_url="https://gateway.us.litellm.internal",
         llm_model="claude",
-        **_VALID_KWARGS,
+        **_EMBEDDING_KWARGS,
     )
     run_startup_checks(us_settings)  # no raise
 

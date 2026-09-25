@@ -18,6 +18,9 @@ import os
 import tempfile
 from pathlib import Path
 
+import pytest
+from pydantic import ValidationError
+
 from app.config import RESIDENCY_ALLOW_LIST, Settings
 from app.tenant_settings import TenantSettings
 
@@ -226,6 +229,38 @@ def test_env_example_gateway_vars_are_documented_as_required() -> None:
     assert "Required (ADR-0009): every model/embedding call goes through the LiteLLM gateway" in (
         ENV_EXAMPLE
     )
+
+
+# ai-app-starter#7 review finding: the gateway being "mandatory" used to be documentation only --
+# `Settings.litellm_base_url` was optional and nothing enforced it at startup. This block asserts
+# the docs now say enforcement is real (Settings construction + startup_checks), not just intent,
+# and that Settings actually behaves that way -- the doc claim and the code are checked together.
+
+
+def test_claude_md_states_gateway_is_enforced_at_startup() -> None:
+    assert "Enforced at startup" in CLAUDE_MD
+    assert "`Settings` refuses to construct" in CLAUDE_MD
+
+
+def test_readme_models_row_states_startup_enforcement() -> None:
+    row = next(line for line in README.splitlines() if line.startswith("| Models |"))
+    assert "enforced at startup" in row
+
+
+def test_deployment_md_states_gateway_enforcement_is_not_only_documented() -> None:
+    assert "Enforced at startup, not only documented" in DEPLOYMENT_MD
+
+
+def test_settings_actually_refuses_to_construct_without_a_gateway_url() -> None:
+    """The doc claims above are backed by real behaviour, not just wording -- construction fails
+    closed with no LITELLM_BASE_URL, in every environment (no `environment`/`auth_mode` special
+    case)."""
+    with pytest.raises(ValidationError, match="LITELLM_BASE_URL"):
+        Settings(
+            litellm_base_url=None,
+            embedding_provider="openai",
+            embedding_model="text-embedding-3-small",
+        )
 
 
 def test_context_md_states_budget_stops_only_the_exhausted_tenant() -> None:

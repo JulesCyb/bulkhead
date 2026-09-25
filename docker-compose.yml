@@ -77,16 +77,22 @@ services:
       DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-30}
       DB_POOL_RECYCLE: ${DB_POOL_RECYCLE:-1800}
       DB_STATEMENT_TIMEOUT_MS: ${DB_STATEMENT_TIMEOUT_MS:-30000}
-      LLM_MODEL: ${LLM_MODEL:-anthropic:claude-sonnet-4-5}
-      LITELLM_BASE_URL: ${LITELLM_BASE_URL:-}
+      # "claude-eu" is a gateway alias (docker/litellm/config.yaml), matching RESIDENCY=eu's
+      # default allow-list (config/residency.toml) -- not a raw provider id.
+      LLM_MODEL: ${LLM_MODEL:-claude-eu}
+      # Required in every environment (ADR-0009, ai-app-starter#7): `app.config.Settings` refuses
+      # to construct at all with this unset -- the gateway is never an optional profile, so the
+      # default here is the gateway's own compose hostname, not empty.
+      LITELLM_BASE_URL: ${LITELLM_BASE_URL:-http://litellm:4000}
       # The per-tenant virtual key minted against the gateway's master key — never the master
       # key itself, which stays out of this container entirely (see the litellm service below).
       LITELLM_API_KEY: ${LITELLM_API_KEY:-}
       EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
       EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1536}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Provider keys are gateway-only (ADR-0009, ai-app-starter#7): app.config.Settings has no
+      # field for either of these -- the api container never receives them at all. They are read
+      # only by the litellm service below, from docker/litellm/config.yaml.
       RESIDENCY: ${RESIDENCY:-eu}
       AUTH_MODE: ${AUTH_MODE}
       LANGFUSE_HOST: ${LANGFUSE_HOST:-}

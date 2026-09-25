@@ -13,7 +13,11 @@ ADR wins — then update this file.
 - Backend/API: FastAPI, Python 3.12, `uv`
 - Agent logic: PydanticAI (`app/agents/assistant.py`); LangGraph only with an ADR justification
 - Models: `LLM_MODEL` in `<provider>:<model>` format, always through the LiteLLM gateway — a
-  required service, not an optional profile (ADR-0009, `app/llm.py`)
+  required service, not an optional profile (ADR-0009, `app/llm.py`). Enforced at startup, not
+  only documented: `Settings` refuses to construct with `LITELLM_BASE_URL` unset or empty, in
+  every environment (`app/config.py`), and `app.startup_checks.run_startup_checks` then checks the
+  configured gateway host against the deployment's residency allow-list unconditionally. There is
+  no direct-provider code path anywhere in `app/llm.py`; do not add one back.
 - Data: PostgreSQL 17 + pgvector, RLS on; the app connects as `app` (no superuser); a separate
   `app_owner` role (no superuser either) owns every object and runs migrations; operator-owned
   facts live in a `control` schema `app` can only read through views

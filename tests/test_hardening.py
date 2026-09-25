@@ -153,8 +153,6 @@ def test_settings_secrets_never_printed_in_repr_or_str():
     Settings object must never leak a live value, whether printed directly or via logging."""
     live_values = {
         "database_url": "postgresql+asyncpg://app:s3cr3t-db@db.internal:5432/app",
-        "openai_api_key": "sk-openai-live-value",
-        "anthropic_api_key": "sk-anthropic-live-value",
         "litellm_api_key": "litellm-live-value",
         "langfuse_secret_key": "langfuse-live-value",
     }
@@ -167,6 +165,16 @@ def test_settings_secrets_never_printed_in_repr_or_str():
     for field, live_value in live_values.items():
         assert live_value not in dump, f"{field} leaked its live value into repr()/str()"
     assert settings.database_url.get_secret_value() == live_values["database_url"]
+
+
+def test_settings_has_no_direct_provider_api_key_fields():
+    """ADR-0009 / ai-app-starter#7 review finding: a raw provider API key on this object would be
+    exactly the escape hatch that lets application code build a client that skips the gateway.
+    `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` are real environment variables (`.env`, `docker-compose
+    .yml`), but they belong to the `litellm` gateway service alone -- `app.config.Settings`, which
+    configures the long-running API process, has no field for either."""
+    assert "openai_api_key" not in Settings.model_fields
+    assert "anthropic_api_key" not in Settings.model_fields
 
 
 def test_settings_has_no_database_owner_connection_string_field():
