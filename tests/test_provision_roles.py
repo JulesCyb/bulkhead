@@ -60,6 +60,7 @@ async def _grants_snapshot(admin_url: str):
                 text(
                     "SELECT "
                     "has_database_privilege('app_owner', current_database(), 'CONNECT'), "
+                    "has_database_privilege('app_owner', current_database(), 'CREATE'), "
                     "has_database_privilege('app', current_database(), 'CONNECT'), "
                     "has_schema_privilege('app', 'public', 'USAGE'), "
                     "has_schema_privilege('app', 'public', 'CREATE')"
@@ -98,8 +99,11 @@ async def test_creates_app_owner_and_app_roles_matching_init_script(admin_url):
     assert app.rolcreaterole is False
     assert app.rolconnlimit == 50
 
-    schema_owner, *_ = await _grants_snapshot(admin_url)
+    schema_owner, privileges, _ = await _grants_snapshot(admin_url)
     assert schema_owner == "app_owner"
+    # CONNECT for both roles, CREATE on the database for app_owner only (the `control` schema).
+    assert privileges[:3] == (True, True, True)
+    assert privileges[4] is False  # app has no CREATE on schema public
 
 
 async def test_app_statement_timeout_matches_role_bootstrap(admin_url):

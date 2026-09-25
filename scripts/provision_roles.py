@@ -115,6 +115,8 @@ async def provision(admin_url: str) -> None:
 
             quoted_db = '"' + dbname.replace('"', '""') + '"'
             await conn.execute(text(f"GRANT CONNECT ON DATABASE {quoted_db} TO app_owner"))
+            # CREATE on the database lets app_owner create the `control` schema (migration 0002).
+            await conn.execute(text(f"GRANT CREATE ON DATABASE {quoted_db} TO app_owner"))
             await conn.execute(text("ALTER SCHEMA public OWNER TO app_owner"))
             await conn.execute(text(f"GRANT CONNECT ON DATABASE {quoted_db} TO app"))
             await conn.execute(text("GRANT USAGE ON SCHEMA public TO app"))
