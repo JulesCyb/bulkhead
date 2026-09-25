@@ -6,6 +6,7 @@ entirely. Skipped when the Docker CLI/daemon isn't available."""
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -46,6 +47,7 @@ def rendered_config(tmp_path, monkeypatch):
         result = subprocess.run(
             ["docker", "compose", "config", "--format", "json"],
             cwd=REPO_ROOT,
+            env={**os.environ, "LITELLM_MASTER_KEY": "test-master-key"},
             capture_output=True,
             text=True,
             timeout=30,
@@ -70,7 +72,6 @@ def test_no_service_runs_provision_roles(rendered_config):
 
 def test_known_services_only(rendered_config):
     """Documents the expected automatic-startup surface, so a future service that does invoke
-    the script by accident is caught even if it's not literally named "provision_roles". litellm
-    carries `profiles: ["gateway"]` and isn't part of the default `docker compose up` set, so it
-    doesn't render here."""
-    assert set(rendered_config["services"]) == {"postgres", "migrate", "api"}
+    the script by accident is caught even if it's not literally named "provision_roles". The
+    litellm gateway is a required service since #51, so it is part of the default set."""
+    assert set(rendered_config["services"]) == {"postgres", "migrate", "api", "litellm"}
