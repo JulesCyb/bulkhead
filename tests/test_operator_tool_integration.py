@@ -80,15 +80,21 @@ async def _seed_tenant(
     engine = create_async_engine(superuser_url)
     async with engine.begin() as conn:
         await conn.execute(
-            text("INSERT INTO tenants (id, name, settings) VALUES (:id, :name, CAST(:s AS jsonb))"),
-            {"id": tenant_id, "name": name, "s": json.dumps({"residency": residency})},
+            text("INSERT INTO tenants (id, name) VALUES (:id, :name)"),
+            {"id": tenant_id, "name": name},
         )
         await conn.execute(
             text(
-                "INSERT INTO control.tenants (tenant_id, isolation_tier, database_alias) "
-                "VALUES (:id, :tier, :alias)"
+                "INSERT INTO control.tenants "
+                "(tenant_id, isolation_tier, database_alias, residency) "
+                "VALUES (:id, :tier, :alias, :residency)"
             ),
-            {"id": tenant_id, "tier": isolation_tier, "alias": database_alias},
+            {
+                "id": tenant_id,
+                "tier": isolation_tier,
+                "alias": database_alias,
+                "residency": residency,
+            },
         )
         if suspended:
             await conn.execute(

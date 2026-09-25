@@ -1,12 +1,12 @@
 """Operator-only cross-tenant enumeration for the operator tool's tenant listing (Spec 9 / #68).
 
 Revision ID: 0012
-Revises: 0017
+Revises: 0013
 Create Date: 2026-09-25
 
 The operator tool's read-only listing needs to see *every* tenant's isolation tier, database
 alias, and suspension state (`control.tenants`) alongside its residency
-(`tenants.settings->>'residency'`, ADR-0008) -- as the owner role, without a
+(`control.tenants.residency`, 0013, ADR-0008) -- as the owner role, without a
 `RequestContext`/`app.tenant_id` to scope any one query. Both `control.tenants` and
 `public.tenants` carry `FORCE ROW LEVEL SECURITY` (0002/0001), which -- unlike ordinary RLS --
 binds `app_owner` too, so with no tenant context set, every ordinary query against either table
@@ -31,8 +31,8 @@ runner's:
 
 - `control_tenants_operator_read` -- a policy on `control.tenants`, `FOR SELECT`, gated on
   `current_user = 'app_owner' AND current_setting('app.control_operator_read', true) = 'true'`.
-- `tenants_operator_read` -- the same shape on `public.tenants`, needed because residency lives
-  there, not in `control.tenants`.
+- `tenants_operator_read` -- the same shape on `public.tenants`, needed for the tenant's name,
+  which lives there, not in `control.tenants`.
 - `control.enumerate_tenants()` -- a `SECURITY DEFINER` function, owned by `app_owner`, that sets
   the flag `is_local=true`, reads every tenant's id, name, isolation tier, database alias,
   residency, and suspension state in one join across both tables, and restores the caller's
@@ -50,7 +50,7 @@ from collections.abc import Sequence
 from alembic import op
 
 revision: str = "0012"
-down_revision: str | None = "0017"
+down_revision: str | None = "0013"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -103,7 +103,7 @@ def upgrade() -> None:
                     pt.name::text,
                     ct.isolation_tier,
                     ct.database_alias,
-                    pt.settings ->> 'residency',
+                    ct.residency,
                     ct.suspended,
                     ct.suspended_at
                 FROM control.tenants ct
