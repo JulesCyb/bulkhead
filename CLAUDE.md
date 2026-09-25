@@ -29,6 +29,8 @@ uv run python scripts/migrate.py          # migrations run once per database ali
 uv run python scripts/migrate.py <alias>  # migrations for just that one alias (owner role)
 uv run python scripts/seed.py "My Tenant" me@example.com   # first tenant + user
 uv run python scripts/provision_roles.py <admin-database-url>  # managed Postgres, no init hook
+uv run python scripts/operator.py suspend <tenant-id-or-name>    # suspend a tenant (idempotent)
+uv run python scripts/operator.py unsuspend <tenant-id-or-name>  # restore it, nothing re-provisioned
 uv run uvicorn app.main:app --reload      # API locally, http://localhost:8000/docs
 uv run pytest                             # tests (must be green before every commit)
 uv run pytest tests/test_rls_integration.py   # real RLS test (needs: uv sync --group dbtest)

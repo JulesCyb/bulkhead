@@ -15,10 +15,12 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic_ai.ui.vercel_ai import VercelAIAdapter
 
 from app.agents.assistant import AssistantDeps, chat_assistant
-from app.deps import Context
+from app.db.session import TenantSuspendedError
+from app.deps import FORBIDDEN_DETAIL, Context
 from app.llm import get_model
 from app.request_limit import RequestLimit
 from app.run_limits import RunDeadlineExceeded, RunLimits, build_run_limits, run_deadline
+from app.tenant_suspension import ensure_tenant_not_suspended
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
@@ -50,6 +52,12 @@ async def _bounded_by_deadline(source: AsyncIterator[str], limits: RunLimits) ->
 async def chat(request: Request, ctx: Context, _limit: RequestLimit) -> Response:
     if int(request.headers.get("content-length") or 0) > MAX_BODY_BYTES:
         raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "Request body too large")
+    # Independent of deps.py's own check (Spec 9 / #69, ADR-0010): this is "the agent-run entry
+    # point", checked on its own before the chat-capable (writing-tool) agent ever dispatches.
+    try:
+        await ensure_tenant_not_suspended(ctx)
+    except TenantSuspendedError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, FORBIDDEN_DETAIL) from exc
     deps = AssistantDeps(ctx=ctx)
     limits = build_run_limits()
     response = await VercelAIAdapter.dispatch_request(

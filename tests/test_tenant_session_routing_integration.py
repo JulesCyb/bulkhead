@@ -114,6 +114,7 @@ async def _seed_tenant(
     name: str,
     *,
     control_row: tuple[str, str | None] | None,
+    suspended: bool = False,
 ) -> None:
     """Writes the tenant's `public.tenants` row and, if given, its `control.tenants` bookkeeping
     row, as `app_owner`. `app_owner` is not a superuser and does not bypass RLS (FORCE ROW LEVEL
@@ -137,6 +138,15 @@ async def _seed_tenant(
                     "VALUES (:tid, :tier, :alias)"
                 ),
                 {"tid": tenant_id, "tier": isolation_tier, "alias": database_alias},
+            )
+        if suspended:
+            await conn.execute(
+                text(
+                    "INSERT INTO control.tenants (tenant_id, suspended_at) "
+                    "VALUES (:tid, now()) "
+                    "ON CONFLICT (tenant_id) DO UPDATE SET suspended_at = now()"
+                ),
+                {"tid": tenant_id},
             )
     await engine.dispose()
 
@@ -247,6 +257,54 @@ async def test_dedicated_tenants_data_is_physically_absent_from_the_pooled_datab
             )
             emails = (await conn.execute(text(_MEMBER_EMAILS))).scalars().all()
     assert emails == []
+
+
+async def test_tenant_session_rejects_a_suspended_tenant_and_unsuspending_restores_it(
+    routing_env,
+):
+    """Spec 9 / #69, ADR-0010, seam 1: the exact same control-plane read `tenant_session()` makes
+    to route a session (this file's other tests) also rejects it, before any session against the
+    tenant's data is ever opened, and un-suspending (the operator's `unsuspend` command, stood in
+    for here by a direct write, mirroring `_seed_tenant`) restores it -- with nothing
+    re-provisioned, exactly the same routing as before suspension.
+    """
+    from app.context import RequestContext
+    from app.db.session import TenantSuspendedError, get_engine, tenant_session
+
+    pooled_urls = routing_env["pooled"]
+    tenant = uuid.uuid4()
+    await _seed_tenant(
+        pooled_urls["migrations"],
+        tenant,
+        "Suspended",
+        control_row=("pooled", None),
+        suspended=True,
+    )
+    await _seed_user(pooled_urls["migrations"], tenant, "suspended@example.com")
+
+    ctx = RequestContext(tenant_id=tenant, identity_id=uuid.uuid4())
+    with pytest.raises(TenantSuspendedError) as exc_info:
+        async with tenant_session(ctx):
+            pass
+    assert exc_info.value.tenant_id == tenant
+
+    # Un-suspend (direct write, standing in for the operator's `unsuspend` command) and the exact
+    # same session-building call now succeeds, routed exactly as it would have been all along.
+    engine = create_async_engine(pooled_urls["migrations"])
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": str(tenant)}
+        )
+        await conn.execute(
+            text("UPDATE control.tenants SET suspended_at = NULL WHERE tenant_id = :tid"),
+            {"tid": str(tenant)},
+        )
+    await engine.dispose()
+
+    async with tenant_session(ctx) as session:
+        assert session.get_bind() is get_engine().sync_engine
+        emails = (await session.execute(text(_MEMBER_EMAILS))).scalars().all()
+        assert emails == ["suspended@example.com"]
 
 
 async def test_tenant_with_no_control_plane_row_defaults_to_pooled(routing_env):

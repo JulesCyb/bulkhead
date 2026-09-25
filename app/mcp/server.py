@@ -6,6 +6,12 @@ rewriting the tools.
 Context: in production, the tenant/identity context comes from the MCP connection's
 authentication (OAuth/token). For local development, from MCP_TENANT_ID / MCP_IDENTITY_ID.
 
+Every tool resolves its context through `resolve_context()`, not `context_provider()` directly
+(Spec 9 / #69, ADR-0010): it builds the context, then checks suspension
+(`app.tenant_suspension.ensure_tenant_not_suspended`) before any tool body runs -- the MCP
+connection handler's own, independent check, alongside the HTTP API's (`app/deps.py`) and the
+agent-run entry points' (`app/agents/assistant.py`).
+
 Start (stdio, e.g. in Claude Code's .mcp.json):
     uv run python -m app.mcp.server
 
@@ -22,6 +28,7 @@ from mcp.server.mcpserver import MCPServer
 
 from app.config import get_settings
 from app.context import RequestContext
+from app.tenant_suspension import ensure_tenant_not_suspended
 from app.tools import documents as document_tools
 
 server = MCPServer(
@@ -43,10 +50,21 @@ def _context_from_env() -> RequestContext:
 context_provider: Callable[[], RequestContext] = _context_from_env
 
 
+async def resolve_context() -> RequestContext:
+    """The MCP connection handler's own context resolution: builds the context, then rejects a
+    suspended tenant before any tool body runs (Spec 9 / #69, ADR-0010) -- see module docstring.
+    Every tool calls this, never `context_provider()` directly.
+    """
+    ctx = context_provider()
+    await ensure_tenant_not_suspended(ctx)
+    return ctx
+
+
 @server.tool()
 async def search_documents(query: str, limit: int = 5) -> list[dict]:
     """Semantic search in the current tenant's documents."""
-    hits = await document_tools.search_documents(context_provider(), query, limit)
+    ctx = await resolve_context()
+    hits = await document_tools.search_documents(ctx, query, limit)
     return [hit.model_dump(mode="json") for hit in hits]
 
 

@@ -22,7 +22,8 @@ into the one-shot agent is a change to code that doesn't exist, not a config tog
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 from pydantic_ai import Agent, RunContext
@@ -32,6 +33,7 @@ from app.context import RequestContext
 from app.llm import get_model
 from app.repositories.documents import DocumentHit
 from app.run_limits import RunLimits, build_run_limits, run_deadline
+from app.tenant_suspension import ensure_tenant_not_suspended
 from app.tools import documents as document_tools
 
 SearchFn = Callable[[RequestContext, str, int], Awaitable[list[DocumentHit]]]
@@ -97,7 +99,13 @@ _register_reading_tools(chat_assistant)
 
 
 async def run_assistant(prompt: str, deps: AssistantDeps, limits: RunLimits | None = None) -> str:
-    """Runs the one-shot (reading-only) agent — backs `/v1/t/{tenant_id}/agents/assistant/run`."""
+    """Runs the one-shot (reading-only) agent — backs `/v1/t/{tenant_id}/agents/assistant/run`.
+
+    Checks suspension itself (Spec 9 / #69, ADR-0010), independently of whatever context-building
+    layer called it — this is "the agent-run entry point" ADR-0010 names alongside the HTTP API
+    and the MCP server, not merely a route behind one of deps.py's checks.
+    """
+    await ensure_tenant_not_suspended(deps.ctx)
     limits = limits or build_run_limits()
     async with run_deadline(limits):
         result = await one_shot_assistant.run(
@@ -110,24 +118,32 @@ async def run_assistant(prompt: str, deps: AssistantDeps, limits: RunLimits | No
     return result.output
 
 
-def stream_assistant(prompt: str, deps: AssistantDeps, limits: RunLimits | None = None):
+@asynccontextmanager
+async def stream_assistant(
+    prompt: str, deps: AssistantDeps, limits: RunLimits | None = None
+) -> AsyncIterator[StreamedRunResult]:
     """Async context manager yielding a StreamedRunResult; use it via `async with` in routes.
 
     Backs `/v1/t/{tenant_id}/agents/assistant/stream` — runs the one-shot (reading-only) agent.
+
+    Checks suspension itself (Spec 9 / #69, ADR-0010) before ever opening the underlying stream —
+    see `run_assistant`'s docstring for why this is independent of the context-building layer.
 
     Does NOT itself enforce the run's wall-clock deadline: the deadline must bound the full
     open-and-consume lifecycle (opening the stream, then reading every delta from it), which
     means wrapping the caller's `async with ... as result: async for ...` block in
     `run_limits.run_deadline(limits)` — see `app/api/agents.py`'s `/assistant/stream` route.
     """
+    await ensure_tenant_not_suspended(deps.ctx)
     limits = limits or build_run_limits()
-    return one_shot_assistant.run_stream(
+    async with one_shot_assistant.run_stream(
         prompt,
         deps=deps,
         model=get_model(deps.model_name),
         usage_limits=limits.usage_limits,
         metadata=deps.ctx.trace_attributes(),
-    )
+    ) as result:
+        yield result
 
 
 __all__ = [
