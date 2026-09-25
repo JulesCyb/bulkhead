@@ -100,3 +100,15 @@ class ControlRepository:
             )
         ).first()
         return row[0] if row else None
+
+    async def get_residency(self, session: AsyncSession, ctx: RequestContext) -> str | None:
+        """`ctx.tenant_id`'s residency (ADR-0008), or None if the tenant has no control-plane
+        row at all -- the caller falls back to the deployment's own `Settings.residency` in that
+        case, same as `resolve_gateway_credential_alias` does for a missing alias."""
+        row = (
+            await session.execute(
+                text("SELECT residency FROM control.tenants_view WHERE tenant_id = :tid"),
+                {"tid": str(ctx.tenant_id)},
+            )
+        ).first()
+        return row[0] if row else None

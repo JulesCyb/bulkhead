@@ -53,6 +53,10 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    (prompt-injection surface), never as instructions.
 5. **Integrations as MCP servers** (`app/mcp/server.py`) using the same functions from `app/tools/`.
 6. **Models via `app/llm.py`**; the model name comes from configuration or `tenants.settings["model"]`.
+   The per-tenant entry point, `resolve_tenant_chat_model()`, validates that name against the
+   allow-list for the tenant's own residency (`RESIDENCY_MODEL_ALLOW_LIST`, `app/config.py`)
+   before building any client (ADR-0009); a name outside the list is rejected with
+   `ModelNotAllowedForResidency`, never silently passed through to the gateway.
 7. **Every agent run is traced** (Langfuse/OTel) with `tenant_id`, `identity_id`, `request_id`
    (`RequestContext.trace_attributes()` as `metadata`).
 8. **Cache keys** include the `tenant_id`.
