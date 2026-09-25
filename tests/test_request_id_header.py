@@ -73,8 +73,11 @@ async def test_stream_endpoint_carries_request_id_header(client, captured_ctx):
     assert header_value == captured_ctx[0].request_id
 
 
-async def test_chat_endpoint_carries_request_id_header(monkeypatch):
+async def test_chat_endpoint_carries_request_id_header(monkeypatch, fake_history):
     monkeypatch.setattr(chat_module, "get_model", lambda name=None: TestModel())
+    monkeypatch.setattr(
+        assistant_module.conversation_tools, "load_conversation_history", fake_history
+    )
     transport = httpx.ASGITransport(app=app)
     body = {
         "id": "conv-1",
