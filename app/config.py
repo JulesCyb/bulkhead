@@ -169,6 +169,15 @@ class Settings(BaseSettings):
             )
         return self
 
+    # Run limits (ADR-0009, CONTEXT.md "Run limit"): the ceiling of model requests, tool calls,
+    # and wall-clock time a single agent run may consume, enforced in the application — never a
+    # budget, that lives at the gateway. "Order of ten model requests and twenty tool calls" is a
+    # starting default meant to be tuned per deployment, not a load-bearing constant.
+    run_request_limit: int = 10
+    run_tool_calls_limit: int = 20
+    run_total_tokens_limit: int | None = None
+    run_deadline_seconds: float = 60.0
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
