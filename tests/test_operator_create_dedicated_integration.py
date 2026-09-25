@@ -135,9 +135,7 @@ async def _alembic_version(url: str) -> str | None:
     try:
         async with engine.connect() as conn:
             has_table = (
-                await conn.execute(
-                    text("SELECT to_regclass('public.alembic_version') IS NOT NULL")
-                )
+                await conn.execute(text("SELECT to_regclass('public.alembic_version') IS NOT NULL"))
             ).scalar_one()
             if not has_table:
                 return None
