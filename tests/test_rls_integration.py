@@ -102,10 +102,24 @@ def app_settings(database_urls, monkeypatch):
 
 
 async def _seed(url: str) -> tuple[uuid.UUID, uuid.UUID]:
-    """Two tenants with one document each — as the owner; without context RLS blocks all."""
+    """Two tenants with one document each — as the owner; without context RLS blocks all.
+
+    Documents' created_by/updated_by (#29) are NOT NULL foreign keys to control.identities,
+    defaulted from the session's app.identity_id -- so seeding needs a real identity row and
+    that setting in scope before the INSERTs, exactly like a real tenant_session() would supply.
+    """
     engine = create_async_engine(url)
     tenant_a, tenant_b = uuid.uuid4(), uuid.uuid4()
+    seed_identity = uuid.uuid4()
     async with engine.begin() as conn:
+        await conn.execute(
+            text("INSERT INTO control.identities (id, issuer, subject) VALUES (:id, 'seed', :sub)"),
+            {"id": seed_identity, "sub": str(seed_identity)},
+        )
+        await conn.execute(
+            text("SELECT set_config('app.identity_id', :iid, true)"),
+            {"iid": str(seed_identity)},
+        )
         for tenant_id, name, seed in ((tenant_a, "A", 0.1), (tenant_b, "B", 0.9)):
             await conn.execute(
                 text("INSERT INTO tenants (id, name) VALUES (:id, :name)"),
@@ -179,6 +193,145 @@ async def test_app_role_cannot_delete_tenants(app_settings, database_urls):
     with pytest.raises((DBAPIError, ProgrammingError)):
         async with tenant_session(ctx_a) as session:
             await session.execute(text("DELETE FROM tenants WHERE id = :tid"), {"tid": tenant_a})
+
+
+async def _create_tenant_and_identity(url: str) -> tuple[uuid.UUID, uuid.UUID]:
+    """A bare tenant and a real control.identities row — for the document audit-column tests
+    (#29), whose created_by/updated_by are NOT NULL foreign keys to control.identities."""
+    engine = create_async_engine(url)
+    tenant_id, identity_id = uuid.uuid4(), uuid.uuid4()
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("INSERT INTO tenants (id, name) VALUES (:id, 'Audit')"), {"id": tenant_id}
+        )
+        await conn.execute(
+            text("INSERT INTO control.identities (id, issuer, subject) VALUES (:id, 'seed', :sub)"),
+            {"id": identity_id, "sub": str(identity_id)},
+        )
+    await engine.dispose()
+    return tenant_id, identity_id
+
+
+async def test_document_insert_sets_created_by_from_session_identity(app_settings, database_urls):
+    """#29 AC1: inserting a document through the tenant-bound session sets created_by (and
+    updated_by, on first write) to the session's identity without application code passing it
+    explicitly -- DocumentRepository.add() never mentions the column."""
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.repositories.documents import DocumentRepository
+
+    tenant_id, identity_id = await _create_tenant_and_identity(database_urls["superuser"])
+    ctx = RequestContext(tenant_id=tenant_id, identity_id=identity_id)
+    async with tenant_session(ctx) as session:
+        doc = await DocumentRepository().add(session, ctx, title="t", content="c", embedding=None)
+        doc_id = doc.id
+
+    # Re-read the row directly: the property under test is what the database persisted, not
+    # what the ORM's local object happens to reflect.
+    engine = create_async_engine(database_urls["superuser"])
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text("SELECT created_by, updated_by FROM documents WHERE id = :id"),
+                {"id": doc_id},
+            )
+        ).one()
+    await engine.dispose()
+    assert row.created_by == identity_id
+    assert row.updated_by == identity_id
+
+
+async def test_document_update_refreshes_updated_by_and_keeps_created_by(
+    app_settings, database_urls
+):
+    """#29 AC2: updating a document in a second transaction with a different session identity
+    changes updated_by/updated_at, while the original creator (created_by) stays unchanged."""
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.repositories.documents import DocumentRepository
+
+    tenant_id, creator_id = await _create_tenant_and_identity(database_urls["superuser"])
+    _, editor_id = await _create_tenant_and_identity(database_urls["superuser"])
+
+    creator_ctx = RequestContext(tenant_id=tenant_id, identity_id=creator_id)
+    async with tenant_session(creator_ctx) as session:
+        doc = await DocumentRepository().add(
+            session, creator_ctx, title="t", content="c", embedding=None
+        )
+        doc_id = doc.id
+
+    editor_ctx = RequestContext(tenant_id=tenant_id, identity_id=editor_id)
+    async with tenant_session(editor_ctx) as session:
+        await session.execute(
+            text("UPDATE documents SET title = 'updated' WHERE id = :id"), {"id": doc_id}
+        )
+
+    engine = create_async_engine(database_urls["superuser"])
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text(
+                    "SELECT created_by, updated_by, created_at, updated_at "
+                    "FROM documents WHERE id = :id"
+                ),
+                {"id": doc_id},
+            )
+        ).one()
+    await engine.dispose()
+    assert row.created_by == creator_id
+    assert row.updated_by == editor_id
+    assert row.updated_at > row.created_at
+
+
+async def test_document_created_by_fk_checked_as_owner_not_app_role(app_settings, database_urls):
+    """#29 AC3: the creator FK resolves against control.identities even though the app role's
+    only grant on it is the narrow issuer-plus-subject lookup view (ADR-0003) -- app has no
+    grant at all on control.identities itself. Proves the FK is checked with the referenced
+    table's owner privileges, not the querying role's, rather than assuming it: a real identity
+    resolves despite the missing grant, and an unknown identity is still rejected by the FK."""
+    from sqlalchemy.exc import DBAPIError
+
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.repositories.documents import DocumentRepository
+
+    tenant_id, identity_id = await _create_tenant_and_identity(database_urls["superuser"])
+
+    engine = create_async_engine(database_urls["app"])
+    async with engine.connect() as conn:
+        grants = (
+            await conn.execute(
+                text(
+                    "SELECT count(*) FROM information_schema.role_table_grants "
+                    "WHERE table_schema = 'control' AND table_name = 'identities' "
+                    "AND grantee = current_user"
+                )
+            )
+        ).scalar_one()
+    await engine.dispose()
+    assert grants == 0
+
+    ctx = RequestContext(tenant_id=tenant_id, identity_id=identity_id)
+    async with tenant_session(ctx) as session:
+        doc = await DocumentRepository().add(session, ctx, title="t", content="c", embedding=None)
+        doc_id = doc.id
+
+    engine = create_async_engine(database_urls["superuser"])
+    async with engine.connect() as conn:
+        created_by = (
+            await conn.execute(
+                text("SELECT created_by FROM documents WHERE id = :id"), {"id": doc_id}
+            )
+        ).scalar_one()
+    await engine.dispose()
+    assert created_by == identity_id
+
+    unknown_ctx = RequestContext(tenant_id=tenant_id, identity_id=uuid.uuid4())
+    with pytest.raises(DBAPIError):
+        async with tenant_session(unknown_ctx) as session:
+            await DocumentRepository().add(
+                session, unknown_ctx, title="t2", content="c2", embedding=None
+            )
 
 
 async def test_tenant_session_sets_identity_id(app_settings, database_urls):
@@ -276,7 +429,7 @@ async def test_owner_owns_public_schema_and_ran_the_migrations(database_urls):
                 await conn.execute(
                     text(
                         "SELECT tableowner FROM pg_tables WHERE schemaname = 'public' "
-                        "AND tablename IN ('tenants', 'users', 'documents')"
+                        "AND tablename IN ('tenants', 'memberships', 'documents')"
                     )
                 )
             )
@@ -431,7 +584,10 @@ async def test_control_tenants_owned_by_app_owner_never_app(database_urls):
 
 async def test_control_tenants_has_forced_rls_with_using_and_check(database_urls):
     """`control.tenants` carries forced RLS with a policy that both restricts and validates,
-    the same shape as every other tenant-scoped table (#12)."""
+    the same shape as every other tenant-scoped table (#12). Selected by name, not "the only
+    policy on this table": migration 0016 (#76) adds a second, purely additive SELECT-only
+    policy (a narrow migration-runner escape hatch) alongside this one -- it carries no
+    with_check clause of its own and does not change this policy's shape."""
     engine = create_async_engine(database_urls["migrations"])
     async with engine.connect() as conn:
         row = (
@@ -447,7 +603,8 @@ async def test_control_tenants_has_forced_rls_with_using_and_check(database_urls
             await conn.execute(
                 text(
                     "SELECT qual IS NOT NULL, with_check IS NOT NULL FROM pg_policies "
-                    "WHERE schemaname = 'control' AND tablename = 'tenants'"
+                    "WHERE schemaname = 'control' AND tablename = 'tenants' "
+                    "AND policyname = 'control_tenants_tenant_isolation'"
                 )
             )
         ).one()
@@ -1342,3 +1499,405 @@ async def test_ready_endpoint_succeeds_against_real_postgres_as_the_app_role(app
         response = await client.get("/ready")
     assert response.status_code == 200
     assert response.json() == {"status": "ready"}
+
+
+# --- Residency route resolution (#60, ADR-0008): the resolver end to end, real RLS ---------
+
+
+async def _set_residency(url: str, tenant_id: uuid.UUID, residency: str | None) -> None:
+    """As the superuser, exactly like `_seed` above: writes `tenants.settings["residency"]`
+    directly rather than through the resolver-under-test, so the resolver's own read is what's
+    being verified, not a round trip through itself."""
+    engine = create_async_engine(url)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE tenants SET settings = jsonb_set("
+                "coalesce(settings, '{}'::jsonb), '{residency}', "
+                "to_jsonb(CAST(:residency AS text))) "
+                "WHERE id = :tid"
+            ),
+            {"tid": tenant_id, "residency": residency},
+        )
+    await engine.dispose()
+
+
+async def test_residency_resolves_through_real_rls_and_never_crosses_tenants(
+    app_settings, database_urls, tmp_path
+):
+    """Given two tenants set to different residencies, resolving one tenant's route never
+    returns the other's -- read through the same tenant-scoped session/RLS scaffolding every
+    repository uses, exactly like the document-search isolation test above (#60)."""
+    from app.config import RESIDENCY_ALLOW_LIST, Settings
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.residency import resolve_residency_route
+
+    tenant_eu, tenant_us = await _seed(database_urls["superuser"])
+    await _set_residency(database_urls["superuser"], tenant_eu, "eu")
+    await _set_residency(database_urls["superuser"], tenant_us, "us")
+    await _set_gateway_alias(database_urls["migrations"], tenant_eu, "acme-gateway-key")
+    await _set_gateway_alias(database_urls["migrations"], tenant_us, "globex-gateway-key")
+    (tmp_path / "acme-gateway-key").write_text("sk-acme-secret")
+    (tmp_path / "globex-gateway-key").write_text("sk-globex-secret")
+    settings = Settings(database_url=database_urls["app"], gateway_credentials_dir=str(tmp_path))
+
+    ctx_eu = RequestContext(tenant_id=tenant_eu, identity_id=uuid.uuid4())
+    async with tenant_session(ctx_eu) as session:
+        resolved_eu = await resolve_residency_route(session, ctx_eu, settings=settings)
+
+    ctx_us = RequestContext(tenant_id=tenant_us, identity_id=uuid.uuid4())
+    async with tenant_session(ctx_us) as session:
+        resolved_us = await resolve_residency_route(session, ctx_us, settings=settings)
+
+    assert resolved_eu.residency == "eu"
+    assert resolved_eu.route == RESIDENCY_ALLOW_LIST["eu"]
+    assert resolved_eu.gateway_credential.get_secret_value() == "sk-acme-secret"
+
+    assert resolved_us.residency == "us"
+    assert resolved_us.route == RESIDENCY_ALLOW_LIST["us"]
+    assert resolved_us.gateway_credential.get_secret_value() == "sk-globex-secret"
+
+    # Never each other's route or credential.
+    assert resolved_eu.route != resolved_us.route
+    assert resolved_eu.route.trace_sink_host != resolved_us.route.trace_sink_host
+    assert (
+        resolved_eu.gateway_credential.get_secret_value()
+        != resolved_us.gateway_credential.get_secret_value()
+    )
+
+
+async def test_residency_resolution_is_scoped_by_rls_not_just_the_where_clause(
+    app_settings, database_urls, tmp_path
+):
+    """Even if the resolver's own WHERE clause were removed or broken, RLS on `tenants` (0001)
+    would still stop tenant A's session from ever reading tenant B's row: `tenant_session(ctx)`
+    sets `app.tenant_id` per transaction, and the `tenants_self_only` policy filters on it."""
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+
+    tenant_eu, tenant_us = await _seed(database_urls["superuser"])
+    await _set_residency(database_urls["superuser"], tenant_eu, "eu")
+    await _set_residency(database_urls["superuser"], tenant_us, "us")
+
+    ctx_eu = RequestContext(tenant_id=tenant_eu, identity_id=uuid.uuid4())
+    async with tenant_session(ctx_eu) as session:
+        # Querying tenant B's row from tenant A's session-scoped connection returns nothing:
+        # RLS filters it out before this WHERE clause is even considered.
+        row = (
+            await session.execute(
+                text("SELECT settings ->> 'residency' FROM tenants WHERE id = :tid"),
+                {"tid": tenant_us},
+            )
+        ).first()
+    assert row is None
+
+
+async def test_resolver_fails_closed_for_a_tenant_with_no_residency_set(
+    app_settings, database_urls
+):
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.residency import ResidencyUnresolved, resolve_residency_route
+
+    tenant_a, _ = await _seed(database_urls["superuser"])
+    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
+    with pytest.raises(ResidencyUnresolved):
+        async with tenant_session(ctx_a) as session:
+            await resolve_residency_route(session, ctx_a)
+
+
+async def test_resolver_fails_closed_for_a_tenant_with_an_unknown_residency(
+    app_settings, database_urls
+):
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.residency import ResidencyUnresolved, resolve_residency_route
+
+    tenant_a, _ = await _seed(database_urls["superuser"])
+    await _set_residency(database_urls["superuser"], tenant_a, "mars")
+    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
+    with pytest.raises(ResidencyUnresolved):
+        async with tenant_session(ctx_a) as session:
+            await resolve_residency_route(session, ctx_a)
+
+
+# --- Tenant memberships replace per-tenant users (ADR-0003, Spec 2 / #23) ---
+
+
+async def _seed_identity(url: str, *, subject: str) -> uuid.UUID:
+    """A global identity, inserted with the superuser exactly like `_seed`'s tenants/documents:
+    `control.identities` carries no tenant_id and no RLS (ADR-0003)."""
+    engine = create_async_engine(url)
+    identity_id = uuid.uuid4()
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO control.identities (id, issuer, subject) "
+                "VALUES (:id, 'https://idp.example.com', :subject)"
+            ),
+            {"id": identity_id, "subject": subject},
+        )
+    await engine.dispose()
+    return identity_id
+
+
+async def _seed_membership(
+    url: str, *, tenant_id: uuid.UUID, identity_id: uuid.UUID, role: str
+) -> None:
+    engine = create_async_engine(url)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO memberships (tenant_id, identity_id, role) "
+                "VALUES (:tenant_id, :identity_id, :role)"
+            ),
+            {"tenant_id": tenant_id, "identity_id": identity_id, "role": role},
+        )
+    await engine.dispose()
+
+
+async def test_migration_drops_users_and_memberships_has_the_expected_shape(database_urls):
+    """Acceptance: migrating drops the old per-tenant `users` table and creates `memberships`
+    with a required indexed tenant reference, a cross-schema reference to `control.identities`,
+    a role restricted to the four defined roles, one membership per identity per tenant, and RLS
+    enabled and forced."""
+    engine = create_async_engine(database_urls["migrations"])
+    async with engine.connect() as conn:
+        users_exists = (
+            await conn.execute(
+                text(
+                    "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+                    "WHERE table_schema = 'public' AND table_name = 'users')"
+                )
+            )
+        ).scalar_one()
+        assert users_exists is False
+
+        rls = (
+            await conn.execute(
+                text(
+                    "SELECT relrowsecurity, relforcerowsecurity FROM pg_class "
+                    "WHERE oid = CAST('memberships' AS regclass)"
+                )
+            )
+        ).one()
+        assert rls.relrowsecurity is True
+        assert rls.relforcerowsecurity is True
+
+        tenant_idx = (
+            await conn.execute(
+                text(
+                    "SELECT indexdef FROM pg_indexes "
+                    "WHERE schemaname = 'public' AND tablename = 'memberships' "
+                    "AND indexname = 'memberships_tenant_idx'"
+                )
+            )
+        ).scalar_one_or_none()
+        assert tenant_idx is not None
+
+        not_null_tenant = (
+            await conn.execute(
+                text(
+                    "SELECT is_nullable FROM information_schema.columns "
+                    "WHERE table_schema = 'public' AND table_name = 'memberships' "
+                    "AND column_name = 'tenant_id'"
+                )
+            )
+        ).scalar_one()
+        assert not_null_tenant == "NO"
+
+        identity_fk_target = (
+            await conn.execute(
+                text(
+                    """
+                    SELECT ccu.table_schema, ccu.table_name
+                    FROM information_schema.table_constraints tc
+                    JOIN information_schema.constraint_column_usage ccu
+                        ON tc.constraint_name = ccu.constraint_name
+                        AND tc.constraint_schema = ccu.constraint_schema
+                    JOIN information_schema.key_column_usage kcu
+                        ON tc.constraint_name = kcu.constraint_name
+                        AND tc.constraint_schema = kcu.constraint_schema
+                    WHERE tc.constraint_type = 'FOREIGN KEY'
+                        AND tc.table_schema = 'public' AND tc.table_name = 'memberships'
+                        AND kcu.column_name = 'identity_id'
+                    """
+                )
+            )
+        ).one()
+    await engine.dispose()
+    assert (identity_fk_target.table_schema, identity_fk_target.table_name) == (
+        "control",
+        "identities",
+    )
+
+    # One membership per identity per tenant.
+    tenant_id = uuid.uuid4()
+    identity_id = await _seed_identity(database_urls["superuser"], subject="s-unique")
+    superuser_engine = create_async_engine(database_urls["superuser"])
+    async with superuser_engine.begin() as conn:
+        await conn.execute(
+            text("INSERT INTO tenants (id, name) VALUES (:id, 'Uniq')"), {"id": tenant_id}
+        )
+    await superuser_engine.dispose()
+    await _seed_membership(
+        database_urls["superuser"], tenant_id=tenant_id, identity_id=identity_id, role="member"
+    )
+    from sqlalchemy.exc import DBAPIError, IntegrityError
+
+    with pytest.raises((DBAPIError, IntegrityError)):
+        await _seed_membership(
+            database_urls["superuser"], tenant_id=tenant_id, identity_id=identity_id, role="admin"
+        )
+
+    # Role restricted to the four defined roles.
+    other_identity_id = await _seed_identity(database_urls["superuser"], subject="s-bad-role")
+    with pytest.raises((DBAPIError, IntegrityError)):
+        await _seed_membership(
+            database_urls["superuser"],
+            tenant_id=tenant_id,
+            identity_id=other_identity_id,
+            role="owner",
+        )
+
+
+async def test_memberships_grants_mirror_the_retired_users_grants(database_urls):
+    """Acceptance: grants on `memberships` for `app` mirror the retired `users` grants."""
+    engine = create_async_engine(database_urls["app"])
+    async with engine.connect() as conn:
+        privileges = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT privilege_type FROM information_schema.table_privileges "
+                        "WHERE table_schema = 'public' AND table_name = 'memberships' "
+                        "AND grantee = 'app'"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    await engine.dispose()
+    assert set(privileges) == {"SELECT", "INSERT", "UPDATE", "DELETE"}
+
+
+async def test_second_tenants_memberships_are_invisible_without_its_own_context(
+    app_settings, database_urls
+):
+    """Acceptance (mirrors the retired users coverage): a second tenant's membership rows are
+    invisible without that tenant's own context set, and a cross-tenant insert or update fails
+    the write check."""
+    from sqlalchemy.exc import DBAPIError
+
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+
+    tenant_a, tenant_b = await _seed(database_urls["superuser"])
+    identity_a = await _seed_identity(database_urls["superuser"], subject="s-a")
+    identity_b = await _seed_identity(database_urls["superuser"], subject="s-b")
+    await _seed_membership(
+        database_urls["superuser"], tenant_id=tenant_a, identity_id=identity_a, role="admin"
+    )
+    await _seed_membership(
+        database_urls["superuser"], tenant_id=tenant_b, identity_id=identity_b, role="admin"
+    )
+
+    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=identity_a)
+    async with tenant_session(ctx_a) as session:
+        rows = (await session.execute(text("SELECT tenant_id FROM memberships"))).scalars().all()
+    assert rows == [tenant_a]
+
+    # Cross-tenant insert is rejected by the WITH CHECK clause.
+    with pytest.raises(DBAPIError):
+        async with tenant_session(ctx_a) as session:
+            await session.execute(
+                text(
+                    "INSERT INTO memberships (tenant_id, identity_id, role) "
+                    "VALUES (:tid, :iid, 'member')"
+                ),
+                {"tid": tenant_b, "iid": identity_b},
+            )
+
+    # Cross-tenant update (targeting the other tenant's row) is rejected: the USING clause
+    # hides the row from tenant A's session in the first place, so zero rows are affected.
+    async with tenant_session(ctx_a) as session:
+        result = await session.execute(
+            text("UPDATE memberships SET role = 'support' WHERE tenant_id = :tid"),
+            {"tid": tenant_b},
+        )
+        assert result.rowcount == 0
+
+
+async def test_membership_lookup_returns_role_or_none(app_settings, database_urls):
+    """Acceptance: the membership lookup returns the role for an existing tenant/identity pair
+    and returns nothing rather than raising when no row matches."""
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.repositories.memberships import MembershipRepository
+
+    tenant_a, _ = await _seed(database_urls["superuser"])
+    identity_a = await _seed_identity(database_urls["superuser"], subject="s-lookup")
+    await _seed_membership(
+        database_urls["superuser"], tenant_id=tenant_a, identity_id=identity_a, role="support"
+    )
+
+    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=identity_a)
+    async with tenant_session(ctx_a) as session:
+        found = await MembershipRepository().get_role(session, ctx_a, identity_id=identity_a)
+        missing = await MembershipRepository().get_role(session, ctx_a, identity_id=uuid.uuid4())
+    assert found == "support"
+    assert missing is None
+
+
+async def test_list_for_tenant_returns_every_role_unfiltered(app_settings, database_urls):
+    """Acceptance: listing a tenant's memberships returns every row including a support-role
+    one, with no role-based filtering."""
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.repositories.memberships import MembershipRepository
+
+    tenant_a, _ = await _seed(database_urls["superuser"])
+    identities = {
+        role: await _seed_identity(database_urls["superuser"], subject=f"s-{role}")
+        for role in ("admin", "member", "support", "agent")
+    }
+    for role, identity_id in identities.items():
+        await _seed_membership(
+            database_urls["superuser"], tenant_id=tenant_a, identity_id=identity_id, role=role
+        )
+
+    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=identities["admin"])
+    async with tenant_session(ctx_a) as session:
+        records = await MembershipRepository().list_for_tenant(session, ctx_a)
+
+    assert {record.role for record in records} == {"admin", "member", "support", "agent"}
+    assert len(records) == 4
+
+
+async def test_app_cannot_widen_its_control_plane_view_with_the_migration_read_flag(
+    database_urls,
+):
+    """0016's migration-read policy exists for the owner-role migration runner only. `app` can
+    set any custom setting itself, so setting `app.control_migration_read` must still leave it
+    seeing nothing but its own tenant's control-plane row."""
+    tenant_a, tenant_b = uuid.uuid4(), uuid.uuid4()
+    owner = create_async_engine(database_urls["superuser"])
+    async with owner.begin() as conn:
+        for tid, name in ((tenant_a, "Flag A"), (tenant_b, "Flag B")):
+            await _insert_public_tenant(conn, tid, name)
+            await _insert_control_tenant(conn, tid, isolation_tier="pooled", database_alias=None)
+    await owner.dispose()
+
+    app = create_async_engine(database_urls["app"])
+    async with app.begin() as conn:
+        await conn.execute(text("SELECT set_config('app.control_migration_read', 'true', true)"))
+        await conn.execute(
+            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": str(tenant_a)}
+        )
+        visible = (
+            (await conn.execute(text("SELECT tenant_id FROM control.tenants_view"))).scalars().all()
+        )
+    await app.dispose()
+    assert visible == [tenant_a]

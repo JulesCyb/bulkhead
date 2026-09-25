@@ -1,4 +1,10 @@
-"""Alembic environment (async, asyncpg). Runs with DATABASE_URL_MIGRATIONS (owner role)."""
+"""Alembic environment (async, asyncpg). Runs with DATABASE_URL_MIGRATIONS (owner role) by
+default -- overridable per invocation via `config.attributes["migration_database_url"]`, the
+seam `scripts/migrate.py` (#76) uses to bring a *specific* database alias to head without
+touching `Settings`/`MigrationSettings` or any other alias's database. `alembic upgrade head`
+run directly from the CLI never sets that attribute, so it keeps migrating the pooled database
+named by DATABASE_URL_MIGRATIONS exactly as before.
+"""
 
 from __future__ import annotations
 
@@ -17,8 +23,10 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
+_url_override = config.attributes.get("migration_database_url")
 config.set_main_option(
-    "sqlalchemy.url", get_migration_settings().database_url_migrations.get_secret_value()
+    "sqlalchemy.url",
+    _url_override or get_migration_settings().database_url_migrations.get_secret_value(),
 )
 target_metadata = Base.metadata
 

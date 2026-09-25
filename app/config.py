@@ -74,6 +74,12 @@ class Settings(BaseSettings):
     # SecretStr (issue #14 / ADR-0011): every tenant-secret and connection-string field is held
     # this way so the object's own repr/str never prints a live value — read with
     # .get_secret_value() only at the one call site that needs the plain value.
+    # This is the *pooled* alias's connection string only (ADR-0002, `app.db.engine_registry`,
+    # Spec 10 / #75) -- the one database every tenant is served from until an operator marks it
+    # `dedicated`. It is never the place for a second tenant's (or any dedicated tenant's)
+    # connection details: those live one-per-alias in tenant-secret files under
+    # `TENANT_DB_SECRETS_DIR` (ADR-0011), resolved lazily by `app.db.engine_registry`, never as a
+    # field on this class.
     database_url: SecretStr = SecretStr("postgresql+asyncpg://app:app@localhost:5432/app")
     # The owner/migrations connection string is NOT a field here (issue #14 / ADR-0011): it is
     # removed from the application's configuration object entirely, so no code path in the
@@ -95,6 +101,11 @@ class Settings(BaseSettings):
     llm_model: str = "anthropic:claude-sonnet-4-5"
     litellm_base_url: str | None = None
     litellm_api_key: SecretStr | None = None
+    # The gateway's admin credential (Spec 7 / #53, ADR-0009): mints and revokes per-tenant
+    # virtual keys through app/gateway_provisioning.py. Distinct from litellm_api_key above,
+    # which the application uses to *call* the gateway as a tenant's own client would -- this
+    # one is never used to build a chat/embedding client, only by the provisioning module.
+    litellm_master_key: SecretStr | None = None
     # No default: a deployment with no embedding provider/model configured must refuse to
     # construct rather than silently reaching some default endpoint (ADR-0008).
     embedding_provider: str | None = None
@@ -145,6 +156,15 @@ class Settings(BaseSettings):
     # field name. Same default location (files delivered by the deployment under /run/secrets),
     # different lookup key and lifetime.
     gateway_credentials_dir: str = "/run/secrets"
+
+    # Default budget and rate limit a newly provisioned tenant's gateway credential is minted
+    # with (Spec 7 / #53, ADR-0009): starting defaults meant to be tuned per deployment, not
+    # load-bearing constants -- a future operator tool (Spec 9) may accept per-tenant overrides
+    # instead of always using these.
+    gateway_default_spend_ceiling_usd: float = 50.0
+    gateway_default_budget_reset_period: str = "30d"
+    gateway_default_requests_per_minute: int = 60
+    gateway_default_tokens_per_minute: int = 100_000
 
     @model_validator(mode="after")
     def _require_embedding_config(self) -> "Settings":

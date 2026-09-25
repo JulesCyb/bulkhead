@@ -9,13 +9,42 @@
   them); the defaults are for localhost only.
 - **Ports**: compose binds 5432/8000/4000 to `127.0.0.1` — the reverse proxy (below) is the
   only public entry point. Do not "fix" this by unbinding.
+- **Least privilege by default (#18)**: `api` and `migrate` no longer take `env_file: .env` (a
+  blanket copy of the whole file into the container); each names only the variables its own job
+  needs in its own `environment:` block. `api` never sees `DATABASE_URL_MIGRATIONS`,
+  `APP_OWNER_DB_PASSWORD`, `POSTGRES_PASSWORD`, `GATEWAY_DB_PASSWORD`, or `LITELLM_MASTER_KEY`;
+  `migrate` sees only its own owner DSN plus the trace-sink/residency variables it shares with
+  `api`. `postgres`/`api`/`migrate` share a `db` network; the gateway is never on it (see
+  "LiteLLM (gateway)" below). Adding a new variable to a service means adding it explicitly to
+  that service's `environment:` block, not restoring `env_file:`.
+- **Secrets as files in production (issue #14 / ADR-0011)**: every secret/connection-string field
+  on `app.config.Settings` and `app.migration_settings.MigrationSettings` is read through
+  pydantic-settings' `secrets_dir="/run/secrets"` — a file named after the field (e.g.
+  `/run/secrets/database_url`, `/run/secrets/anthropic_api_key`) is picked up automatically, and
+  a matching environment variable still wins if both are present. In production, mount tenant and
+  deployment secrets as files under `/run/secrets` (Docker/Swarm secrets, a Kubernetes
+  `secretKeyRef` volume, or a file SOPS decrypts on deploy) instead of passing them as plain
+  environment variables in `.env`; rotating a secret is then replacing the file and redeploying,
+  with no code change. `.env`/`environment:` stays the right choice for local development.
+- **Image pins**: every pulled image in `docker-compose.yml` (`postgres`, `litellm`) names a
+  specific version, never `latest`/a bare major-version tag — `docker compose config` is the
+  place this is enforced (`tests/test_deployment_hardening_compose.py`,
+  `tests/test_gateway_compose.py`). `api`/`migrate` build from this repo's own `Dockerfile`, whose
+  own base images (`python:3.12-slim`, `ghcr.io/astral-sh/uv`) are pinned there for the same
+  reason.
+- **Local env files**: `.gitignore`/`.dockerignore` exclude any `.env.<anything>` (not just the
+  exact name `.env`) by default, so a locally created `.env.local`/`.env.production` never lands
+  in git or an image layer; `.env.example` is explicitly re-included in both so the template stays
+  tracked and shipped.
 
 ## Local / a single server (EU)
 
 - `docker compose up -d` starts Postgres, runs migrations via the one-shot `migrate` service
-  (owner role — the api container never holds the superuser DSN), starts the API, and starts
-  the model gateway (LiteLLM) — required, not an optional profile (ADR-0009). Set
-  `LITELLM_MASTER_KEY` in `.env` first; rendering the compose file fails otherwise.
+  (as the non-superuser `app_owner` role — the `api` container's own environment allow-list
+  never includes `DATABASE_URL_MIGRATIONS`, `APP_OWNER_DB_PASSWORD`, or `POSTGRES_PASSWORD`; see
+  "Least privilege by default" above), starts the API, and starts the model gateway (LiteLLM) —
+  required, not an optional profile (ADR-0009). Set `LITELLM_MASTER_KEY` in `.env` first;
+  rendering the compose file fails otherwise.
 - Backups: `pg_dump` via cron or provider snapshots; object storage (MinIO/Hetzner) for files.
 - Put a reverse proxy with TLS (Caddy/Traefik) in front of the API, targeting `127.0.0.1:8000`.
 
@@ -29,13 +58,13 @@ this deployment is; `RESIDENCY_ALLOW_LIST` in `app/config.py` is the single plac
 residency's allowed hosts — add a residency there, not by editing a host string in one of these
 sections.
 
-`api` and `migrate` are the two services with `env_file: .env` in `docker-compose.yml`, so both
-receive `LANGFUSE_HOST` (and `RESIDENCY`) exactly as set in `.env`; `postgres` and `litellm`
-receive only the specific variables named under their own `environment:` block and never see the
-tracing secret (see `tests/test_gateway_compose.py`). `tests/test_residency_trace_sink_compose.py`
-renders the compose file and asserts this wiring directly, so an edit that silently drops the
-trace sink from a service that needs it — or leaks it into one that shouldn't have it — fails
-that test instead of surfacing in an incident.
+`api` and `migrate` each name `LANGFUSE_HOST` (and `RESIDENCY`) explicitly in their own
+`environment:` block in `docker-compose.yml` (#18 dropped the blanket `env_file: .env` both used
+to have); `postgres` and `litellm` receive only the specific variables named under their own
+`environment:` block and never see the tracing secret (see `tests/test_gateway_compose.py`).
+`tests/test_residency_trace_sink_compose.py` renders the compose file and asserts this wiring
+directly, so an edit that silently drops the trace sink from a service that needs it — or leaks it
+into one that shouldn't have it — fails that test instead of surfacing in an incident.
 
 ## Langfuse (tracing)
 
@@ -52,10 +81,25 @@ in `docker/postgres/01-init.sh`) that can never see the application's tenant tab
 receives only its own database URL, `LITELLM_MASTER_KEY`, and the model-provider credentials its
 configured aliases call — never the application's database credential or the tracing secret.
 Maintain `docker/litellm/config.yaml`; set `LITELLM_MASTER_KEY` in `.env` (rendering
-`docker-compose.yml` fails if it is unset) and mint virtual keys with per-tenant budgets via the
-LiteLLM admin API. Backend: `LITELLM_BASE_URL=http://litellm:4000`,
+`docker-compose.yml` fails if it is unset). `scripts/seed.py` mints the first tenant's virtual
+key automatically via `app.gateway_provisioning.provision_gateway_credential` (Spec 7 / #53) —
+no manual step. Before Spec 9's operator tool exists, provision any later tenant the same way,
+from a Python shell: `await provision_gateway_credential(tenant_id, residency=..., limits=...)`;
+`revoke_gateway_credential(tenant_id)` reverses it (revokes the key, removes the secret file,
+clears the control-plane alias). Backend: `LITELLM_BASE_URL=http://litellm:4000`,
 `LITELLM_API_KEY=<virtual key>`, `LLM_MODEL=openai:claude`, `EMBEDDING_MODEL=embeddings`
 (the alias names from the config).
+
+**Networking (#18)**: `litellm` sits on two networks, neither shared with `db` (the network `api`
+and `migrate` use for the application's own connections to postgres): `gatewaydb` carries only the
+gateway's own database traffic to `postgres`, and `gateway` carries only `api`'s HTTP calls to the
+gateway's OpenAI-compatible API. A compromised gateway credential therefore has no network route
+to the application's own database traffic, and `migrate` (which never calls the gateway) has no
+route to it at all. `postgres` and `litellm` still share the `gatewaydb` network — the gateway's
+own database genuinely lives on that same Postgres instance (ADR-0009), and a Postgres bound to
+`127.0.0.1` on the host cannot be reached from a container with no shared Docker network at all;
+splitting the gateway onto its own Postgres instance would remove that overlap entirely but is a
+bigger change than this networking pass (see `tests/test_deployment_hardening_compose.py`).
 
 ## Scaling / relocation
 

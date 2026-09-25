@@ -13,7 +13,9 @@ ADR wins — then update this file.
 - Backend/API: FastAPI, Python 3.12, `uv`
 - Agent logic: PydanticAI (`app/agents/assistant.py`); LangGraph only with an ADR justification
 - Models: `LLM_MODEL` in `<provider>:<model>` format, optionally through the LiteLLM gateway (`app/llm.py`)
-- Data: PostgreSQL 17 + pgvector, RLS on, app role `app` (no superuser)
+- Data: PostgreSQL 17 + pgvector, RLS on; the app connects as `app` (no superuser); a separate
+  `app_owner` role (no superuser either) owns every object and runs migrations; operator-owned
+  facts live in a `control` schema `app` can only read through views
 - Observability: Langfuse via OTel (`app/observability.py`, optionally `logfire`)
 - Frontend: none in this repo — Next.js + Vercel AI SDK against `POST /v1/t/{tenant_id}/api/chat`, see `docs/frontend.md`; a mobile app as another client, see `docs/mobile.md`
 - Operations: Docker Compose (`docker-compose.yml`), hosted in an EU region
@@ -23,7 +25,8 @@ ADR wins — then update this file.
 ```bash
 uv sync                                   # environment (+ --extra observability, --group dbtest)
 docker compose up -d --wait postgres      # database locally
-uv run alembic upgrade head               # migrations (owner role, DATABASE_URL_MIGRATIONS)
+uv run python scripts/migrate.py          # migrations run once per database alias: every alias to head
+uv run python scripts/migrate.py <alias>  # migrations for just that one alias (owner role)
 uv run python scripts/seed.py "My Tenant" me@example.com   # first tenant + user
 uv run python scripts/provision_roles.py <admin-database-url>  # managed Postgres, no init hook
 uv run uvicorn app.main:app --reload      # API locally, http://localhost:8000/docs
@@ -45,7 +48,8 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    tenant-table registry (`app/db/tenant_tables.py`). Template: `migrations/versions/0001_initial.py`.
 3. **DB access only through repositories** (`app/repositories/`) with sessions from
    `tenant_session(ctx)`. The app connects as `app` (no superuser, `NOBYPASSRLS`); migrations and
-   seed use `DATABASE_URL_MIGRATIONS`.
+   seed run as the separate `app_owner` role (no superuser, `NOBYPASSRLS`, owns every object) via
+   `DATABASE_URL_MIGRATIONS` — a DSN the API container's own configuration never holds.
 4. **Agents access data only through tools** (`app/tools/`) that check the context and return only
    what is needed. Never a DB connection or credentials to the model. Writing tools require a
    confirmation step — this starter ships read-only tools only; build the confirmation flow
@@ -93,7 +97,11 @@ scripts/seed.py       first tenant + user (superseded by the operator tool's `cr
 
 ## Do not touch without checking first
 
-- RLS policies, roles, and grants in `migrations/` and `docker/postgres/01-init.sh`
+- RLS policies, roles, and grants in `migrations/` and `docker/postgres/01-init.sh` — including,
+  specifically, the privileged-role bootstrap script (`docker/postgres/01-init.sh`, and its
+  managed-Postgres equivalent `scripts/provision_roles.py`) that creates `app_owner`/`app`, and
+  the control-plane migration (`migrations/versions/0002_control_plane_schema.py`) that creates
+  the `control` schema and its ownership/grant pattern
 - The tenant-table registry (`app/db/tenant_tables.py`) — it drives RLS migration tooling and,
   later, tenant erasure; removing a table from it silently drops its RLS/erasure coverage
 - `app/context.py`, `app/deps.py`, `app/db/session.py` — changes here are authorized by

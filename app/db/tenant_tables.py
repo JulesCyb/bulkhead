@@ -1,10 +1,15 @@
 """The tenant-table registry (ADR-0010, Spec 9 / #65).
 
-`TENANT_TABLES` is the single, explicit list of every table in the tenant-editable (`public`)
-schema that carries a `tenant_id` column. Two things depend on it staying complete:
+`TENANT_TABLES` is the single, explicit list of every table *currently* in the tenant-editable
+(`public`) schema that carries a `tenant_id` column — the present-day state at the migration
+head, not a historical record. Two things depend on it staying complete:
 
-- Migration tooling iterates it to apply Row-Level Security (see
-  `migrations/versions/0001_initial.py`) instead of keeping a private, per-migration list.
+- Each migration that creates or retires a registered table applies (or, on retirement, drops)
+  Row-Level Security for exactly the tables it itself creates, using its own frozen snapshot of
+  those names — never by importing this live module, which would apply RLS to a table that does
+  not exist yet when an old migration is replayed on a fresh database (issue #23 learned this the
+  hard way: 0009 retired `users` from this registry in favor of `memberships`, a table
+  `migrations/versions/0001_initial.py` never creates).
 - The tenant lifecycle tool (Spec 9) will iterate it to reach every tenant's rows on erasure.
 
 `unregistered_tenant_tables()` is the other half: it introspects the real schema and returns
@@ -23,7 +28,7 @@ from __future__ import annotations
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-TENANT_TABLES: tuple[str, ...] = ("users", "documents")
+TENANT_TABLES: tuple[str, ...] = ("memberships", "documents")
 
 
 async def unregistered_tenant_tables(conn: AsyncConnection) -> list[str]:
