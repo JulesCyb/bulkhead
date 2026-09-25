@@ -217,9 +217,10 @@ async def _seed_every_tenant_table(url: str, *, tenant_id, identity_id, membersh
             await conn.execute(
                 text(
                     "INSERT INTO pending_actions "
-                    "(tenant_id, conversation_id, tool_name, args_hash, asking_membership_id, "
-                    "expires_at) "
-                    "VALUES (:tid, 'conv-1', 'a_tool', 'hash', :mid, now() + interval '1 hour')"
+                    "(tenant_id, conversation_id, tool_name, tool_call_id, args_hash, "
+                    "asking_membership_id, expires_at) "
+                    "VALUES (:tid, 'conv-1', 'a_tool', 'call-1', 'hash', :mid, "
+                    "now() + interval '1 hour')"
                 ),
                 {"tid": tenant_id, "mid": membership_id},
             )

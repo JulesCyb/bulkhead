@@ -1,7 +1,7 @@
 """Tenant policies treat an empty `app.tenant_id` as "no context", not as an error.
 
 Revision ID: 0040
-Revises: 0024
+Revises: 0038
 Create Date: 2026-09-25
 
 Once a pooled connection has carried a tenant context, Postgres keeps the custom setting
@@ -22,7 +22,7 @@ from collections.abc import Sequence
 from alembic import op
 
 revision: str = "0040"
-down_revision: str | None = "0024"
+down_revision: str | None = "0038"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
