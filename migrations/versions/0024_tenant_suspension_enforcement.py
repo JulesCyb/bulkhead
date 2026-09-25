@@ -1,7 +1,7 @@
 """Suspension enforced at context resolution, and the operator's suspend/unsuspend write path.
 
 Revision ID: 0024
-Revises: 0032
+Revises: 0035
 Create Date: 2026-09-25
 
 Spec 9 / #69, ADR-0010. Two changes:
@@ -57,7 +57,7 @@ from collections.abc import Sequence
 from alembic import op
 
 revision: str = "0024"
-down_revision: str | None = "0032"
+down_revision: str | None = "0035"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
