@@ -21,8 +21,7 @@ def get_model(model_name: str | None = None) -> Model | str:
     if s.litellm_base_url:
         # Through the gateway: the bare model name from litellm/config.yaml, no provider prefix.
         bare = name.split(":", 1)[1] if ":" in name else name
-        provider = OpenAIProvider(
-            base_url=s.litellm_base_url, api_key=s.litellm_api_key or "litellm"
-        )
+        api_key = s.litellm_api_key.get_secret_value() if s.litellm_api_key else "litellm"
+        provider = OpenAIProvider(base_url=s.litellm_base_url, api_key=api_key)
         return OpenAIChatModel(bare, provider=provider)
     return name

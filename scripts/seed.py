@@ -16,11 +16,12 @@ import uuid
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from app.config import get_settings
+from app.migration_settings import get_migration_settings
 
 
 async def main(tenant_name: str, email: str) -> None:
-    engine = create_async_engine(get_settings().database_url_migrations)
+    dsn = get_migration_settings().database_url_migrations.get_secret_value()
+    engine = create_async_engine(dsn)
     tenant_id, user_id = uuid.uuid4(), uuid.uuid4()
     async with engine.begin() as conn:
         # Satisfies the policies' WITH CHECK even when the role is owner-but-not-superuser.
