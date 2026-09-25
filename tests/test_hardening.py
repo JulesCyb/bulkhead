@@ -3,12 +3,15 @@ configuration-property tests (ADR-0008, spec 8 / issue #58)."""
 
 from __future__ import annotations
 
+import httpx
 import pytest
 from pydantic import ValidationError
 
 from app.api.agents import _sse
 from app.config import RESIDENCY_ALLOW_LIST, Settings
 from app.main import check_auth_mode
+
+_VALID_KWARGS = {"embedding_provider": "openai", "embedding_model": "text-embedding-3-small"}
 
 
 def test_sse_framing_preserves_newlines():
@@ -160,6 +163,133 @@ def test_migration_settings_independent_of_application_settings(monkeypatch):
 
     for module in (main_module, deps_module):
         assert "migration_settings" not in inspect.getsource(module)
+
+
+# --- Fail-closed startup and live readiness guard (issue #15 / ADR-0011) ---
+
+
+def test_create_app_raises_immediately_for_prod_dev_headers_without_any_lifespan_event():
+    """The dev-headers guard runs at application-*construction* time: building the app object
+    with production-like settings and header-based auth raises immediately, with no ASGI
+    lifespan event ever firing — closing the gap where a test harness (or any other way of
+    launching the process) that never drives lifespan could skip the guard entirely."""
+    from app.main import create_app
+
+    prod_settings = Settings(environment="prod", auth_mode="dev-headers", **_VALID_KWARGS)
+    with pytest.raises(RuntimeError, match="dev-headers"):
+        create_app(settings=prod_settings)
+
+
+async def test_lifespan_also_raises_independent_of_the_construction_time_check(monkeypatch):
+    """Construction succeeds with dev-like settings. Driving the ASGI lifespan directly
+    afterwards, with `get_settings()` now returning production-like, header-auth settings, must
+    still raise — proving the lifespan's own guard call is a second, independent execution of
+    `check_auth_mode`, not a value cached from what construction saw."""
+    from app import main as main_module
+
+    dev_settings = Settings(environment="dev", auth_mode="dev-headers", **_VALID_KWARGS)
+    app_obj = main_module.create_app(settings=dev_settings)
+
+    prod_settings = Settings(environment="prod", auth_mode="dev-headers", **_VALID_KWARGS)
+    monkeypatch.setattr(main_module, "get_settings", lambda: prod_settings)
+
+    with pytest.raises(RuntimeError, match="dev-headers"):
+        async with app_obj.router.lifespan_context(app_obj):
+            pass
+
+
+async def test_lifespan_raises_when_a_substituted_role_rls_guard_fails(monkeypatch):
+    """With auth-mode settings that pass cleanly, a substituted, failing role/RLS guard still
+    raises during ASGI startup, before the application could ever accept a request."""
+    from app import main as main_module
+
+    good_settings = Settings(environment="dev", auth_mode="dev-headers", **_VALID_KWARGS)
+    app_obj = main_module.create_app(settings=good_settings)
+    monkeypatch.setattr(main_module, "get_settings", lambda: good_settings)
+
+    async def failing_guard() -> None:
+        raise RuntimeError("substituted role/RLS guard failure")
+
+    monkeypatch.setattr(main_module, "run_role_rls_guard", failing_guard)
+
+    with pytest.raises(RuntimeError, match="substituted role/RLS guard failure"):
+        async with app_obj.router.lifespan_context(app_obj):
+            pass
+
+
+@pytest.fixture
+def ready_client():
+    from app.main import app as main_app
+
+    transport = httpx.ASGITransport(app=main_app)
+    return httpx.AsyncClient(transport=transport, base_url="http://test")
+
+
+async def test_ready_endpoint_returns_generic_503_when_guard_fails(ready_client):
+    """A substituted, failing guard makes `/ready` answer 503 with a body that names neither
+    the offending role nor table — only the server log (`caplog`) sees the real reason."""
+    from app.api.health import get_role_rls_guard
+    from app.main import app as main_app
+
+    offending_detail = "role app_super_secret is a superuser on table super_secret_table"
+
+    async def failing_guard() -> None:
+        raise RuntimeError(offending_detail)
+
+    main_app.dependency_overrides[get_role_rls_guard] = lambda: failing_guard
+    try:
+        async with ready_client as client:
+            response = await client.get("/ready")
+    finally:
+        main_app.dependency_overrides.pop(get_role_rls_guard, None)
+
+    assert response.status_code == 503
+    assert offending_detail not in response.text
+    assert "app_super_secret" not in response.text
+    assert "super_secret_table" not in response.text
+
+
+async def test_ready_endpoint_returns_200_when_guard_passes(ready_client):
+    from app.api.health import get_role_rls_guard
+    from app.main import app as main_app
+
+    async def passing_guard() -> None:
+        return None
+
+    main_app.dependency_overrides[get_role_rls_guard] = lambda: passing_guard
+    try:
+        async with ready_client as client:
+            response = await client.get("/ready")
+    finally:
+        main_app.dependency_overrides.pop(get_role_rls_guard, None)
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ready"}
+
+
+async def test_ready_endpoint_reruns_the_guard_on_every_call_not_cached(ready_client):
+    """Two calls to `/ready` must each invoke the guard again — the readiness check must never
+    reuse a cached result from an earlier check (boot-time or a previous request)."""
+    from app.api.health import get_role_rls_guard
+    from app.main import app as main_app
+
+    call_count = 0
+
+    async def counting_guard() -> None:
+        nonlocal call_count
+        call_count += 1
+
+    main_app.dependency_overrides[get_role_rls_guard] = lambda: counting_guard
+    try:
+        async with ready_client as client:
+            first = await client.get("/ready")
+            second = await client.get("/ready")
+    finally:
+        main_app.dependency_overrides.pop(get_role_rls_guard, None)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert call_count == 2
 
 
 def test_settings_reads_secret_from_secrets_dir(tmp_path):

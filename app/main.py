@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import agents, chat, health
 from app.config import Settings, get_settings
+from app.db.guard import run_role_rls_guard
 from app.observability import setup_observability
 
 log = logging.getLogger(__name__)
@@ -21,7 +22,13 @@ log = logging.getLogger(__name__)
 
 def check_auth_mode(settings: Settings) -> None:
     """Refuse to start outside dev/test with header auth — the guardrail lives in code,
-    not only in the docs. With dev-headers, every request can impersonate any tenant."""
+    not only in the docs. With dev-headers, every request can impersonate any tenant.
+
+    Called both at application-object construction time (`create_app`, below) and again inside
+    the ASGI lifespan (issue #15 / ADR-0011): a way of launching the process that never fires
+    lifespan events (e.g. some test harnesses) still hits this guard at construction, and a way
+    that constructs the app once and only later changes what `get_settings()` returns still hits
+    it again at lifespan startup — no path can skip it."""
     if settings.auth_mode != "dev-headers":
         return
     if settings.environment not in ("dev", "test"):
@@ -37,11 +44,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     check_auth_mode(settings)
     setup_observability(settings)
+    # Fail-closed startup guard (issue #15 / ADR-0011): refuses to ever accept traffic while
+    # connected as a superuser/BYPASSRLS role, or while any public-schema table lacks forced
+    # RLS. Looked up by name (not bound at import time) so a test can monkeypatch
+    # `app.main.run_role_rls_guard` and drive this lifespan directly to prove the guard runs
+    # here independent of the readiness endpoint's own dependency.
+    await run_role_rls_guard()
     yield
 
 
-def create_app() -> FastAPI:
-    settings = get_settings()
+def create_app(settings: Settings | None = None) -> FastAPI:
+    settings = settings or get_settings()
+    # Runs at construction time, not only inside the lifespan above (issue #15 / ADR-0011): no
+    # way of building the application object — including a test harness that never fires ASGI
+    # lifespan events — can skip this guard.
+    check_auth_mode(settings)
     app = FastAPI(title=settings.app_name, lifespan=lifespan)
     origins = settings.cors_origin_list
     app.add_middleware(
