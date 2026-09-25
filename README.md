@@ -19,6 +19,18 @@ enforced by the database and refused at startup, never left to a code review.
 
 <p align="center"><sub>The diagram is code: <code>uv run python scripts/render_architecture.py</code> regenerates it.</sub></p>
 
+## Why this exists
+
+Everyone is vibe-coding AI apps right now. Almost nobody is vibe-coding the security.
+
+The first customer's data sits in the same table as the second customer's. The agent writes
+whatever a poisoned document tells it to. "We'll add auth later" ships on Friday. None of that
+is a bug you fix afterwards — it's the shape of the thing you built.
+
+bulkhead gives you a different shape on day one: tenant isolation the database enforces, a
+human's approval before any agent writes, EU data that stays in the EU. Keep vibe-coding on
+top. The hull doesn't leak.
+
 ## Three things your agent cannot do
 
 1. **Read another tenant's rows.** Row-Level Security is `FORCE`d on every table; the app
