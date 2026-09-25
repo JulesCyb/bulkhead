@@ -229,6 +229,11 @@ class Settings(BaseSettings):
     llm_call_timeout_seconds: float = 30.0
     embedding_call_timeout_seconds: float = 30.0
 
+    # Pending-action approval window (ADR-0007, Spec 5 / #37): how long a writing-tool approval
+    # request stays valid before it can no longer be approved -- configuration, not a constant,
+    # so a deployment can tune it to how quickly its members typically respond.
+    pending_action_expiry_seconds: float = 300.0
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
