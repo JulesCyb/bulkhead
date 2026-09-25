@@ -1846,6 +1846,104 @@ async def test_resolver_fails_closed_for_a_tenant_with_an_unknown_residency(
             await resolve_residency_route(session, ctx_a)
 
 
+# --- Chat and document-search routing through a tenant's real residency (Spec 8 / #61) -----
+
+
+async def test_tenant_chat_and_embedding_clients_route_through_real_residency_and_never_cross(
+    app_settings, database_urls, tmp_path
+):
+    """`resolve_tenant_chat_model` (app/llm.py) and `resolve_tenant_embedding_client`
+    (app/embeddings.py) -- the two entry points the running assistant and the document-search
+    tool actually call in production (#61) -- built end to end for two tenants of different
+    residencies, through the same tenant-scoped session/RLS scaffolding every repository uses.
+    No real provider call is made: only client *construction* is exercised. Two tenants never
+    get the same bare model alias, the same embedding endpoint client, or the same credential.
+    """
+    from app.config import Settings
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.embeddings import (
+        reset_tenant_embedding_client_cache,
+        resolve_tenant_embedding_client,
+    )
+    from app.llm import reset_tenant_chat_model_cache, resolve_tenant_chat_model
+
+    reset_tenant_chat_model_cache()
+    reset_tenant_embedding_client_cache()
+
+    tenant_eu, tenant_us = await _seed(database_urls["superuser"])
+    await _set_residency(database_urls["superuser"], tenant_eu, "eu")
+    await _set_residency(database_urls["superuser"], tenant_us, "us")
+    await _set_gateway_alias(database_urls["migrations"], tenant_eu, "acme-gateway-key")
+    await _set_gateway_alias(database_urls["migrations"], tenant_us, "globex-gateway-key")
+    (tmp_path / "acme-gateway-key").write_text("sk-acme-secret")
+    (tmp_path / "globex-gateway-key").write_text("sk-globex-secret")
+    settings = Settings(
+        database_url=database_urls["app"],
+        gateway_credentials_dir=str(tmp_path),
+        litellm_base_url="http://litellm.internal:4000",
+    )
+
+    try:
+        ctx_eu = RequestContext(tenant_id=tenant_eu, identity_id=uuid.uuid4())
+        async with tenant_session(ctx_eu) as session:
+            chat_model_eu = await resolve_tenant_chat_model(
+                session, ctx_eu, "claude-eu", settings=settings
+            )
+        async with tenant_session(ctx_eu) as session:
+            embedding_client_eu = await resolve_tenant_embedding_client(
+                session, ctx_eu, settings=settings
+            )
+
+        ctx_us = RequestContext(tenant_id=tenant_us, identity_id=uuid.uuid4())
+        async with tenant_session(ctx_us) as session:
+            chat_model_us = await resolve_tenant_chat_model(
+                session, ctx_us, "claude", settings=settings
+            )
+        async with tenant_session(ctx_us) as session:
+            embedding_client_us = await resolve_tenant_embedding_client(
+                session, ctx_us, settings=settings
+            )
+
+        # Two tenants of different residencies visibly use different routes for the same request.
+        assert chat_model_eu.model_name == "claude-eu"
+        assert chat_model_us.model_name == "claude"
+        assert chat_model_eu.provider.client.api_key == "sk-acme-secret"
+        assert chat_model_us.provider.client.api_key == "sk-globex-secret"
+        assert chat_model_eu is not chat_model_us
+        assert chat_model_eu.provider.client is not chat_model_us.provider.client
+
+        assert embedding_client_eu.api_key == "sk-acme-secret"
+        assert embedding_client_us.api_key == "sk-globex-secret"
+        assert embedding_client_eu is not embedding_client_us
+    finally:
+        reset_tenant_chat_model_cache()
+        reset_tenant_embedding_client_cache()
+
+
+async def test_tenant_with_no_resolvable_residency_fails_closed_on_chat_and_embedding(
+    app_settings, database_urls
+):
+    """#61 AC3: a tenant with no resolvable residency is refused cleanly on both the chat and the
+    document-search (embedding) path -- neither silently falls back to a default route."""
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.embeddings import resolve_tenant_embedding_client
+    from app.llm import resolve_tenant_chat_model
+    from app.residency import ResidencyUnresolved
+
+    tenant_a, _ = await _seed(database_urls["superuser"])
+    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
+
+    with pytest.raises(ResidencyUnresolved):
+        async with tenant_session(ctx_a) as session:
+            await resolve_tenant_chat_model(session, ctx_a, "claude-eu")
+
+    with pytest.raises(ResidencyUnresolved):
+        async with tenant_session(ctx_a) as session:
+            await resolve_tenant_embedding_client(session, ctx_a)
+
+
 # --- Tenant memberships replace per-tenant users (ADR-0003, Spec 2 / #23) ---
 
 

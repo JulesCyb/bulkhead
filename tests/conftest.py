@@ -27,7 +27,9 @@ os.environ.setdefault("EMBEDDING_MODEL", "text-embedding-3-small")
 os.environ.setdefault("ENVIRONMENT", "dev")
 os.environ.setdefault("AUTH_MODE", "dev-headers")
 
+from app.agents import assistant as assistant_module
 from app.agents.assistant import AssistantDeps, chat_assistant, one_shot_assistant
+from app.api import chat as chat_module
 from app.context import RequestContext
 from app.repositories.documents import DocumentHit
 
@@ -79,18 +81,61 @@ def fake_history(history_calls):
 
 
 @pytest.fixture
-def deps(ctx, fake_search, fake_history) -> AssistantDeps:
-    return AssistantDeps(ctx=ctx, search=fake_search, load_history=fake_history)
+def save_calls() -> list[tuple[uuid.UUID, str, list[ModelMessage]]]:
+    """Every (tenant_id, conversation_id, messages) a fake `save_run` was actually asked to
+    persist -- ADR-0006, #34."""
+    return []
 
 
 @pytest.fixture
-def test_model():
+def fake_save(save_calls):
+    """Records the run's persisted messages in-memory instead of touching a database — a test
+    that cares about a specific store (e.g. seeing an earlier run's reply on a second request)
+    writes its own fake keyed by conversation id instead of using this one."""
+
+    async def _save(
+        ctx: RequestContext, conversation_id: str, messages: list[ModelMessage]
+    ) -> None:
+        save_calls.append((ctx.tenant_id, conversation_id, messages))
+
+    return _save
+
+
+@pytest.fixture
+def deps(ctx, fake_search, fake_history, fake_save) -> AssistantDeps:
+    return AssistantDeps(ctx=ctx, search=fake_search, load_history=fake_history, save_run=fake_save)
+
+
+def resolve_to_model(model):
+    """Wraps `model` as a fake `resolve_chat_model` (Spec 8 / #61): the per-tenant, residency-
+    routed model resolver `app.agents.assistant.run_assistant`/`stream_assistant` and
+    `app.api.chat.chat` now call in place of the old, deployment-wide `app.llm.get_model()`.
+    Ignores `deps` entirely and always returns `model` — the test seam every ASGI test in this
+    suite uses to inject a `TestModel`/`FunctionModel` without a real database or gateway
+    credential file on disk. Patch both `app.agents.assistant.resolve_chat_model` (used by the
+    one-shot run/stream entry points) and `app.api.chat.resolve_chat_model` (its own
+    `from ... import` binding, a separate name to patch) to cover every entry point a test drives.
+    """
+
+    async def _resolve(deps):
+        return model
+
+    return _resolve
+
+
+@pytest.fixture
+def test_model(monkeypatch):
     """TestModel calls every tool once and answers deterministically.
 
     Overrides both agents (Spec 5 / #36 split) since a test may exercise either the one-shot
-    endpoints or /api/chat without knowing in advance which one it will hit.
+    endpoints or /api/chat without knowing in advance which one it will hit. Also patches out
+    per-tenant residency-based model resolution (`resolve_to_model`, above) so no real database
+    connection is attempted before the override even takes effect.
     """
     tm = TestModel()
+    resolver = resolve_to_model(tm)
+    monkeypatch.setattr(assistant_module, "resolve_chat_model", resolver)
+    monkeypatch.setattr(chat_module, "resolve_chat_model", resolver)
     with one_shot_assistant.override(model=tm), chat_assistant.override(model=tm):
         yield tm
 

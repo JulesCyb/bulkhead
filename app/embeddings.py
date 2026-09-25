@@ -1,19 +1,31 @@
-"""Embeddings via the LiteLLM gateway's OpenAI-compatible endpoint (required, ADR-0009).
+"""Embeddings via the LiteLLM gateway's OpenAI-compatible endpoint (required, ADR-0009;
+Spec 8 / #61, ADR-0008).
 
 The dimension must match the documents.embedding column (migration 0001: 1536).
 
-Two entry points: `embed()` — the pre-existing, deployment-wide client, kept for call sites and
-tests with no tenant context — and `resolve_tenant_embedding_client()` (Spec 7 / #54, ADR-0009):
-built from a tenant's own gateway credential, cached per tenant id so two tenants never share a
-connection, and carrying an explicit wall-clock deadline instead of the client library's
-multi-minute default. The embedding model itself is not tenant-choosable (ADR-0008: one embedding
-model family is shared across every residency, since the vector column's dimension is fixed), so
-there is no allow-list check here — that only applies to the chat model (`app/llm.py`).
+The single entry point is `resolve_tenant_embedding_client()` (Spec 7 / #54, Spec 8 / #61,
+ADR-0009, ADR-0008): it resolves `ctx.tenant_id`'s residency route and gateway credential
+together through `app.residency.resolve_residency_route` -- the one call site both this module
+and `app/llm.py` use, so a tenant with no resolvable residency fails closed
+(`app.residency.ResidencyUnresolved`) exactly the same way on the embedding path as on the chat
+path, rather than reaching some process-wide default endpoint. The client built from that route
+is cached per tenant id so two tenants never share a connection, and carries an explicit
+wall-clock deadline instead of the client library's multi-minute default. There used to be a
+second, deployment-wide entry point (`embed()`) that could reach a raw OpenAI endpoint directly,
+bypassing the gateway and any residency check; it has been removed (#61) so no code path can
+still reach a hard-coded default embedding endpoint.
+
+Every residency shares one embedding model family -- residency only ever selects the serving
+region an embedding call is routed to, never a different model. This is fixed by the
+`documents.embedding` column's dimension (pgvector indexes need a fixed dimension across every
+row, whichever residency wrote them): adding a second embedding model family is not a
+configuration change here, it is a new vector column and a re-embedding migration for every
+existing row. The embedding model itself is therefore not tenant-choosable and carries no
+allow-list check here -- that only applies to the chat model (`app/llm.py`).
 """
 
 from __future__ import annotations
 
-from functools import lru_cache
 from uuid import UUID
 
 import httpx
@@ -23,27 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings, get_settings
 from app.context import RequestContext
-from app.gateway_credentials import resolve_gateway_credential
-
-
-@lru_cache
-def _client() -> AsyncOpenAI:
-    # One client per process: AsyncOpenAI holds an httpx connection pool; constructing it
-    # per call would leak connections and pay TCP+TLS setup on every search.
-    s = get_settings()
-    if s.litellm_base_url:
-        api_key = s.litellm_api_key.get_secret_value() if s.litellm_api_key else "litellm"
-        return AsyncOpenAI(base_url=s.litellm_base_url, api_key=api_key)
-    return AsyncOpenAI(api_key=s.openai_api_key.get_secret_value() if s.openai_api_key else None)
-
-
-async def embed(text: str) -> list[float]:
-    s = get_settings()
-    response = await _client().embeddings.create(
-        model=s.embedding_model, input=text, dimensions=s.embedding_dimensions
-    )
-    return list(response.data[0].embedding)
-
+from app.residency import resolve_residency_route
 
 # Cache of per-tenant embedding clients (ADR-0009: "any cache of them is keyed by tenant"), the
 # embedding-side counterpart of app.llm's `_tenant_chat_models` -- same reasoning, same shape.
@@ -92,8 +84,18 @@ def reset_tenant_embedding_client_cache() -> None:
 async def resolve_tenant_embedding_client(
     session: AsyncSession, ctx: RequestContext, *, settings: Settings | None = None
 ) -> AsyncOpenAI:
-    """Resolves `ctx.tenant_id`'s own gateway credential and builds (or reuses) its cached
-    embedding client -- the embedding-side counterpart of `app.llm.resolve_tenant_chat_model`."""
+    """The per-tenant embedding entry point (Spec 8 / #61, ADR-0008) -- the embedding-side
+    counterpart of `app.llm.resolve_tenant_chat_model`.
+
+    Resolves `ctx.tenant_id`'s residency route through `app.residency.resolve_residency_route`
+    (the same single call site the chat path's residency check ultimately rests on), then builds
+    (or reuses) the tenant's own cached embedding client from the credential that route bundles.
+    Raises `app.residency.ResidencyUnresolved` if the tenant's residency is missing, unknown, or
+    absent from the allow-list -- exactly the same fail-closed behaviour as the chat path, never a
+    fallback to a default embedding endpoint -- and propagates
+    `app.gateway_credentials.GatewayCredentialUnavailable` unchanged if the credential itself
+    cannot be resolved.
+    """
     s = settings or get_settings()
-    credential = await resolve_gateway_credential(session, ctx, settings=s)
-    return build_tenant_embedding_client(ctx.tenant_id, credential, settings=s)
+    resolved = await resolve_residency_route(session, ctx, settings=s)
+    return build_tenant_embedding_client(ctx.tenant_id, resolved.gateway_credential, settings=s)
