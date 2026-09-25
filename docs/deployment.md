@@ -40,9 +40,11 @@
 ## Local / a single server (EU)
 
 - `docker compose up -d` starts Postgres, runs migrations via the one-shot `migrate` service
-  (owner role — the api container never holds the superuser DSN), starts the API, and starts
-  the model gateway (LiteLLM) — required, not an optional profile (ADR-0009). Set
-  `LITELLM_MASTER_KEY` in `.env` first; rendering the compose file fails otherwise.
+  (as the non-superuser `app_owner` role — the `api` container's own environment allow-list
+  never includes `DATABASE_URL_MIGRATIONS`, `APP_OWNER_DB_PASSWORD`, or `POSTGRES_PASSWORD`; see
+  "Least privilege by default" above), starts the API, and starts the model gateway (LiteLLM) —
+  required, not an optional profile (ADR-0009). Set `LITELLM_MASTER_KEY` in `.env` first;
+  rendering the compose file fails otherwise.
 - Backups: `pg_dump` via cron or provider snapshots; object storage (MinIO/Hetzner) for files.
 - Put a reverse proxy with TLS (Caddy/Traefik) in front of the API, targeting `127.0.0.1:8000`.
 
