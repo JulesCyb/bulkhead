@@ -54,6 +54,7 @@ from app.db.session import tenant_session
 from app.jwt_verifier import KeySource, TokenVerificationError
 from app.tenant_suspension import TenantSuspendedError, ensure_tenant_not_suspended
 from app.token_verifier import (
+    AGENT_IDENTITY_ISSUER,
     TenantTokenVerificationError,
     VerificationFailureReason,
     verify_tenant_token,
@@ -73,9 +74,21 @@ def get_key_source(settings: Annotated[Settings, Depends(get_settings)]) -> KeyS
     identity provider needs a real JWKS-backed KeySource; override this dependency
     (`app.dependency_overrides[get_key_source] = ...`, exactly how tests inject their own),
     never edit `app/jwt_verifier.py` to make it reach the network itself.
+
+    Issuer-aware (gap fix, Spec 6 / #49): `app.token_verifier.verify_tenant_token` calls this with
+    `AGENT_IDENTITY_ISSUER` for an agent identity's token (minted by
+    `app/agent_credential_exchange.py`, signed with `agent_token_signing_key`) and with the
+    tenant's own configured issuer for everyone else (signed with `jwt_verification_key`) — two
+    different signing keys for two different token populations, resolved by the one thing that
+    distinguishes them (`iss`), not by two separate KeySource implementations one caller could
+    forget to keep in sync.
     """
 
     def _source(issuer: str, kid: str | None) -> str:
+        if issuer == AGENT_IDENTITY_ISSUER:
+            if settings.agent_token_signing_key is None:
+                raise TokenVerificationError("no agent token signing key configured")
+            return settings.agent_token_signing_key.get_secret_value()
         if settings.jwt_verification_key is None:
             raise TokenVerificationError("no verification key configured")
         return settings.jwt_verification_key.get_secret_value()

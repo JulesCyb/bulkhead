@@ -156,6 +156,32 @@ def test_check_mcp_mode_does_not_raise_for_stdio_in_dev_or_test():
         )  # no raise
 
 
+def test_main_still_serves_stdio_unchanged_in_development(monkeypatch):
+    """Issue #49's acceptance criterion 5: the local development entrypoint (`uv run python -m
+    app.mcp.server`) still starts and serves its tool over stdio, with no token involved, exactly
+    as it did before the networked transport existed -- `main()` never touches
+    `build_streamable_http_app`/`MCPTenantAuthMiddleware` for the stdio transport."""
+    settings = Settings(
+        _env_file=None,
+        environment="dev",
+        auth_mode="dev-headers",
+        mcp_transport="stdio",
+        **_VALID_KWARGS,
+    )
+    monkeypatch.setattr(mcp_server, "get_settings", lambda: settings)
+    monkeypatch.setattr(mcp_server, "run_startup_checks", lambda s: None)
+
+    calls: list[str] = []
+    monkeypatch.setattr(mcp_server.server, "run", lambda transport: calls.append(transport))
+
+    mcp_server.main()  # must not raise -- check_mcp_mode passes for stdio in dev
+
+    assert calls == ["stdio"]
+    # The stdio path's context provider is unchanged: still the process-wide env fallback, never
+    # the per-connection contextvar the networked transport uses.
+    assert mcp_server.context_provider is mcp_server._context_from_env
+
+
 def test_check_mcp_mode_does_not_raise_for_streamable_http_with_a_verifier_configured():
     for environment in ("dev", "test", "prod"):
         mcp_server.check_mcp_mode(

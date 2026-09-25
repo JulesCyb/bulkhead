@@ -1,0 +1,142 @@
+# Residency, sub-processors, and the MCP boundary (ADR-0008)
+
+This is the outward-facing statement of what the running code actually enforces about where a
+tenant's content goes — the claim an auditor or a customer's legal team can check against the
+code named here, not a restatement of the sales pitch. `docs/deployment.md`'s own "Residency"
+section is the operator-facing companion: how to configure a deployment so this claim holds.
+
+## The claim
+
+For every tenant, on every content-bearing request (a chat/agent run, a document search, a
+trace):
+
+1. **A per-tenant residency setting names the jurisdiction.** `control.tenants.residency`
+   (operator-owned, ADR-0008 — a tenant cannot move itself to another jurisdiction by writing
+   its own settings) names one of the deployment's configured residencies. A tenant with no
+   residency set, or one absent from the deployment's own allow-list, is refused service on that
+   path rather than silently routed through some other jurisdiction's endpoint
+   (`app.residency.resolve_residency_route` raises `ResidencyUnresolved`).
+2. **A startup allow-list check refuses to let the process start misconfigured.**
+   `app.startup_checks.run_startup_checks` — called from both the HTTP API's startup path and the
+   MCP server's own `main()` — walks every endpoint this deployment is actually configured to
+   reach (the model/gateway host, the embedding endpoint, the trace sink) against
+   `RESIDENCY_ALLOW_LIST` (`app/config.py`) for the deployment's own residency, and raises
+   `ResidencyConfigurationError` before a single request or tool call is served if any of them
+   sits outside it.
+3. **There is no default embedding provider.** `Settings.embedding_provider` and
+   `Settings.embedding_model` have no default value; `Settings` refuses to construct at all
+   (`ValueError` from `_require_embedding_config`) unless both are set explicitly. A deployment
+   can never silently reach whatever endpoint the embedding client library defaults to.
+4. **Tracing is content-free by default, per tenant.** Every span an agent run produces carries
+   `tenant_id`/`identity_id`/`request_id` as flat, queryable attributes
+   (`app.observability.tenant_span_attributes`), and prompts, tool arguments, and document text
+   are captured only when the tenant's own `tenants.settings["content_tracing_opt_in"]`
+   (`app.tenant_settings.TenantSettings`, default `False`) is explicitly turned on — until then,
+   `include_content` is `False` for that tenant's every run
+   (`app.observability.instrumentation_capabilities`). The trace sink itself is resolved from the
+   tenant's residency the same way the model and embedding routes are, so two tenants in
+   different residencies never share an exporter.
+
+None of this is a deployment-wide toggle: a tenant assigned to `eu` and a tenant assigned to `us`
+on the same running process get different model routes, different embedding endpoints, and
+different trace sinks, resolved fresh on every request from `control.tenants.residency`.
+
+## Sub-processors
+
+Every host any content-bearing path can reach is named in `RESIDENCY_ALLOW_LIST`
+(`app/config.py`) — this list *is* the sub-processor list; there is no second, hand-maintained
+copy for legal to check against a different set of names. As shipped, two residencies are
+configured:
+
+| Role | Sub-processor | Reached at | Configured for |
+|---|---|---|---|
+| Model provider | Anthropic | `*.anthropic.com` (direct, or the LiteLLM gateway's own regional route to it) | `eu`, `us` |
+| Model provider | OpenAI | `*.openai.com` | `eu`, `us` |
+| Embedding provider | OpenAI | `https://api.openai.com/v1` (`embedding_endpoint`) | `eu`, `us` |
+| Gateway | LiteLLM (self-hosted, `docker/litellm/config.yaml`) | `*.eu.litellm.internal` / `*.us.litellm.internal` | `eu`, `us` |
+| Tracing host | Langfuse | `eu.cloud.langfuse.com` (`eu`) / `us.cloud.langfuse.com` (`us`) (`trace_sink_host`) | `eu`, `us` |
+
+The embedding provider is shared across every residency by design (ADR-0008): the vector column
+has one fixed dimension, so a residency picks the provider's *region*, never a different
+embedding model. A model provider or gateway host not in this table is unreachable on a
+content-bearing path — the startup check refuses to start otherwise, and
+`app.llm.resolve_tenant_chat_model` refuses a model name outside `RESIDENCY_MODEL_ALLOW_LIST` for
+the tenant's own residency before ever building a client.
+
+## Worked example: adding a second residency
+
+Say a customer needs `uk` (its own jurisdiction, distinct from `eu`/`us`). Four things change,
+all data, no branching:
+
+1. **The allow-list entry** (`app/config.py`) — add a `RESIDENCY_ALLOW_LIST["uk"]` naming the
+   hosts this residency may reach:
+
+   ```python
+   "uk": ResidencyRoute(
+       model_host_patterns=("*.anthropic.com", "*.openai.com", "*.uk.litellm.internal"),
+       embedding_endpoint="https://api.openai.com/v1",
+       trace_sink_host="uk.cloud.langfuse.com",  # a self-hosted UK Langfuse instance, e.g.
+   ),
+   ```
+
+2. **The model route** — a `RESIDENCY_MODEL_ALLOW_LIST["uk"]` entry naming the gateway aliases a
+   `uk` tenant may use, and a matching `model_list` entry in `docker/litellm/config.yaml` routing
+   that alias to a UK-region endpoint (e.g. AWS Bedrock `eu-west-2`):
+
+   ```python
+   RESIDENCY_MODEL_ALLOW_LIST["uk"] = ("claude-uk", "embeddings")
+   ```
+
+   ```yaml
+   - model_name: claude-uk
+     litellm_params:
+       model: bedrock/anthropic.claude-sonnet-4-5
+       aws_region_name: eu-west-2
+   ```
+
+3. **The embedding endpoint** — nothing to add here unless the customer also requires the
+   embedding call itself to stay in `uk`: the shared embedding model family means every residency
+   reuses the same `embedding_endpoint` (OpenAI) unless a UK-hosted OpenAI-compatible endpoint is
+   substituted in the new entry from step 1.
+
+4. **The trace sink** — point `trace_sink_host` (step 1) at a Langfuse instance actually running
+   in the UK; `app.observability.setup_observability` builds one `TracerProvider` per residency
+   from this same dict, so no further wiring is needed once the host is correct.
+
+Once these four data changes are made, an operator sets `control.tenants.residency = 'uk'` for
+that tenant (via the operator tool, never a tenant's own request) and `run_startup_checks`
+validates the new entry the same way it validates `eu`/`us` today — nothing about this recipe is
+code that needs a new branch in the model-routing, embedding, or observability modules.
+
+## The MCP boundary
+
+The MCP server (`app/mcp/server.py`) hands the exact same tool functions (`search_documents`,
+`list_memberships`) to whichever client connects to it. That client brings **its own model** —
+Claude Code, Claude Desktop, or any other MCP client the operator has not configured — and that
+model sits entirely outside the residency guarantees above: the operator's processor chain
+(`RESIDENCY_ALLOW_LIST`, the gateway, the per-residency trace sink) governs the model *this
+deployment* calls on a tenant's behalf, never the model a connecting client happens to be
+configured with. A document snippet handed to an MCP client through `search_documents` may
+therefore leave the tenant's residency the moment that client's own model processes it — that is
+the connecting client's (the customer's) responsibility, not something this deployment can
+enforce or observe.
+
+The one bound that still applies regardless of which model receives it is the existing snippet
+cap: `search_documents` never returns more than 20 hits per call
+(`app/tools/documents.py`, `limit = max(1, min(limit, 20))`), so the size of what leaves through
+this path is bounded even though the destination is not.
+
+The MCP server now speaks two transports (ADR-0005, issue #49; see
+[`docs/mcp-connection.md`](mcp-connection.md) for how to connect to either). `stdio`
+(`MCP_TRANSPORT=stdio`, the default) is local development only, guarded the same way
+`AUTH_MODE=dev-headers` is — it refuses to start outside `ENVIRONMENT=dev`/`test` — and its
+identity still comes from the process-wide `MCP_TENANT_ID`/`MCP_IDENTITY_ID` fallback.
+`streamable-http` is the production path: every connection's tenant and identity are derived
+from its own bearer token, per connection (`MCPTenantAuthMiddleware`,
+`app.token_verifier.verify_tenant_token` — the exact module the HTTP API's `app.deps.get_context`
+uses), mounted under the tenant's own path prefix (`/v1/t/{tenant_id}/mcp`, ADR-0012) so a token
+minted for one tenant is refused by another tenant's MCP endpoint. `check_mcp_mode` refuses to
+start `streamable-http` at all unless a token verifier (`JWT_VERIFICATION_KEY`) is configured.
+The boundary described above — the connecting client's own model sits outside residency
+enforcement — applies to every MCP connection regardless of which transport carries it; only the
+authentication and per-connection identity story differs between them.
