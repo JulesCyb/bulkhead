@@ -238,3 +238,30 @@ class PendingAction(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     resolved_by: Mapped[UUID | None] = mapped_column(ForeignKey("memberships.id"), nullable=True)
+
+
+class StandingGrant(Base):
+    """A tenant admin's standing authorization for one agent identity to call one writing tool
+    with no person present (ADR-0005, ADR-0007, Spec 5 / #38).
+
+    `agent_membership_id`/`granted_by`/`revoked_by` all reference `memberships`, not
+    `control.identities` -- the same split `PendingAction` draws and for the same reason: a grant
+    is a tenant-scoped fact about a membership's role, not about the global identity.
+
+    Uniqueness ("at most one active grant per tenant, agent identity, and tool") is enforced by
+    the database, not here: `standing_grants_active_uidx` (migration 0031) is a partial unique
+    index on `(agent_membership_id, tool_name) WHERE revoked_at IS NULL` -- a revoked grant never
+    counts against it, so revoking and re-granting the same membership/tool pair is always legal.
+    """
+
+    __tablename__ = "standing_grants"
+    __table_args__ = (Index("standing_grants_tenant_idx", "tenant_id"),)
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[UUID] = mapped_column(ForeignKey("tenants.id"))
+    agent_membership_id: Mapped[UUID] = mapped_column(ForeignKey("memberships.id"))
+    tool_name: Mapped[str] = mapped_column(String(200))
+    granted_by: Mapped[UUID] = mapped_column(ForeignKey("memberships.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_by: Mapped[UUID | None] = mapped_column(ForeignKey("memberships.id"), nullable=True)
