@@ -2,9 +2,11 @@
 
 ## Before exposing anything
 
-- **Auth**: implement `AUTH_MODE=jwt` in `app/deps.py`. The startup guard refuses
-  `dev-headers` unless `ENVIRONMENT` is `dev`/`test` — set `ENVIRONMENT=prod` on servers so a
-  forgotten auth switch fails loudly instead of running open.
+- **Auth**: set `AUTH_MODE=jwt` (implemented in `app/deps.py`, issue #24) and configure
+  `JWT_VERIFICATION_KEY`/`JWT_ALGORITHM` plus, per tenant, `control.tenants.identity_issuer` (or
+  `DEFAULT_IDENTITY_ISSUER` for the interim one-operator-run-provider case). The startup guard
+  refuses `dev-headers` unless `ENVIRONMENT` is `dev`/`test` — set `ENVIRONMENT=prod` on servers
+  so a forgotten auth switch fails loudly instead of running open.
 - **Passwords**: set `POSTGRES_PASSWORD` and `APP_DB_PASSWORD` in `.env` (compose interpolates
   them); the defaults are for localhost only.
 - **Ports**: compose binds 5432/8000/4000 to `127.0.0.1` — the reverse proxy (below) is the
