@@ -27,7 +27,7 @@ uv sync                                   # environment (+ --extra observability
 docker compose up -d --wait postgres      # database locally
 uv run python scripts/migrate.py          # migrations run once per database alias: every alias to head
 uv run python scripts/migrate.py <alias>  # migrations for just that one alias (owner role)
-uv run python scripts/seed.py "My Tenant" me@example.com   # first tenant + user
+uv run python scripts/operator.py create "My Tenant" --residency eu --admin-email me@example.com  # first tenant + admin
 uv run python scripts/provision_roles.py <admin-database-url>  # managed Postgres, no init hook
 uv run uvicorn app.main:app --reload      # API locally, http://localhost:8000/docs
 uv run pytest                             # tests (must be green before every commit)
@@ -50,9 +50,10 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    `tenant_session(ctx)`. `tenant_session(ctx)` resolves which engine to use internally, from the
    tenant's isolation tier and database alias in the control plane (ADR-0002) — pooled by
    default — with no change to how callers use it: same signature, same transaction behaviour.
-   The app connects as `app` (no superuser, `NOBYPASSRLS`); migrations and
-   seed run as the separate `app_owner` role (no superuser, `NOBYPASSRLS`, owns every object) via
-   `DATABASE_URL_MIGRATIONS` — a DSN the API container's own configuration never holds.
+   The app connects as `app` (no superuser, `NOBYPASSRLS`); migrations and the operator tool
+   (`app/operator/`, `scripts/operator.py`) run as the separate `app_owner` role (no superuser,
+   `NOBYPASSRLS`, owns every object) via `DATABASE_URL_MIGRATIONS` — a DSN the API container's
+   own configuration never holds.
 4. **Agents access data only through tools** (`app/tools/`) that check the context and return only
    what is needed. Never a DB connection or credentials to the model. Writing tools require a
    confirmation step — this starter ships read-only tools only; build the confirmation flow
@@ -98,8 +99,7 @@ migrations/           Alembic (async), 0001_initial.py as the template
 tests/                pytest; RLS integration test with pgserver
 docker/               Postgres init (app role), LiteLLM config
 docs/                 adr/, agents/ (skill config), frontend.md, mobile.md, deployment.md
-app/operator/          operator tool: audited dispatch, tenant lookup, tenant listing (scripts/operator.py entry point)
-scripts/seed.py       first tenant + user (superseded by the operator tool's `create`, once it ships)
+app/operator/          operator tool: audited dispatch, tenant lookup, tenant listing, `create` (scripts/operator.py entry point; replaces scripts/seed.py)
 ```
 
 ## Do not touch without checking first

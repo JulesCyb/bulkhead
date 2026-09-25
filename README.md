@@ -29,7 +29,7 @@ uv sync --group dbtest              # dbtest only if you want the real RLS test
 cp .env.example .env                # add keys and model names
 docker compose up -d --wait postgres    # --wait blocks until the healthcheck passes
 uv run python scripts/migrate.py    # migrations run once per database alias; this brings every known alias to head
-uv run python scripts/seed.py "My Tenant" me@example.com   # prints tenant/user IDs
+uv run python scripts/operator.py create "My Tenant" --residency eu --admin-email me@example.com   # prints tenant/identity IDs
 uv run uvicorn app.main:app --reload
 ```
 
@@ -65,6 +65,7 @@ Tests: `uv run pytest` — the RLS integration test is skipped when `pgserver` i
 | MCP server | `app/mcp/server.py` | the same tools for Claude Code / Claude Desktop |
 | Models | `app/llm.py`, `app/embeddings.py` | provider abstraction, LiteLLM option |
 | Tracing | `app/observability.py` | Langfuse via OTel (optional) |
+| Operator tool | `app/operator/`, `scripts/operator.py` | audited `create`/`list` commands, run as `app_owner`; `create` provisions a pooled tenant end to end (control-plane record, gateway credential, first admin membership) — replaces the retired `scripts/seed.py` |
 | Tests | `tests/` | unit (TestModel, no DB) + a real RLS test against embedded Postgres |
 
 ## The four rules that hold it together
@@ -72,8 +73,9 @@ Tests: `uv run pytest` — the RLS integration test is skipped when `pgserver` i
 1. **Every new table gets a `tenant_id`** — plus an index, `FORCE ROW LEVEL SECURITY`, and a
    policy on `current_setting('app.tenant_id')`. Template and checklist live in
    `migrations/versions/0001_initial.py` and `migrations/script.py.mako`.
-2. **The app connects as the `app` role** — no superuser, `NOBYPASSRLS`. Migrations and seed
-   run as the separate, non-superuser `app_owner` role via `DATABASE_URL_MIGRATIONS`; the API
+2. **The app connects as the `app` role** — no superuser, `NOBYPASSRLS`. Migrations and the
+   operator tool (`scripts/operator.py`) run as the separate, non-superuser `app_owner` role via
+   `DATABASE_URL_MIGRATIONS`; the API
    container never holds that connection string or the `app_owner`/Postgres cluster passwords —
    only its own `DATABASE_URL` for `app` (see the `api`/`migrate` blocks in
    `docker-compose.yml`). Operator-owned facts about a tenant (isolation tier, residency,
@@ -116,7 +118,7 @@ In full, with commands and conventions: [`CLAUDE.md`](CLAUDE.md).
 | Frontend | Moves too fast to freeze here — `docs/frontend.md` describes how to attach one |
 | LangGraph | Only once an agent truly needs a state machine with checkpoints — then as its own module, with an ADR |
 | Langfuse compose | Use Langfuse's official compose file, see `docs/deployment.md` |
-| Onboarding/billing | Arrives with the second customer, not before |
+| Self-service onboarding/billing | Tenant creation itself is covered by the operator tool's `create` command (`app/operator/`); self-service signup and billing arrive with the second customer, not before |
 
 ## Where it comes from
 
