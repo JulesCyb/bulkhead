@@ -13,6 +13,9 @@ reintroduce a claim the code does not back up.
 
 from __future__ import annotations
 
+import json
+import os
+import tempfile
 from pathlib import Path
 
 from app.config import RESIDENCY_ALLOW_LIST, Settings
@@ -359,10 +362,15 @@ def test_mcp_server_docs_state_the_client_model_boundary_and_snippet_cap() -> No
     assert "limit = max(1, min(limit, 20))" in MCP_SERVER_SOURCE
 
 
-def test_residency_doc_names_mcp_over_http_as_still_open() -> None:
+def test_residency_doc_no_longer_names_mcp_over_http_as_still_open() -> None:
+    # #49 landed (streamable-http with per-connection identity) -- the doc must not still claim
+    # it as open, unfinished work the way it did before this ticket (#50).
     section = RESIDENCY_MD.split("## The MCP boundary", 1)[1]
-    assert "#49" in section
+    assert "still-open work of issue #49" not in section
+    assert "not a production-ready path" not in section
     assert "stdio" in section
+    assert "streamable-http" in section
+    assert "production path" in section
 
 
 def test_claude_md_tracing_rule_describes_flat_attributes_and_content_off_by_default() -> None:
@@ -466,3 +474,113 @@ def test_readme_table_states_the_default_retention_period() -> None:
     assert "90 days" in row
     assert "retention_days" in row
     assert "ADR-0006" in row
+
+
+# --- Spec 6's closing ticket (#50): connecting to and administering the tools server ---
+
+MCP_JSON_EXAMPLE_PATH = REPO_ROOT / ".mcp.json.example"
+MCP_CONNECTION_MD = (REPO_ROOT / "docs" / "mcp-connection.md").read_text(encoding="utf-8")
+ADR_0005 = (REPO_ROOT / "docs" / "adr" / "0005-agent-identities.md").read_text(encoding="utf-8")
+
+
+def test_adr_0005_is_accepted_not_proposed() -> None:
+    status_line = next(line for line in ADR_0005.splitlines() if line.startswith("- **Status:**"))
+    assert "accepted" in status_line
+    assert "proposed" not in status_line
+
+
+def test_mcp_json_example_parses_from_a_different_working_directory() -> None:
+    # The point of #50's fix: reading (and, for the stdio entry, running) this file no longer
+    # assumes the caller's own working directory happens to be the repo root -- proven by
+    # actually reading it from an unrelated cwd, not just by inspecting the string.
+    cwd_before = os.getcwd()
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            os.chdir(tmp)
+            data = json.loads(MCP_JSON_EXAMPLE_PATH.read_text(encoding="utf-8"))
+        finally:
+            os.chdir(cwd_before)
+    assert set(data["mcpServers"]) == {"ai-app-tools", "ai-app-tools-remote"}
+
+
+def test_mcp_json_example_has_a_valid_local_stdio_shape() -> None:
+    data = json.loads(MCP_JSON_EXAMPLE_PATH.read_text(encoding="utf-8"))
+    stdio = data["mcpServers"]["ai-app-tools"]
+    assert stdio["command"] == "uv"
+    # Explicit project directory, not an assumed cwd (the review's "relies on the process cwd
+    # for .env" finding, docs/reviews/2026-09-12-security-review.md:305).
+    assert "--directory" in stdio["args"]
+    assert "MCP_TENANT_ID" in stdio["env"]
+    assert "MCP_IDENTITY_ID" in stdio["env"]
+
+
+def test_mcp_json_example_has_a_valid_networked_shape_with_a_token() -> None:
+    data = json.loads(MCP_JSON_EXAMPLE_PATH.read_text(encoding="utf-8"))
+    networked = data["mcpServers"]["ai-app-tools-remote"]
+    assert networked["type"] == "http"
+    assert "/mcp" in networked["url"]
+    assert "TENANT_ID" in networked["url"]
+    assert "Bearer" in networked["headers"]["Authorization"]
+
+
+def test_settings_load_from_env_example_file_without_error() -> None:
+    # Every new MCP-transport / agent-token setting this spec introduces (MCP_TRANSPORT,
+    # JWT_VERIFICATION_KEY, JWT_ALGORITHM, AGENT_TOKEN_SIGNING_KEY, AGENT_TOKEN_TTL_SECONDS) has a
+    # working default -- loading the example file constructs cleanly with no override needed for
+    # any of them. EMBEDDING_PROVIDER/EMBEDDING_MODEL are deliberately blank in .env.example
+    # (ADR-0008: no default, must be set explicitly per deployment) so those two, pre-existing,
+    # unrelated required fields are the only ones supplied here.
+    settings = Settings(
+        _env_file=str(REPO_ROOT / ".env.example"),
+        _env_ignore_empty=True,
+        embedding_provider="openai",
+        embedding_model="text-embedding-3-small",
+    )
+    assert settings.mcp_transport == "stdio"
+    assert settings.jwt_algorithm == "RS256"
+    assert settings.agent_token_ttl_seconds == 300
+    assert settings.jwt_verification_key is None
+    assert settings.agent_token_signing_key is None
+
+
+def test_connection_guide_routes_match_the_agent_identity_and_token_routes() -> None:
+    # Cross-referenced one-to-one against the actual routes app/api/agent_identities.py and
+    # app/api/agent_tokens.py define, so the guide can't silently drift from the real API surface.
+    assert "POST /v1/t/{tenant_id}/agent-identities" in MCP_CONNECTION_MD
+    assert "POST /v1/t/{tenant_id}/agent-identities/{identity_id}/credentials" in MCP_CONNECTION_MD
+    assert "POST /v1/t/{tenant_id}/agent-tokens" in MCP_CONNECTION_MD
+    assert "GET /v1/t/{tenant_id}/agent-credentials" in MCP_CONNECTION_MD
+    assert "POST /v1/t/{tenant_id}/agent-credentials/{credential_id}/revoke" in MCP_CONNECTION_MD
+
+
+def test_connection_guide_covers_both_the_member_and_the_admin_walkthrough() -> None:
+    assert "As a member" in MCP_CONNECTION_MD
+    assert "As a tenant admin" in MCP_CONNECTION_MD
+    assert "stdio" in MCP_CONNECTION_MD
+    assert "streamable-http" in MCP_CONNECTION_MD
+
+
+def test_claude_md_directory_table_marks_networked_transport_as_production() -> None:
+    line = next(line for line in CLAUDE_MD.splitlines() if line.startswith("app/mcp/server.py"))
+    assert "streamable-http" in line
+    assert "production" in line
+    assert "stdio" in line
+    assert "development" in line
+
+
+def test_claude_md_commands_mark_the_stdio_launch_command_as_development_only() -> None:
+    line = next(
+        line for line in CLAUDE_MD.splitlines() if "uv run python -m app.mcp.server" in line
+    )
+    assert "development" in line.lower()
+    assert "streamable-http" in line
+
+
+def test_readme_and_claude_md_state_a_token_is_required_outside_local_development() -> None:
+    mcp_row = next(line for line in README.splitlines() if line.startswith("| MCP server |"))
+    assert "token" in mcp_row.lower()
+    assert "production" in mcp_row.lower()
+
+    make_it_your_own_section = README.split("## Make it your own", 1)[1]
+    assert "mcp-connection.md" in make_it_your_own_section
+    assert "token is required outside local development" in make_it_your_own_section

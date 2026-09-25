@@ -2,10 +2,24 @@
   "mcpServers": {
     "ai-app-tools": {
       "command": "uv",
-      "args": ["run", "python", "-m", "app.mcp.server"],
+      "args": [
+        "run",
+        "--directory",
+        "/absolute/path/to/ai-app-starter",
+        "python",
+        "-m",
+        "app.mcp.server"
+      ],
       "env": {
-        "MCP_TENANT_ID": "<from scripts/seed.py>",
-        "MCP_IDENTITY_ID": "<from scripts/seed.py>"
+        "MCP_TENANT_ID": "<from scripts/operator.py create>",
+        "MCP_IDENTITY_ID": "<from scripts/operator.py create>"
+      }
+    },
+    "ai-app-tools-remote": {
+      "type": "http",
+      "url": "https://your-deployment.example.com/v1/t/<TENANT_ID>/mcp",
+      "headers": {
+        "Authorization": "Bearer <TOKEN -- your own JWT, or the output of POST /v1/t/<TENANT_ID>/agent-tokens for an agent identity>"
       }
     }
   }

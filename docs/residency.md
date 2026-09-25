@@ -126,12 +126,17 @@ cap: `search_documents` never returns more than 20 hits per call
 (`app/tools/documents.py`, `limit = max(1, min(limit, 20))`), so the size of what leaves through
 this path is bounded even though the destination is not.
 
-Today the MCP server is reachable over stdio only (`MCP_TRANSPORT=stdio`, the default and the
-only transport wired to a real, per-connection identity) — a local, one-process-per-developer
-transport for Claude Code/Desktop during development, not a network service. A
-`streamable-http` transport setting exists and is guarded at startup
-(`app.mcp.server.check_mcp_mode`), but deriving each network connection's own tenant and identity
-from its own token — rather than the process-wide `MCP_TENANT_ID`/`MCP_IDENTITY_ID` fallback
-stdio uses — is the still-open work of issue #49; until it lands, `streamable-http` is not a
-production-ready path and the boundary described above applies to every MCP connection there is
-today.
+The MCP server now speaks two transports (ADR-0005, issue #49; see
+[`docs/mcp-connection.md`](mcp-connection.md) for how to connect to either). `stdio`
+(`MCP_TRANSPORT=stdio`, the default) is local development only, guarded the same way
+`AUTH_MODE=dev-headers` is — it refuses to start outside `ENVIRONMENT=dev`/`test` — and its
+identity still comes from the process-wide `MCP_TENANT_ID`/`MCP_IDENTITY_ID` fallback.
+`streamable-http` is the production path: every connection's tenant and identity are derived
+from its own bearer token, per connection (`MCPTenantAuthMiddleware`,
+`app.token_verifier.verify_tenant_token` — the exact module the HTTP API's `app.deps.get_context`
+uses), mounted under the tenant's own path prefix (`/v1/t/{tenant_id}/mcp`, ADR-0012) so a token
+minted for one tenant is refused by another tenant's MCP endpoint. `check_mcp_mode` refuses to
+start `streamable-http` at all unless a token verifier (`JWT_VERIFICATION_KEY`) is configured.
+The boundary described above — the connecting client's own model sits outside residency
+enforcement — applies to every MCP connection regardless of which transport carries it; only the
+authentication and per-connection identity story differs between them.

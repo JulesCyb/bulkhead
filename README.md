@@ -63,7 +63,7 @@ Tests: `uv run pytest` — the RLS integration test is skipped when `pgserver` i
 | Tools | `app/tools/documents.py` | context-aware search, shared by agent and MCP |
 | Agent | `app/agents/assistant.py` | PydanticAI agent, model resolved at runtime, tracing metadata |
 | API | `app/api/` | `/v1/t/{tenant_id}/agents/assistant/run`, `/v1/t/{tenant_id}/agents/assistant/stream` (SSE, both one-shot, no memory); `/v1/t/{tenant_id}/api/chat` (Vercel AI SDK) — server-held history: the server loads the stored conversation, trusts only the client's newest member-authored message, and persists the run's new messages back through the repository once it completes, independent of the client's own stream (ADR-0006) |
-| MCP server | `app/mcp/server.py` | the same tools for Claude Code / Claude Desktop, over stdio only today; the connecting client's own model sits outside residency enforcement — see [`docs/residency.md`](docs/residency.md#the-mcp-boundary) |
+| MCP server | `app/mcp/server.py` | the same tools for Claude Code / Claude Desktop: `stdio` for local development, `streamable-http` (production, requires a bearer token — no token, no connection outside local dev) mounted at `/v1/t/{tenant_id}/mcp` with per-connection identity (ADR-0005); the connecting client's own model sits outside residency enforcement — see [`docs/mcp-connection.md`](docs/mcp-connection.md) and [`docs/residency.md`](docs/residency.md#the-mcp-boundary) |
 | Models | `app/llm.py`, `app/embeddings.py` | provider abstraction; the LiteLLM gateway is mandatory, not an add-on (ADR-0009) |
 | Residency | `app/residency.py`, `app/startup_checks.py` | per-tenant model/embedding/trace routing, fail-closed at request time and at startup (ADR-0008) — see [`docs/residency.md`](docs/residency.md) |
 | Tracing | `app/observability.py` | Langfuse via OTel, a regular dependency (not optional); content-free by default, per-tenant opt-in, one trace sink per residency (ADR-0008) |
@@ -103,7 +103,9 @@ In full, with commands and conventions: [`CLAUDE.md`](CLAUDE.md).
 4. Add your domain tables as a new migration; work through the checklist in `script.py.mako`.
 5. Add tools in `app/tools/`, extend the MCP server, adjust the agent instructions.
 6. Attach clients: [`docs/frontend.md`](docs/frontend.md) (Next.js),
-   [`docs/mobile.md`](docs/mobile.md) (Android/iOS), [`docs/deployment.md`](docs/deployment.md).
+   [`docs/mobile.md`](docs/mobile.md) (Android/iOS), [`docs/deployment.md`](docs/deployment.md),
+   [`docs/mcp-connection.md`](docs/mcp-connection.md) (Claude Code / Claude Desktop over MCP —
+   a bearer token is required outside local development).
 7. **Set `AUTH_MODE=jwt` before anything is publicly reachable.** The dev headers are for
    localhost and nowhere else. JWT mode (`app/deps.py`) is implemented: configure
    `JWT_VERIFICATION_KEY`/`JWT_ALGORITHM` and, per tenant, `control.tenants.identity_issuer`

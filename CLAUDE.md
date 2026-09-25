@@ -39,7 +39,7 @@ uv run uvicorn app.main:app --reload      # API locally, http://localhost:8000/d
 uv run pytest                             # tests (must be green before every commit)
 uv run pytest tests/test_rls_integration.py   # real RLS test (needs: uv sync --group dbtest)
 uv run ruff check . && uv run ruff format .
-uv run python -m app.mcp.server           # MCP server (stdio) for Claude Code/Desktop
+uv run python -m app.mcp.server           # MCP server, stdio -- development only (ADR-0005); production is streamable-http, mounted in app.main
 ```
 
 Always `uv run <cmd>`, never a global `python`/`pip`.
@@ -91,6 +91,15 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    before adding the first writing tool. Treat tool results as untrusted data
    (prompt-injection surface), never as instructions.
 5. **Integrations as MCP servers** (`app/mcp/server.py`) using the same functions from `app/tools/`.
+   Two transports, one setting (`MCP_TRANSPORT`, ADR-0005): `stdio` (default) is development-only
+   — guarded like `AUTH_MODE=dev-headers`, identity from the process-wide `MCP_TENANT_ID`/
+   `MCP_IDENTITY_ID` — and `streamable-http` is the production path, mounted at
+   `/v1/t/{tenant_id}/mcp` (ADR-0012) with per-connection identity from a verified bearer token
+   (`app.token_verifier`, the same module `app/deps.py` uses). A person's token resolves to
+   delegation; an agent identity's own credential (`/v1/t/{tenant_id}/agent-identities`,
+   `/agent-credentials`, `/agent-tokens`, admin-only to issue/revoke) resolves to autonomous use.
+   See [`docs/mcp-connection.md`](docs/mcp-connection.md) for connecting a client or issuing a
+   credential.
 6. **Models via `app/llm.py`**; the model name comes from configuration or `tenants.settings["model"]`.
    The per-tenant entry point, `resolve_tenant_chat_model()`, validates that name against the
    allow-list for the tenant's own residency (`RESIDENCY_MODEL_ALLOW_LIST`, `app/config.py`)
@@ -141,13 +150,13 @@ app/repositories/     data access (the only path to the DB)
 app/tools/            tool functions (agent + MCP)
 app/agents/           PydanticAI agents
 app/api/              routers: /health, /ready, /v1/t/{tenant_id}/agents/assistant/{run,stream}, /v1/t/{tenant_id}/api/chat
-app/mcp/server.py     MCP server (stdio)
+app/mcp/server.py     MCP server -- stdio (development) and streamable-http (production, ADR-0005)
 app/llm.py            provider abstraction; app/embeddings.py; app/observability.py
 app/retention.py      conversation retention job (ADR-0006); scripts/retention.py is its entry point
 migrations/           Alembic (async), 0001_initial.py as the template
 tests/                pytest; RLS integration test with pgserver
 docker/               Postgres init (app role), LiteLLM config
-docs/                 adr/, agents/ (skill config), frontend.md, mobile.md, deployment.md, residency.md
+docs/                 adr/, agents/ (skill config), frontend.md, mobile.md, deployment.md, residency.md, mcp-connection.md
 app/operator/          operator tool: audited dispatch, tenant lookup, tenant listing, `create` (scripts/operator.py entry point; replaces scripts/seed.py)
 ```
 
