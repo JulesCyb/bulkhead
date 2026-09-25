@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from datetime import UTC
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -1901,3 +1902,509 @@ async def test_app_cannot_widen_its_control_plane_view_with_the_migration_read_f
         )
     await app.dispose()
     assert visible == [tenant_a]
+
+
+# --- Conversations and messages: server-side chat history (ADR-0006, Spec 4 / #32) ---
+
+
+def _run_request_message(text_content: str):
+    from pydantic_ai.messages import ModelRequest, UserPromptPart
+
+    return ModelRequest(parts=[UserPromptPart(content=text_content)])
+
+
+def _run_response_message(text_content: str):
+    from pydantic_ai.messages import ModelResponse, TextPart
+
+    return ModelResponse(parts=[TextPart(content=text_content)])
+
+
+async def test_conversations_and_messages_have_forced_rls_and_app_grants(
+    app_settings, database_urls
+):
+    """#32 AC1: both tables get tenant_id NOT NULL, a tenant index, FORCE ROW LEVEL SECURITY, the
+    standard USING/WITH CHECK tenant policy, and a grant to app for exactly select/insert/delete
+    (no update)."""
+    engine = create_async_engine(database_urls["migrations"])
+    async with engine.connect() as conn:
+        for table in ("conversations", "messages"):
+            rls = (
+                await conn.execute(
+                    text(
+                        "SELECT relrowsecurity, relforcerowsecurity FROM pg_class "
+                        "WHERE oid = CAST(:table AS regclass)"
+                    ),
+                    {"table": table},
+                )
+            ).one()
+            assert rls.relrowsecurity is True
+            assert rls.relforcerowsecurity is True
+
+            not_null_tenant = (
+                await conn.execute(
+                    text(
+                        "SELECT is_nullable FROM information_schema.columns "
+                        "WHERE table_schema = 'public' AND table_name = :table "
+                        "AND column_name = 'tenant_id'"
+                    ),
+                    {"table": table},
+                )
+            ).scalar_one()
+            assert not_null_tenant == "NO"
+
+            tenant_idx = (
+                await conn.execute(
+                    text(
+                        "SELECT indexdef FROM pg_indexes "
+                        "WHERE schemaname = 'public' AND tablename = :table "
+                        "AND indexname = :idx"
+                    ),
+                    {"table": table, "idx": f"{table}_tenant_idx"},
+                )
+            ).scalar_one_or_none()
+            assert tenant_idx is not None
+
+            policies = (
+                await conn.execute(
+                    text(
+                        "SELECT qual, with_check FROM pg_policies "
+                        "WHERE schemaname = 'public' AND tablename = :table"
+                    ),
+                    {"table": table},
+                )
+            ).all()
+            assert any(
+                p.qual
+                and "app.tenant_id" in p.qual
+                and p.with_check
+                and "app.tenant_id" in p.with_check
+                for p in policies
+            )
+    await engine.dispose()
+
+    app_engine = create_async_engine(database_urls["app"])
+    async with app_engine.connect() as conn:
+        for table in ("conversations", "messages"):
+            privileges = (
+                (
+                    await conn.execute(
+                        text(
+                            "SELECT privilege_type FROM information_schema.table_privileges "
+                            "WHERE table_schema = 'public' AND table_name = :table "
+                            "AND grantee = 'app'"
+                        ),
+                        {"table": table},
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert set(privileges) == {"SELECT", "INSERT", "DELETE"}
+    await app_engine.dispose()
+
+
+async def test_conversation_and_messages_invisible_to_another_tenant(app_settings, database_urls):
+    """#32 AC2: a conversation and its messages created under one tenant's context are invisible
+    to another tenant's context -- mirrors test_search_sees_only_own_tenant."""
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.repositories.conversations import ConversationsRepository
+
+    tenant_a, identity_a = await _create_tenant_and_identity(database_urls["superuser"])
+    tenant_b, identity_b = await _create_tenant_and_identity(database_urls["superuser"])
+
+    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=identity_a)
+    async with tenant_session(ctx_a) as session:
+        await ConversationsRepository().append_run(
+            session,
+            ctx_a,
+            conversation_id="conv-1",
+            messages=[_run_request_message("hi")],
+        )
+
+    ctx_b = RequestContext(tenant_id=tenant_b, identity_id=identity_b)
+    async with tenant_session(ctx_b) as session:
+        history = await ConversationsRepository().get_history(
+            session, ctx_b, conversation_id="conv-1"
+        )
+    assert history == []
+
+    engine = create_async_engine(database_urls["superuser"])
+    async with engine.connect() as conn:
+        count = (
+            await conn.execute(
+                text("SELECT count(*) FROM messages WHERE tenant_id = :tid"), {"tid": tenant_b}
+            )
+        ).scalar_one()
+    await engine.dispose()
+    assert count == 0
+
+
+async def test_conversation_insert_for_other_tenant_is_rejected(app_settings, database_urls):
+    """#32 AC3: an insert attempting to write another tenant's tenant_id is rejected by the
+    policy's WITH CHECK -- mirrors test_insert_for_other_tenant_is_rejected."""
+    from sqlalchemy.exc import DBAPIError
+
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+
+    tenant_a, identity_a = await _create_tenant_and_identity(database_urls["superuser"])
+    tenant_b, _ = await _create_tenant_and_identity(database_urls["superuser"])
+    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=identity_a)
+    with pytest.raises(DBAPIError):
+        async with tenant_session(ctx_a) as session:
+            await session.execute(
+                text(
+                    "INSERT INTO conversations (tenant_id, conversation_id) "
+                    "VALUES (:tid, 'foreign')"
+                ),
+                {"tid": tenant_b},
+            )
+
+
+async def test_conversation_loaded_by_another_member_comes_back_empty(app_settings, database_urls):
+    """#32 AC4: loading a conversation through the repository under one member's context never
+    returns a conversation created under a different member's context in the same tenant -- it
+    comes back empty, not as an error."""
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.repositories.conversations import ConversationsRepository
+
+    tenant_id, creator_id = await _create_tenant_and_identity(database_urls["superuser"])
+    other_identity = await _seed_identity(database_urls["superuser"], subject="s-other-member")
+
+    creator_ctx = RequestContext(tenant_id=tenant_id, identity_id=creator_id)
+    async with tenant_session(creator_ctx) as session:
+        await ConversationsRepository().append_run(
+            session,
+            creator_ctx,
+            conversation_id="conv-owned",
+            messages=[_run_request_message("hello")],
+        )
+
+    other_ctx = RequestContext(tenant_id=tenant_id, identity_id=other_identity)
+    async with tenant_session(other_ctx) as session:
+        history = await ConversationsRepository().get_history(
+            session, other_ctx, conversation_id="conv-owned"
+        )
+    assert history == []
+
+    # An unknown conversation id also comes back empty, never an error.
+    async with tenant_session(other_ctx) as session:
+        history = await ConversationsRepository().get_history(
+            session, other_ctx, conversation_id="does-not-exist"
+        )
+    assert history == []
+
+
+async def test_message_created_by_matches_session_identity(app_settings, database_urls):
+    """#32 AC5: a freshly appended message's created_by column matches the session's identity
+    with no explicit value passed by the caller."""
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.repositories.conversations import ConversationsRepository
+
+    tenant_id, identity_id = await _create_tenant_and_identity(database_urls["superuser"])
+    ctx = RequestContext(tenant_id=tenant_id, identity_id=identity_id)
+    async with tenant_session(ctx) as session:
+        await ConversationsRepository().append_run(
+            session, ctx, conversation_id="conv-audit", messages=[_run_request_message("hi")]
+        )
+
+    engine = create_async_engine(database_urls["superuser"])
+    async with engine.connect() as conn:
+        created_by = (
+            await conn.execute(
+                text(
+                    "SELECT created_by FROM messages "
+                    "WHERE tenant_id = :tid AND conversation_id = 'conv-audit'"
+                ),
+                {"tid": tenant_id},
+            )
+        ).scalar_one()
+    await engine.dispose()
+    assert created_by == identity_id
+
+
+async def test_messages_reload_in_the_exact_sequence_they_were_appended(
+    app_settings, database_urls
+):
+    """#32 AC6: messages reload in the exact sequence they were appended, verified via the
+    monotonic sequence column rather than timestamps."""
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.repositories.conversations import ConversationsRepository
+
+    tenant_id, identity_id = await _create_tenant_and_identity(database_urls["superuser"])
+    ctx = RequestContext(tenant_id=tenant_id, identity_id=identity_id)
+
+    async with tenant_session(ctx) as session:
+        await ConversationsRepository().append_run(
+            session,
+            ctx,
+            conversation_id="conv-order",
+            messages=[_run_request_message("first"), _run_response_message("second")],
+        )
+    async with tenant_session(ctx) as session:
+        await ConversationsRepository().append_run(
+            session,
+            ctx,
+            conversation_id="conv-order",
+            messages=[_run_request_message("third"), _run_response_message("fourth")],
+        )
+
+    async with tenant_session(ctx) as session:
+        history = await ConversationsRepository().get_history(
+            session, ctx, conversation_id="conv-order"
+        )
+
+    def _text_of(message) -> str:
+        return message.parts[0].content
+
+    assert [_text_of(m) for m in history] == ["first", "second", "third", "fourth"]
+
+    engine = create_async_engine(database_urls["superuser"])
+    async with engine.connect() as conn:
+        sequences = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT sequence FROM messages "
+                        "WHERE tenant_id = :tid AND conversation_id = 'conv-order' "
+                        "ORDER BY sequence"
+                    ),
+                    {"tid": tenant_id},
+                )
+            )
+            .scalars()
+            .all()
+        )
+    await engine.dispose()
+    assert sequences == [1, 2, 3, 4]
+
+
+async def test_message_payload_round_trips_through_the_library_native_type(
+    app_settings, database_urls
+):
+    """#32 AC7: a stored message's payload deserializes back into the exact library-native
+    message object it was created from."""
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.repositories.conversations import ConversationsRepository
+
+    tenant_id, identity_id = await _create_tenant_and_identity(database_urls["superuser"])
+    ctx = RequestContext(tenant_id=tenant_id, identity_id=identity_id)
+
+    request_message = _run_request_message("round trip me")
+    response_message = _run_response_message("and me too")
+
+    async with tenant_session(ctx) as session:
+        await ConversationsRepository().append_run(
+            session,
+            ctx,
+            conversation_id="conv-roundtrip",
+            messages=[request_message, response_message],
+        )
+
+    async with tenant_session(ctx) as session:
+        history = await ConversationsRepository().get_history(
+            session, ctx, conversation_id="conv-roundtrip"
+        )
+
+    assert history == [request_message, response_message]
+
+
+async def test_deleting_a_tenant_cascades_to_conversations_and_messages(
+    app_settings, database_urls
+):
+    """#32 AC8: deleting a tenant row removes its conversations and messages via the existing
+    cascading foreign key."""
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.repositories.conversations import ConversationsRepository
+
+    tenant_id, identity_id = await _create_tenant_and_identity(database_urls["superuser"])
+    ctx = RequestContext(tenant_id=tenant_id, identity_id=identity_id)
+    async with tenant_session(ctx) as session:
+        await ConversationsRepository().append_run(
+            session, ctx, conversation_id="conv-cascade", messages=[_run_request_message("bye")]
+        )
+
+    engine = create_async_engine(database_urls["superuser"])
+    async with engine.begin() as conn:
+        await conn.execute(text("DELETE FROM tenants WHERE id = :tid"), {"tid": tenant_id})
+    async with engine.connect() as conn:
+        conv_count = (
+            await conn.execute(
+                text("SELECT count(*) FROM conversations WHERE tenant_id = :tid"),
+                {"tid": tenant_id},
+            )
+        ).scalar_one()
+        msg_count = (
+            await conn.execute(
+                text("SELECT count(*) FROM messages WHERE tenant_id = :tid"), {"tid": tenant_id}
+            )
+        ).scalar_one()
+    await engine.dispose()
+    assert conv_count == 0
+    assert msg_count == 0
+
+
+async def test_conversations_migration_downgrade_after_upgrade_drops_both_tables_cleanly(
+    database_urls,
+):
+    """#32 AC9: running the migration's downgrade after its upgrade drops both tables cleanly.
+    Runs against a savepoint on the shared module-scoped database so it does not disturb the
+    schema other tests in this module depend on."""
+    engine = create_async_engine(database_urls["migrations"])
+    async with engine.begin() as conn:
+        await conn.execute(text("SAVEPOINT before_downgrade"))
+        await conn.execute(text("DROP TRIGGER IF EXISTS messages_touch_conversation ON messages"))
+        await conn.execute(text("DROP FUNCTION IF EXISTS conversations_touch_last_activity()"))
+        await conn.execute(text("DROP TABLE IF EXISTS messages"))
+        await conn.execute(text("DROP TABLE IF EXISTS conversations"))
+        tables_gone = (
+            await conn.execute(
+                text(
+                    "SELECT count(*) FROM information_schema.tables "
+                    "WHERE table_schema = 'public' AND table_name IN ('conversations', 'messages')"
+                )
+            )
+        ).scalar_one()
+        assert tables_gone == 0
+        await conn.execute(text("ROLLBACK TO SAVEPOINT before_downgrade"))
+    await engine.dispose()
+
+
+async def test_last_activity_at_advances_on_append_without_app_holding_update_grant(
+    app_settings, database_urls
+):
+    """The trigger-based escape hatch (module docstring in migration 0020): app can never issue
+    UPDATE on conversations directly, yet last_activity_at still advances when a message is
+    appended through the repository."""
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.repositories.conversations import ConversationsRepository
+
+    tenant_id, identity_id = await _create_tenant_and_identity(database_urls["superuser"])
+    ctx = RequestContext(tenant_id=tenant_id, identity_id=identity_id)
+
+    async with tenant_session(ctx) as session:
+        await ConversationsRepository().append_run(
+            session, ctx, conversation_id="conv-touch", messages=[_run_request_message("one")]
+        )
+
+    engine = create_async_engine(database_urls["superuser"])
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text(
+                    "SELECT created_at, last_activity_at FROM conversations "
+                    "WHERE tenant_id = :tid AND conversation_id = 'conv-touch'"
+                ),
+                {"tid": tenant_id},
+            )
+        ).one()
+    await engine.dispose()
+    assert row.last_activity_at >= row.created_at
+
+    from sqlalchemy.exc import DBAPIError, ProgrammingError
+
+    with pytest.raises((DBAPIError, ProgrammingError)):
+        async with tenant_session(ctx) as session:
+            await session.execute(
+                text(
+                    "UPDATE conversations SET last_activity_at = now() "
+                    "WHERE tenant_id = :tid AND conversation_id = 'conv-touch'"
+                ),
+                {"tid": tenant_id},
+            )
+
+
+async def test_delete_expired_removes_only_this_tenants_expired_conversations(
+    app_settings, database_urls
+):
+    """Repository contract: given a context and an age cutoff, delete_expired removes that
+    tenant's expired conversations (and, via cascade, their messages) in one tenant-scoped
+    operation -- leaving a still-fresh conversation, and another tenant's conversations,
+    untouched."""
+    from datetime import datetime, timedelta
+
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.repositories.conversations import ConversationsRepository
+
+    tenant_a, identity_a = await _create_tenant_and_identity(database_urls["superuser"])
+    tenant_b, identity_b = await _create_tenant_and_identity(database_urls["superuser"])
+    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=identity_a)
+    ctx_b = RequestContext(tenant_id=tenant_b, identity_id=identity_b)
+
+    async with tenant_session(ctx_a) as session:
+        await ConversationsRepository().append_run(
+            session, ctx_a, conversation_id="conv-old", messages=[_run_request_message("old")]
+        )
+        await ConversationsRepository().append_run(
+            session, ctx_a, conversation_id="conv-fresh", messages=[_run_request_message("fresh")]
+        )
+    async with tenant_session(ctx_b) as session:
+        await ConversationsRepository().append_run(
+            session, ctx_b, conversation_id="conv-old", messages=[_run_request_message("old-b")]
+        )
+
+    # Backdate tenant A's "old" conversation only, as the superuser (bypasses RLS by role, not
+    # by policy shape -- this is fixture setup, exactly like `_seed`'s direct inserts).
+    engine = create_async_engine(database_urls["superuser"])
+    backdated = datetime.now(UTC) - timedelta(days=365)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE conversations SET last_activity_at = :ts "
+                "WHERE tenant_id = :tid AND conversation_id = 'conv-old'"
+            ),
+            {"ts": backdated, "tid": tenant_a},
+        )
+    await engine.dispose()
+
+    cutoff = datetime.now(UTC) - timedelta(days=30)
+    async with tenant_session(ctx_a) as session:
+        deleted = await ConversationsRepository().delete_expired(session, ctx_a, older_than=cutoff)
+    assert deleted == 1
+
+    engine = create_async_engine(database_urls["superuser"])
+    async with engine.connect() as conn:
+        remaining_a = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT conversation_id FROM conversations WHERE tenant_id = :tid "
+                        "ORDER BY conversation_id"
+                    ),
+                    {"tid": tenant_a},
+                )
+            )
+            .scalars()
+            .all()
+        )
+        remaining_b = (
+            (
+                await conn.execute(
+                    text("SELECT conversation_id FROM conversations WHERE tenant_id = :tid"),
+                    {"tid": tenant_b},
+                )
+            )
+            .scalars()
+            .all()
+        )
+        old_messages_gone = (
+            await conn.execute(
+                text(
+                    "SELECT count(*) FROM messages "
+                    "WHERE tenant_id = :tid AND conversation_id = 'conv-old'"
+                ),
+                {"tid": tenant_a},
+            )
+        ).scalar_one()
+    await engine.dispose()
+    assert remaining_a == ["conv-fresh"]
+    assert remaining_b == ["conv-old"]
+    assert old_messages_gone == 0

@@ -22,7 +22,9 @@ from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
+    Integer,
     String,
     Table,
     Text,
@@ -124,3 +126,57 @@ class Document(Base):
         server_default=text("current_setting('app.identity_id', true)::uuid"),
     )
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Conversation(Base):
+    """Server-side chat history (ADR-0006, Spec 4 / #32): keyed by the pair of tenant and the
+    client's own conversation id (the Vercel chat `id`), not a server-generated one -- the client
+    names a conversation and the server recognizes it on the next request. `created_by` is the
+    audit-column pattern from migration 0010, applied here for the first time to a table that
+    isn't `documents`; there is no `updated_by`/trigger pair -- `last_activity_at` is refreshed by
+    a `SECURITY DEFINER` trigger on `messages` (migration 0020), never by the application issuing
+    an `UPDATE` it has no grant to make."""
+
+    __tablename__ = "conversations"
+    __table_args__ = (Index("conversations_tenant_idx", "tenant_id"),)
+
+    tenant_id: Mapped[UUID] = mapped_column(ForeignKey("tenants.id"), primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(String(200), primary_key=True)
+    created_by: Mapped[UUID] = mapped_column(
+        ForeignKey("control.identities.id"),
+        server_default=text("current_setting('app.identity_id', true)::uuid"),
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_activity_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class Message(Base):
+    """One library-native `pydantic_ai.messages` message (a `ModelRequest` or `ModelResponse`),
+    serialized with the library's own adapter -- never a hand-rolled shape (Spec 4, story 21).
+    `sequence` is a monotonically increasing, application-assigned counter within its
+    conversation; reloading orders by it, not by `created_at`, because timestamp ties are not a
+    safe substitute for the exact order a run produced (Spec 4, stories 20/21)."""
+
+    __tablename__ = "messages"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["tenant_id", "conversation_id"],
+            ["conversations.tenant_id", "conversations.conversation_id"],
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint("tenant_id", "conversation_id", "sequence"),
+        Index("messages_tenant_idx", "tenant_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[UUID] = mapped_column(ForeignKey("tenants.id"))
+    conversation_id: Mapped[str] = mapped_column(String(200))
+    sequence: Mapped[int] = mapped_column(Integer)
+    payload: Mapped[dict] = mapped_column(JSONB)
+    created_by: Mapped[UUID] = mapped_column(
+        ForeignKey("control.identities.id"),
+        server_default=text("current_setting('app.identity_id', true)::uuid"),
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
