@@ -17,6 +17,7 @@ from app.agents.assistant import AssistantDeps, run_assistant, stream_assistant
 from app.deps import Context
 from app.gateway_credentials import GatewayCredentialUnavailable
 from app.llm import ModelNotAllowedForResidency
+from app.observability import resolve_tenant_tracing, tenant_span_attributes
 from app.request_limit import RequestLimit
 from app.residency import ResidencyUnresolved
 from app.run_limits import RunDeadlineExceeded, build_run_limits, run_deadline
@@ -63,8 +64,14 @@ class RunResponse(BaseModel):
 
 @router.post("/assistant/run", response_model=RunResponse)
 async def run(body: RunRequest, ctx: Context, _limit: RequestLimit) -> RunResponse:
+    tracing = await resolve_tenant_tracing(ctx)
+    deps = AssistantDeps(
+        ctx=ctx,
+        residency=tracing.residency,
+        content_tracing_opt_in=tracing.content_tracing_opt_in,
+    )
     try:
-        output = await run_assistant(body.prompt, AssistantDeps(ctx=ctx))
+        output = await run_assistant(body.prompt, deps)
     except UsageLimitExceeded as exc:
         raise HTTPException(
             status_code=429,
@@ -83,15 +90,23 @@ async def run(body: RunRequest, ctx: Context, _limit: RequestLimit) -> RunRespon
 @router.post("/assistant/stream")
 async def stream(body: RunRequest, ctx: Context, _limit: RequestLimit) -> StreamingResponse:
     limits = build_run_limits()
+    tracing = await resolve_tenant_tracing(ctx)
+    deps = AssistantDeps(
+        ctx=ctx,
+        residency=tracing.residency,
+        content_tracing_opt_in=tracing.content_tracing_opt_in,
+    )
 
     async def events() -> AsyncIterator[str]:
         try:
-            # The deadline must bound opening the stream AND reading every delta from it, not
-            # just the call that starts it — see run_deadline()'s docstring.
+            # Both the deadline and the tenant span attributes must bound opening the stream AND
+            # reading every delta from it, not just the call that starts it — see
+            # run_deadline()'s and tenant_span_attributes()'s docstrings.
             async with run_deadline(limits):
-                async with stream_assistant(body.prompt, AssistantDeps(ctx=ctx), limits) as result:
-                    async for delta in result.stream_text(delta=True):
-                        yield _sse(delta)
+                with tenant_span_attributes(ctx.trace_attributes()):
+                    async with stream_assistant(body.prompt, deps, limits) as result:
+                        async for delta in result.stream_text(delta=True):
+                            yield _sse(delta)
         except UsageLimitExceeded as exc:
             yield _sse_error("run_limit_exceeded", str(exc))
             return
