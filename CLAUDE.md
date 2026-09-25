@@ -54,9 +54,12 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    never inside a repository's read path (`app/repositories/`), since RLS already handles the only
    visibility question that exists (tenant boundary) and a role has no say in it. `list_memberships`
    / the `/v1/t/{tenant_id}/memberships` route (`app/tools/memberships.py`, `app/api/memberships.py`)
-   is the worked example to copy for a new admin-only action. A failed check raises `PermissionError`
-   and is reported by the registered exception handler (`app.main.handle_permission_error`) as a 403
-   naming the missing role — never a bare exception left to the default handler, never a 500.
+   is the worked example to copy for a new admin-only action. A failed check raises `RoleRequired`
+   (`app/context.py`, a `PermissionError` subclass carrying the missing role as its typed
+   `required_role` attribute) and is reported by the registered exception handler
+   (`app.main.handle_permission_error`) as a 403 naming the missing role — never a bare
+   `PermissionError` left to the default handler, never a 500, and never a caller recovering the
+   role by string-matching the exception's message instead of reading `required_role`.
 1b. **The per-transaction `app.identity_id` setting is the source of truth for who did a write**
    (ADR-0004): `tenant_session(ctx)` sets it on every transaction; a table that needs an audit
    trail reads it from the database side, never from a value the application passes explicitly or

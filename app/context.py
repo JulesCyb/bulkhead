@@ -1,7 +1,13 @@
 """The context object: who is acting, for which tenant.
 
-Built once per HTTP request (app/deps.py) and passed through agent run, tools, and
-repositories. Nothing reads tenant or identity from global state.
+Built once per HTTP request (`app/deps.py`) and once per MCP connection -- `streamable-http`
+builds one per connection from a verified bearer token (`app/mcp/server.py`'s
+`MCPTenantAuthMiddleware`/`_actor_context`); `stdio` builds one process-wide from the
+`MCP_TENANT_ID`/`MCP_IDENTITY_ID` dev fallback (`_context_from_env`), never per connection, since
+`stdio` is a single local development client (ADR-0005). Either way it is then passed through the
+agent run, every tool call, and every repository call -- an agent run receives exactly the
+context its caller (the HTTP route or the MCP tool) already built, never one of its own. Nothing
+reads tenant or identity from global state.
 """
 
 from __future__ import annotations
@@ -23,6 +29,26 @@ two from silently drifting apart -- change one, change the other, or that test f
 """
 
 ROLES: frozenset[str] = frozenset(get_args(Role))
+
+
+class RoleRequired(PermissionError):
+    """Raised by `RequestContext.require_role` when the acting context lacks the role a tool or
+    route demands (ADR-0004). A `PermissionError` subclass -- every existing `except
+    PermissionError` site (`app/mcp/server.py`'s `_masked`, `app.main`'s registered exception
+    handler) keeps catching it unchanged -- but callers that need the missing role for a 403 body
+    or a log field read it off `required_role` instead of re-deriving it from `str(exc)` with a
+    regex. Never raise a bare `PermissionError` for a missing role, and never recover the role by
+    parsing this exception's message: the message is for a human/log line, `required_role` is for
+    code."""
+
+    def __init__(self, required_role: Role, actual_roles: frozenset[str] = frozenset()) -> None:
+        self.required_role: Role = required_role
+        """The single role the check demanded -- exactly the argument `require_role` was called
+        with."""
+        self.actual_roles: frozenset[str] = actual_roles
+        """The roles the context actually had at the time of the check, for logs only -- never
+        rendered into the client-facing 403 body (that stays role-name-only, per ADR-0004)."""
+        super().__init__(f"role {required_role!r} required")
 
 
 MeansKind = Literal["agent", "credential"]
@@ -57,7 +83,7 @@ class RequestContext:
 
     def require_role(self, role: Role) -> None:
         if not self.has_role(role):
-            raise PermissionError(f"role {role!r} required")
+            raise RoleRequired(role, self.roles)
 
     def acting_through(self, kind: MeansKind, id: str) -> RequestContext:
         """Returns a new context with the same actor (tenant/identity/roles/request_id)
