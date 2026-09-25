@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     langfuse_secret_key: str | None = None
 
     mcp_tenant_id: str | None = None
-    mcp_user_id: str | None = None
+    mcp_identity_id: str | None = None
 
     @property
     def cors_origin_list(self) -> list[str]:

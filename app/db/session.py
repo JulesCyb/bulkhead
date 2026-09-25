@@ -1,6 +1,6 @@
 """Async engine and tenant-bound sessions.
 
-tenant_session() opens a transaction and sets app.tenant_id / app.user_id via set_config
+tenant_session() opens a transaction and sets app.tenant_id / app.identity_id via set_config
 (is_local=true, valid for this transaction only). The RLS policies in migrations/ filter on it.
 Without a set context, current_setting(..., true) returns NULL -> the policies block everything.
 """
@@ -49,7 +49,7 @@ async def tenant_session(ctx: RequestContext) -> AsyncIterator[AsyncSession]:
                 {"tid": str(ctx.tenant_id)},
             )
             await session.execute(
-                text("SELECT set_config('app.user_id', :uid, true)"),
-                {"uid": str(ctx.user_id)},
+                text("SELECT set_config('app.identity_id', :iid, true)"),
+                {"iid": str(ctx.identity_id)},
             )
             yield session

@@ -32,14 +32,15 @@ async def test_run_requires_dev_headers(client):
     assert response.status_code == 401
 
 
-async def test_run_with_context(client, calls):
-    tenant_id, user_id = uuid.uuid4(), uuid.uuid4()
+async def test_run_with_context(client, calls, contexts):
+    tenant_id, identity_id = uuid.uuid4(), uuid.uuid4()
     async with client:
         response = await client.post(
             "/agents/assistant/run",
             json={"prompt": "What does the contract say?"},
-            headers={"X-Tenant-Id": str(tenant_id), "X-User-Id": str(user_id)},
+            headers={"X-Tenant-Id": str(tenant_id), "X-Identity-Id": str(identity_id)},
         )
     assert response.status_code == 200, response.text
     assert response.json()["output"]
     assert calls and calls[0][0] == tenant_id
+    assert contexts and contexts[0].identity_id == identity_id

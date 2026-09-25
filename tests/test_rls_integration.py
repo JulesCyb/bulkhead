@@ -116,12 +116,12 @@ async def test_search_sees_only_own_tenant(app_settings, database_urls):
     query = [0.0] * DIM
     query[0] = 1.0
 
-    ctx_a = RequestContext(tenant_id=tenant_a, user_id=uuid.uuid4())
+    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
     async with tenant_session(ctx_a) as session:
         hits = await DocumentRepository().search(session, query, limit=10)
     assert [h.title for h in hits] == ["Document A"]
 
-    ctx_b = RequestContext(tenant_id=tenant_b, user_id=uuid.uuid4())
+    ctx_b = RequestContext(tenant_id=tenant_b, identity_id=uuid.uuid4())
     async with tenant_session(ctx_b) as session:
         hits = await DocumentRepository().search(session, query, limit=10)
     assert [h.title for h in hits] == ["Document B"]
@@ -134,7 +134,7 @@ async def test_insert_for_other_tenant_is_rejected(app_settings, database_urls):
     from app.db.session import tenant_session
 
     tenant_a, tenant_b = await _seed(database_urls["migrations"])
-    ctx_a = RequestContext(tenant_id=tenant_a, user_id=uuid.uuid4())
+    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
     with pytest.raises(DBAPIError):
         async with tenant_session(ctx_a) as session:
             await session.execute(
@@ -155,10 +155,24 @@ async def test_app_role_cannot_delete_tenants(app_settings, database_urls):
     from app.db.session import tenant_session
 
     tenant_a, _ = await _seed(database_urls["migrations"])
-    ctx_a = RequestContext(tenant_id=tenant_a, user_id=uuid.uuid4())
+    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
     with pytest.raises((DBAPIError, ProgrammingError)):
         async with tenant_session(ctx_a) as session:
             await session.execute(text("DELETE FROM tenants WHERE id = :tid"), {"tid": tenant_a})
+
+
+async def test_tenant_session_sets_identity_id(app_settings, database_urls):
+    """The new session-setting name is set and readable — no policy reads it yet (Spec 3's job)."""
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+
+    tenant_id, identity_id = uuid.uuid4(), uuid.uuid4()
+    ctx = RequestContext(tenant_id=tenant_id, identity_id=identity_id)
+    async with tenant_session(ctx) as session:
+        value = (
+            await session.execute(text("SELECT current_setting('app.identity_id', true)"))
+        ).scalar_one()
+    assert value == str(identity_id)
 
 
 async def test_no_context_means_no_rows(app_settings, database_urls):

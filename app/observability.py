@@ -1,7 +1,7 @@
 """Tracing for agent runs (Langfuse via OpenTelemetry, optional).
 
 Active once LANGFUSE_HOST/PUBLIC_KEY/SECRET_KEY are set and `logfire` is installed
-(`uv sync --extra observability`). Context attributes (tenant_id, user_id, request_id) are
+(`uv sync --extra observability`). Context attributes (tenant_id, identity_id, request_id) are
 attached by the agent call via `metadata` — see app/agents/assistant.py.
 """
 
