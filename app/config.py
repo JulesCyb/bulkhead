@@ -130,6 +130,15 @@ class Settings(BaseSettings):
     request_limit_max: int = 30
     request_limit_window_seconds: float = 60.0
 
+    # Directory holding one file per gateway-credential alias (Spec 7 / #52, ADR-0009,
+    # ADR-0011). Deliberately a separate field from `secrets_dir` above: `secrets_dir` is
+    # pydantic-settings' own mechanism for loading *this object's own fields* once at process
+    # startup (one file per field name); this directory is read fresh on every request by
+    # app.gateway_credentials, keyed by an alias the control plane names per tenant, not by a
+    # field name. Same default location (files delivered by the deployment under /run/secrets),
+    # different lookup key and lifetime.
+    gateway_credentials_dir: str = "/run/secrets"
+
     @model_validator(mode="after")
     def _require_embedding_config(self) -> "Settings":
         if not self.embedding_provider:

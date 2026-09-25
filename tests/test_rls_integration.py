@@ -468,3 +468,152 @@ async def test_app_statement_timeout_matches_bootstrap(database_urls):
         ).scalar_one()
     await engine.dispose()
     assert int(timeout_ms) == ROLE_STATEMENT_TIMEOUT_MS
+
+
+# --- Gateway credential alias (#52): the control-plane fact + the resolver end to end ------
+
+
+async def _set_gateway_alias(url: str, tenant_id: uuid.UUID, alias: str) -> None:
+    """As the owner role -- the only role that may ever write to `control.tenants` (#12).
+
+    FORCE ROW LEVEL SECURITY (0001/0002) applies to `app_owner` too, so writing still needs
+    `app.tenant_id` set to the target tenant, exactly as a real provisioning step would.
+    """
+    engine = create_async_engine(url)
+    async with engine.connect() as conn:
+        await conn.execute(
+            text("SELECT set_config('app.tenant_id', :t, false)"), {"t": str(tenant_id)}
+        )
+        await conn.execute(
+            text("INSERT INTO control.tenants (tenant_id) VALUES (:tid)"),
+            {"tid": tenant_id},
+        )
+        await conn.execute(
+            text(
+                "UPDATE control.tenants SET gateway_credential_alias = :alias "
+                "WHERE tenant_id = :tid"
+            ),
+            {"tid": tenant_id, "alias": alias},
+        )
+        await conn.commit()
+    await engine.dispose()
+
+
+async def test_control_tenants_view_exposes_the_gateway_credential_alias(
+    app_settings, database_urls
+):
+    """The alias the owner role recorded is visible to `app` through the read-only view,
+    scoped to the caller's own tenant like every other row in `control.tenants` (#52)."""
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.repositories.control import ControlRepository
+
+    tenant_a, _ = await _seed(database_urls["superuser"])
+    await _set_gateway_alias(database_urls["migrations"], tenant_a, "acme-gateway-key")
+
+    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
+    async with tenant_session(ctx_a) as session:
+        alias = await ControlRepository().get_gateway_credential_alias(session, ctx_a)
+    assert alias == "acme-gateway-key"
+
+
+async def test_control_tenants_alias_is_none_when_not_yet_recorded(app_settings, database_urls):
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.repositories.control import ControlRepository
+
+    tenant_a, _ = await _seed(database_urls["superuser"])
+    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
+    async with tenant_session(ctx_a) as session:
+        alias = await ControlRepository().get_gateway_credential_alias(session, ctx_a)
+    assert alias is None
+
+
+async def test_app_cannot_write_the_gateway_credential_alias(app_settings, database_urls):
+    """`app` has no UPDATE (or any DML) anywhere in `control` -- only the owner role can ever
+    set an alias (#12, #52); a tenant's own request cannot forge itself a credential."""
+    from sqlalchemy.exc import DBAPIError, ProgrammingError
+
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+
+    tenant_a, _ = await _seed(database_urls["superuser"])
+    await _set_gateway_alias(database_urls["migrations"], tenant_a, "acme-gateway-key")
+    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
+    with pytest.raises((DBAPIError, ProgrammingError)):
+        async with tenant_session(ctx_a) as session:
+            await session.execute(
+                text(
+                    "UPDATE control.tenants SET gateway_credential_alias = 'forged' "
+                    "WHERE tenant_id = :tid"
+                ),
+                {"tid": tenant_a},
+            )
+
+
+async def test_two_tenants_with_different_aliases_resolve_different_credentials(
+    app_settings, database_urls, tmp_path
+):
+    """End to end (#52): given a tenant id, the resolver reads the control plane's alias, then
+    that alias's secret file fresh -- two tenants with different aliases get two different
+    credential contents, nothing shared or cached between them."""
+    from app.config import Settings
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.gateway_credentials import resolve_gateway_credential
+
+    tenant_a, tenant_b = await _seed(database_urls["superuser"])
+    await _set_gateway_alias(database_urls["migrations"], tenant_a, "acme-gateway-key")
+    await _set_gateway_alias(database_urls["migrations"], tenant_b, "globex-gateway-key")
+    (tmp_path / "acme-gateway-key").write_text("sk-acme-secret")
+    (tmp_path / "globex-gateway-key").write_text("sk-globex-secret")
+    settings = Settings(
+        database_url="postgresql+asyncpg://app:app@localhost:5432/app",
+        gateway_credentials_dir=str(tmp_path),
+    )
+
+    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
+    async with tenant_session(ctx_a) as session:
+        credential_a = await resolve_gateway_credential(session, ctx_a, settings=settings)
+
+    ctx_b = RequestContext(tenant_id=tenant_b, identity_id=uuid.uuid4())
+    async with tenant_session(ctx_b) as session:
+        credential_b = await resolve_gateway_credential(session, ctx_b, settings=settings)
+
+    assert credential_a.get_secret_value() == "sk-acme-secret"
+    assert credential_b.get_secret_value() == "sk-globex-secret"
+
+
+async def test_resolver_raises_typed_error_for_a_tenant_with_no_alias_recorded(
+    app_settings, database_urls
+):
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.gateway_credentials import GatewayCredentialUnavailable, resolve_gateway_credential
+
+    tenant_a, _ = await _seed(database_urls["superuser"])
+    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
+    with pytest.raises(GatewayCredentialUnavailable):
+        async with tenant_session(ctx_a) as session:
+            await resolve_gateway_credential(session, ctx_a)
+
+
+async def test_resolver_raises_typed_error_when_the_secret_file_is_missing(
+    app_settings, database_urls, tmp_path
+):
+    from app.config import Settings
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.gateway_credentials import GatewayCredentialUnavailable, resolve_gateway_credential
+
+    tenant_a, _ = await _seed(database_urls["superuser"])
+    await _set_gateway_alias(database_urls["migrations"], tenant_a, "acme-gateway-key")
+    settings = Settings(
+        database_url="postgresql+asyncpg://app:app@localhost:5432/app",
+        gateway_credentials_dir=str(tmp_path),
+    )
+
+    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
+    with pytest.raises(GatewayCredentialUnavailable):
+        async with tenant_session(ctx_a) as session:
+            await resolve_gateway_credential(session, ctx_a, settings=settings)
