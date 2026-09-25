@@ -3123,3 +3123,45 @@ async def test_expiry_window_is_configuration_not_a_constant(app_settings, datab
     assert long_offset > short_offset
     assert abs(short_offset - timedelta(seconds=30)) < timedelta(seconds=5)
     assert abs(long_offset - timedelta(seconds=3000)) < timedelta(seconds=5)
+
+
+async def test_no_context_on_a_reused_connection_means_no_rows_not_an_error(
+    app_settings, database_urls, monkeypatch
+):
+    """Once a pooled connection has carried a tenant context, Postgres leaves `app.tenant_id`
+    as '' (not NULL) after the transaction and after RESET ALL. Every policy must treat that as
+    "no context" -- zero rows -- instead of failing on `''::uuid`, or the first context-less
+    read after any tenant request (control_session, the /ready guard) breaks."""
+    from app import config
+    from app.context import RequestContext
+    from app.db import session as db_session
+
+    monkeypatch.setenv("DB_POOL_SIZE", "1")
+    monkeypatch.setenv("DB_MAX_OVERFLOW", "0")
+    config.get_settings.cache_clear()
+    db_session._engine = None
+    db_session._session_factory = None
+
+    tenant_a, _ = await _seed(database_urls["superuser"])
+    async with db_session.tenant_session(
+        RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
+    ) as session:
+        await session.execute(text("SELECT 1 FROM documents"))
+
+    async with db_session.control_session() as session:
+        leftover = (
+            await session.execute(text("SELECT current_setting('app.tenant_id', true)"))
+        ).scalar_one()
+        documents = (await session.execute(text("SELECT count(*) FROM documents"))).scalar_one()
+        control_rows = (
+            await session.execute(text("SELECT count(*) FROM control.tenants_view"))
+        ).scalar_one()
+        # What the /ready guard runs over control_session() to find every database alias.
+        aliases = (
+            (await session.execute(text("SELECT * FROM control.enumerate_database_aliases()")))
+            .scalars()
+            .all()
+        )
+    assert leftover in ("", None)
+    assert documents == 0 and control_rows == 0
+    assert isinstance(aliases, list)  # answered, rather than failing on ''::uuid

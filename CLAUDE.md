@@ -68,9 +68,11 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    `control.identities` — never to a membership, which can be revoked) for any other tenant
    table that needs to say who wrote or last touched a row.
 2. **Every new table** has `tenant_id uuid NOT NULL REFERENCES tenants(id)`, an index on it,
-   `ENABLE`/`FORCE ROW LEVEL SECURITY`, and a policy `tenant_id = current_setting('app.tenant_id',
-   true)::uuid` (USING and WITH CHECK) plus a GRANT to the `app` role, and must be added to the
-   tenant-table registry (`app/db/tenant_tables.py`). Template: `migrations/versions/0001_initial.py`.
+   `ENABLE`/`FORCE ROW LEVEL SECURITY`, and a policy `tenant_id = NULLIF(current_setting(
+   'app.tenant_id', true), '')::uuid` (USING and WITH CHECK; the NULLIF matters: a reused pooled
+   connection reports '' rather than NULL without a context, migration 0040) plus a GRANT to the
+   `app` role, and must be added to the tenant-table registry (`app/db/tenant_tables.py`).
+   Template: `migrations/versions/0001_initial.py`.
    `conversations` and `messages` (migration `0020_conversations_and_messages.py`) are additionally
    governed, with no exception, by the tenant's own retention period (ADR-0006): a tenant's own
    `settings["retention_days"]`, or the documented default of `DEFAULT_RETENTION_DAYS` (90 days,
