@@ -5,7 +5,7 @@
       "args": [
         "run",
         "--directory",
-        "/absolute/path/to/ai-app-starter",
+        "/absolute/path/to/bulkhead",
         "python",
         "-m",
         "app.mcp.server"

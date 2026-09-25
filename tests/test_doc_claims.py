@@ -316,9 +316,15 @@ def test_adr_0004_names_all_four_roles_and_cross_references_adr_0005() -> None:
     assert "ADR-0005" in decision_section
 
 
-def test_architecture_svg_caption_matches_tenant_wide_visibility() -> None:
+def test_architecture_svg_claims_only_what_the_code_enforces() -> None:
+    # The hero diagram (scripts/render_architecture.py) states three guarantees in plain words;
+    # each must remain something the code actually does, and it must not resurrect the retired
+    # per-member-permissions claim.
     assert "the logged-in user's permissions" not in ARCHITECTURE_SVG
-    assert "Tenant-wide visibility, roles gate actions" in ARCHITECTURE_SVG
+    assert "never hold a database password" in ARCHITECTURE_SVG
+    assert "a person approves that exact change" in ARCHITECTURE_SVG
+    assert "Row-Level Security forced on every table" in ARCHITECTURE_SVG
+    assert "fails closed" in ARCHITECTURE_SVG
 
 
 # Spec 8's closing ticket (#63): the residency/tracing claim in the outward-facing docs, the

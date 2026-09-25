@@ -1,26 +1,47 @@
-# ai-app-starter
+# 🦭 bulkhead
 
-[![CI](https://github.com/JulesCyb/ai-app-starter/actions/workflows/ci.yml/badge.svg)](https://github.com/JulesCyb/ai-app-starter/actions/workflows/ci.yml)
+**Secure by design, not by discipline.** A multi-tenant backend for AI agents where tenant
+isolation, human approval of every write, and data residency are load-bearing architecture —
+enforced by the database and refused at startup, never left to a code review.
 
-Prototype an AI-agent app today without closing a single door for tomorrow.
-
-This is a working agent backend — FastAPI + PydanticAI behind an HTTP API — that treats the web frontend, a mobile app, and Claude Code as three clients of the same interface. It is multi-tenant from day one without getting in your way while there is only one tenant, and everything vendor-shaped (model, gateway, tracing) sits behind an interface you can swap.
+[![CI](https://github.com/JulesCyb/bulkhead/actions/workflows/ci.yml/badge.svg)](https://github.com/JulesCyb/bulkhead/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-2f81f7?style=flat-square)](LICENSE)
+[![Python 3.12](https://img.shields.io/badge/python-3.12-3776ab?style=flat-square&logo=python&logoColor=white)](pyproject.toml)
+[![PydanticAI](https://img.shields.io/badge/agents-PydanticAI-e92063?style=flat-square)](app/agents/assistant.py)
+[![MCP](https://img.shields.io/badge/MCP-streamable--http-8b5cf6?style=flat-square)](docs/mcp-connection.md)
+[![Postgres 17 · RLS](https://img.shields.io/badge/Postgres%2017-Row--Level%20Security-336791?style=flat-square&logo=postgresql&logoColor=white)](migrations/versions/0001_initial.py)
+[![GitHub stars](https://img.shields.io/github/stars/JulesCyb/bulkhead?style=flat-square&color=f59e0b)](https://github.com/JulesCyb/bulkhead/stargazers)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-22c55e?style=flat-square)](https://github.com/JulesCyb/bulkhead/issues)
 
 <p align="center">
-  <img src="docs/architecture.svg" alt="Architecture: clients (web, mobile, Claude Code) call the FastAPI or the MCP server; both produce a context object with tenant_id that is passed through agent, tools, and repository down to the Postgres database with Row-Level Security" width="100%">
+  <img src="docs/architecture.svg" alt="bulkhead architecture: web, mobile, and MCP clients enter through one front door that names the tenant and carries a signed token; inside one deployment the agents reach data only through tools; wall 2 — a human approves every change; wall 1 — each tenant's data is sealed by Postgres Row-Level Security; wall 3 — a residency gate keeps content in its jurisdiction before it reaches the model gateway or the trace sink" width="100%">
 </p>
 
-<p align="center"><sub><a href="https://excalidraw.com/#json=HVEtqjokzG5Qtgyo6uulN,5FEngHdy0vyeKAv4jYPyZg">Open and edit the diagram in Excalidraw</a></sub></p>
+<p align="center"><sub>The diagram is code: <code>uv run python scripts/render_architecture.py</code> regenerates it.</sub></p>
+
+## Three things your agent cannot do
+
+1. **Read another tenant's rows.** Row-Level Security is `FORCE`d on every table; the app
+   connects as a role with neither superuser nor `BYPASSRLS`; a reused pooled connection
+   without a tenant context sees nothing (the `NULLIF` policy, migration 0040).
+2. **Write without a human's yes.** Every writing tool is a pending action stored server-side
+   with a hash of its exact arguments; the answer is checked against that record, never the
+   client's message; there is no "always allow" for a person, by design (ADR-0007).
+3. **Send content out of its jurisdiction.** Model, embeddings, and traces each resolve their
+   route from the tenant's own residency; an unlisted host fails closed — at startup, before
+   the first request (ADR-0008).
+
+Web, mobile, and Claude Code are three clients of the same API and the same MCP server; one
+context object (`tenant_id`, `identity_id`, roles) travels through every request, agent run,
+tool call, and database transaction. No global state. Tools are
+isolated by tenant, not by individual member — every member of a tenant can see every document
+of that tenant today; per-member visibility is not implemented.
 
 > **As of 2026-08** (PydanticAI 2.x, MCP SDK 2.x, FastAPI 0.14x). Before deriving a project,
 > run `uv lock --upgrade` and update the model names in `.env.example` and
 > `docker/litellm/config.yaml`.
 
 ---
-
-## The idea in four sentences
-
-The agent logic runs as its own service with an HTTP API — web, mobile, and Claude Code are just three clients of the same interface. Every request produces a **context object** (`tenant_id`, `identity_id`, roles) that is passed through agent, tools, repository, and down into the database transaction; nothing reads global state. In the database, **Row-Level Security** enforces tenant separation — not developer discipline. And the agent never sees a DB connection: it reaches data exclusively through tools that are isolated by tenant, not by individual member — every member of a tenant can see every document of that tenant today; per-member visibility is not implemented.
 
 ## Quickstart
 

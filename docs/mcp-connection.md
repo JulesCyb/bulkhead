@@ -45,7 +45,7 @@ Use this path while developing against your own tenant, running the API on your 
 2. Copy `.mcp.json.example` to `.mcp.json` (Claude Code) or your MCP client's own config file
    location (Claude Desktop), keeping only the `ai-app-tools` (stdio) entry.
 3. Fill in the placeholders:
-   - `args`: replace `/absolute/path/to/ai-app-starter` with this repo's absolute path on disk —
+   - `args`: replace `/absolute/path/to/bulkhead` with this repo's absolute path on disk —
      `uv run --directory <path> …` tells `uv` where the project lives explicitly, so the
      server's `.env` resolves correctly no matter which directory the MCP client happens to
      launch the command from (previously an assumption the client's own working directory
