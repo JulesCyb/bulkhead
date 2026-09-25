@@ -28,7 +28,13 @@ from __future__ import annotations
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-TENANT_TABLES: tuple[str, ...] = ("memberships", "documents", "agent_credentials")
+TENANT_TABLES: tuple[str, ...] = (
+    "memberships",
+    "documents",
+    "agent_credentials",
+    "conversations",
+    "messages",
+)
 
 
 async def unregistered_tenant_tables(conn: AsyncConnection) -> list[str]:
