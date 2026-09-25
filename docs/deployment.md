@@ -81,8 +81,12 @@ in `docker/postgres/01-init.sh`) that can never see the application's tenant tab
 receives only its own database URL, `LITELLM_MASTER_KEY`, and the model-provider credentials its
 configured aliases call — never the application's database credential or the tracing secret.
 Maintain `docker/litellm/config.yaml`; set `LITELLM_MASTER_KEY` in `.env` (rendering
-`docker-compose.yml` fails if it is unset) and mint virtual keys with per-tenant budgets via the
-LiteLLM admin API. Backend: `LITELLM_BASE_URL=http://litellm:4000`,
+`docker-compose.yml` fails if it is unset). `scripts/seed.py` mints the first tenant's virtual
+key automatically via `app.gateway_provisioning.provision_gateway_credential` (Spec 7 / #53) —
+no manual step. Before Spec 9's operator tool exists, provision any later tenant the same way,
+from a Python shell: `await provision_gateway_credential(tenant_id, residency=..., limits=...)`;
+`revoke_gateway_credential(tenant_id)` reverses it (revokes the key, removes the secret file,
+clears the control-plane alias). Backend: `LITELLM_BASE_URL=http://litellm:4000`,
 `LITELLM_API_KEY=<virtual key>`, `LLM_MODEL=openai:claude`, `EMBEDDING_MODEL=embeddings`
 (the alias names from the config).
 
