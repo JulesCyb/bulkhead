@@ -276,7 +276,7 @@ async def test_owner_owns_public_schema_and_ran_the_migrations(database_urls):
                 await conn.execute(
                     text(
                         "SELECT tableowner FROM pg_tables WHERE schemaname = 'public' "
-                        "AND tablename IN ('tenants', 'users', 'documents')"
+                        "AND tablename IN ('tenants', 'memberships', 'documents')"
                     )
                 )
             )
@@ -1342,3 +1342,257 @@ async def test_ready_endpoint_succeeds_against_real_postgres_as_the_app_role(app
         response = await client.get("/ready")
     assert response.status_code == 200
     assert response.json() == {"status": "ready"}
+
+
+# --- Tenant memberships replace per-tenant users (ADR-0003, Spec 2 / #23) ---
+
+
+async def _seed_identity(url: str, *, subject: str) -> uuid.UUID:
+    """A global identity, inserted with the superuser exactly like `_seed`'s tenants/documents:
+    `control.identities` carries no tenant_id and no RLS (ADR-0003)."""
+    engine = create_async_engine(url)
+    identity_id = uuid.uuid4()
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO control.identities (id, issuer, subject) "
+                "VALUES (:id, 'https://idp.example.com', :subject)"
+            ),
+            {"id": identity_id, "subject": subject},
+        )
+    await engine.dispose()
+    return identity_id
+
+
+async def _seed_membership(
+    url: str, *, tenant_id: uuid.UUID, identity_id: uuid.UUID, role: str
+) -> None:
+    engine = create_async_engine(url)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO memberships (tenant_id, identity_id, role) "
+                "VALUES (:tenant_id, :identity_id, :role)"
+            ),
+            {"tenant_id": tenant_id, "identity_id": identity_id, "role": role},
+        )
+    await engine.dispose()
+
+
+async def test_migration_drops_users_and_memberships_has_the_expected_shape(database_urls):
+    """Acceptance: migrating drops the old per-tenant `users` table and creates `memberships`
+    with a required indexed tenant reference, a cross-schema reference to `control.identities`,
+    a role restricted to the four defined roles, one membership per identity per tenant, and RLS
+    enabled and forced."""
+    engine = create_async_engine(database_urls["migrations"])
+    async with engine.connect() as conn:
+        users_exists = (
+            await conn.execute(
+                text(
+                    "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+                    "WHERE table_schema = 'public' AND table_name = 'users')"
+                )
+            )
+        ).scalar_one()
+        assert users_exists is False
+
+        rls = (
+            await conn.execute(
+                text(
+                    "SELECT relrowsecurity, relforcerowsecurity FROM pg_class "
+                    "WHERE oid = CAST('memberships' AS regclass)"
+                )
+            )
+        ).one()
+        assert rls.relrowsecurity is True
+        assert rls.relforcerowsecurity is True
+
+        tenant_idx = (
+            await conn.execute(
+                text(
+                    "SELECT indexdef FROM pg_indexes "
+                    "WHERE schemaname = 'public' AND tablename = 'memberships' "
+                    "AND indexname = 'memberships_tenant_idx'"
+                )
+            )
+        ).scalar_one_or_none()
+        assert tenant_idx is not None
+
+        not_null_tenant = (
+            await conn.execute(
+                text(
+                    "SELECT is_nullable FROM information_schema.columns "
+                    "WHERE table_schema = 'public' AND table_name = 'memberships' "
+                    "AND column_name = 'tenant_id'"
+                )
+            )
+        ).scalar_one()
+        assert not_null_tenant == "NO"
+
+        identity_fk_target = (
+            await conn.execute(
+                text(
+                    """
+                    SELECT ccu.table_schema, ccu.table_name
+                    FROM information_schema.table_constraints tc
+                    JOIN information_schema.constraint_column_usage ccu
+                        ON tc.constraint_name = ccu.constraint_name
+                        AND tc.constraint_schema = ccu.constraint_schema
+                    JOIN information_schema.key_column_usage kcu
+                        ON tc.constraint_name = kcu.constraint_name
+                        AND tc.constraint_schema = kcu.constraint_schema
+                    WHERE tc.constraint_type = 'FOREIGN KEY'
+                        AND tc.table_schema = 'public' AND tc.table_name = 'memberships'
+                        AND kcu.column_name = 'identity_id'
+                    """
+                )
+            )
+        ).one()
+    await engine.dispose()
+    assert (identity_fk_target.table_schema, identity_fk_target.table_name) == (
+        "control",
+        "identities",
+    )
+
+    # One membership per identity per tenant.
+    tenant_id = uuid.uuid4()
+    identity_id = await _seed_identity(database_urls["superuser"], subject="s-unique")
+    superuser_engine = create_async_engine(database_urls["superuser"])
+    async with superuser_engine.begin() as conn:
+        await conn.execute(
+            text("INSERT INTO tenants (id, name) VALUES (:id, 'Uniq')"), {"id": tenant_id}
+        )
+    await superuser_engine.dispose()
+    await _seed_membership(
+        database_urls["superuser"], tenant_id=tenant_id, identity_id=identity_id, role="member"
+    )
+    from sqlalchemy.exc import DBAPIError, IntegrityError
+
+    with pytest.raises((DBAPIError, IntegrityError)):
+        await _seed_membership(
+            database_urls["superuser"], tenant_id=tenant_id, identity_id=identity_id, role="admin"
+        )
+
+    # Role restricted to the four defined roles.
+    other_identity_id = await _seed_identity(database_urls["superuser"], subject="s-bad-role")
+    with pytest.raises((DBAPIError, IntegrityError)):
+        await _seed_membership(
+            database_urls["superuser"],
+            tenant_id=tenant_id,
+            identity_id=other_identity_id,
+            role="owner",
+        )
+
+
+async def test_memberships_grants_mirror_the_retired_users_grants(database_urls):
+    """Acceptance: grants on `memberships` for `app` mirror the retired `users` grants."""
+    engine = create_async_engine(database_urls["app"])
+    async with engine.connect() as conn:
+        privileges = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT privilege_type FROM information_schema.table_privileges "
+                        "WHERE table_schema = 'public' AND table_name = 'memberships' "
+                        "AND grantee = 'app'"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    await engine.dispose()
+    assert set(privileges) == {"SELECT", "INSERT", "UPDATE", "DELETE"}
+
+
+async def test_second_tenants_memberships_are_invisible_without_its_own_context(
+    app_settings, database_urls
+):
+    """Acceptance (mirrors the retired users coverage): a second tenant's membership rows are
+    invisible without that tenant's own context set, and a cross-tenant insert or update fails
+    the write check."""
+    from sqlalchemy.exc import DBAPIError
+
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+
+    tenant_a, tenant_b = await _seed(database_urls["superuser"])
+    identity_a = await _seed_identity(database_urls["superuser"], subject="s-a")
+    identity_b = await _seed_identity(database_urls["superuser"], subject="s-b")
+    await _seed_membership(
+        database_urls["superuser"], tenant_id=tenant_a, identity_id=identity_a, role="admin"
+    )
+    await _seed_membership(
+        database_urls["superuser"], tenant_id=tenant_b, identity_id=identity_b, role="admin"
+    )
+
+    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=identity_a)
+    async with tenant_session(ctx_a) as session:
+        rows = (await session.execute(text("SELECT tenant_id FROM memberships"))).scalars().all()
+    assert rows == [tenant_a]
+
+    # Cross-tenant insert is rejected by the WITH CHECK clause.
+    with pytest.raises(DBAPIError):
+        async with tenant_session(ctx_a) as session:
+            await session.execute(
+                text(
+                    "INSERT INTO memberships (tenant_id, identity_id, role) "
+                    "VALUES (:tid, :iid, 'member')"
+                ),
+                {"tid": tenant_b, "iid": identity_b},
+            )
+
+    # Cross-tenant update (targeting the other tenant's row) is rejected: the USING clause
+    # hides the row from tenant A's session in the first place, so zero rows are affected.
+    async with tenant_session(ctx_a) as session:
+        result = await session.execute(
+            text("UPDATE memberships SET role = 'support' WHERE tenant_id = :tid"),
+            {"tid": tenant_b},
+        )
+        assert result.rowcount == 0
+
+
+async def test_membership_lookup_returns_role_or_none(app_settings, database_urls):
+    """Acceptance: the membership lookup returns the role for an existing tenant/identity pair
+    and returns nothing rather than raising when no row matches."""
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.repositories.memberships import MembershipRepository
+
+    tenant_a, _ = await _seed(database_urls["superuser"])
+    identity_a = await _seed_identity(database_urls["superuser"], subject="s-lookup")
+    await _seed_membership(
+        database_urls["superuser"], tenant_id=tenant_a, identity_id=identity_a, role="support"
+    )
+
+    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=identity_a)
+    async with tenant_session(ctx_a) as session:
+        found = await MembershipRepository().get_role(session, ctx_a, identity_id=identity_a)
+        missing = await MembershipRepository().get_role(session, ctx_a, identity_id=uuid.uuid4())
+    assert found == "support"
+    assert missing is None
+
+
+async def test_list_for_tenant_returns_every_role_unfiltered(app_settings, database_urls):
+    """Acceptance: listing a tenant's memberships returns every row including a support-role
+    one, with no role-based filtering."""
+    from app.context import RequestContext
+    from app.db.session import tenant_session
+    from app.repositories.memberships import MembershipRepository
+
+    tenant_a, _ = await _seed(database_urls["superuser"])
+    identities = {
+        role: await _seed_identity(database_urls["superuser"], subject=f"s-{role}")
+        for role in ("admin", "member", "support", "agent")
+    }
+    for role, identity_id in identities.items():
+        await _seed_membership(
+            database_urls["superuser"], tenant_id=tenant_a, identity_id=identity_id, role=role
+        )
+
+    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=identities["admin"])
+    async with tenant_session(ctx_a) as session:
+        records = await MembershipRepository().list_for_tenant(session, ctx_a)
+
+    assert {record.role for record in records} == {"admin", "member", "support", "agent"}
+    assert len(records) == 4

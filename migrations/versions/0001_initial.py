@@ -7,13 +7,21 @@ Create Date: 2026-08-17
 Roles: migrations run as the owner (DATABASE_URL_MIGRATIONS). The app connects as the `app`
 role (no superuser, NOBYPASSRLS — created in docker/postgres/01-init.sh). Superusers always
 bypass RLS; that is why the app must never run as one.
+
+`_TABLES_AT_THIS_REVISION` is a frozen snapshot of the tables this migration itself creates, not
+an import of `app.db.tenant_tables.TENANT_TABLES` (issue #23 / migration 0009 retired `users`
+from that registry and replaced it with `memberships`, a table this migration never creates):
+importing the live, present-day registry into a historical migration would make replaying this
+migration on a fresh database apply RLS to a table that does not exist yet at this point in the
+migration history. Every later migration that changes the set of registered tenant tables
+applies RLS to what it actually creates, the same way, rather than reaching back into this one.
 """
 
 from collections.abc import Sequence
 
 from alembic import op
 
-from app.db.tenant_tables import TENANT_TABLES
+_TABLES_AT_THIS_REVISION: tuple[str, ...] = ("users", "documents")
 
 revision: str = "0001"
 down_revision: str | None = None
@@ -86,7 +94,7 @@ def upgrade() -> None:
     # A vector index is only needed from a few tens of thousands of rows; then e.g.:
     # CREATE INDEX documents_embedding_idx ON documents USING hnsw (embedding vector_cosine_ops)
 
-    for table in TENANT_TABLES:
+    for table in _TABLES_AT_THIS_REVISION:
         _rls(table)
 
     # Grants for the app role (exists only if 01-init.sh has run — skip otherwise).
