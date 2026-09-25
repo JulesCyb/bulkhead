@@ -72,9 +72,13 @@ into one that shouldn't have it — fails that test instead of surfacing in an i
 
 Langfuse v3 needs ClickHouse, Redis/Valkey, and MinIO. Use the official compose file from
 https://github.com/langfuse/langfuse (do not rebuild it), start it on the same Docker network,
-inside the deployment's residency (see above), and set `LANGFUSE_HOST`
-(e.g. `http://langfuse-web:3000`), `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`. Then
-`uv sync --extra observability`.
+inside the deployment's residency (see above), and set `LANGFUSE_PUBLIC_KEY`,
+`LANGFUSE_SECRET_KEY` (ADR-0008: the trace sink host itself is resolved per tenant from
+`RESIDENCY_ALLOW_LIST`, not from `LANGFUSE_HOST` — see `app/observability.py`). The tracing
+dependency (`logfire`, plus the OpenTelemetry SDK/OTLP exporter) is a regular dependency, always
+installed — no extra `uv sync` step. Traces carry identifiers only; a tenant admin opts their own
+tenant into content capture via `tenants.settings["content_tracing_opt_in"]`
+(`app/tenant_settings.py`).
 
 ## LiteLLM (gateway)
 

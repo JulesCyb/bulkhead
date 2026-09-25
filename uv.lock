@@ -15,19 +15,17 @@ dependencies = [
     { name = "asyncpg" },
     { name = "fastapi" },
     { name = "httpx" },
+    { name = "logfire" },
     { name = "mcp" },
     { name = "openai" },
+    { name = "opentelemetry-exporter-otlp-proto-http" },
+    { name = "opentelemetry-sdk" },
     { name = "pgvector" },
     { name = "pydantic-ai-slim", extra = ["anthropic", "openai"] },
     { name = "pydantic-settings" },
     { name = "pyjwt", extra = ["crypto"] },
     { name = "sqlalchemy", extra = ["asyncio"] },
     { name = "uvicorn", extra = ["standard"] },
-]
-
-[package.optional-dependencies]
-observability = [
-    { name = "logfire" },
 ]
 
 [package.dev-dependencies]
@@ -46,9 +44,11 @@ requires-dist = [
     { name = "asyncpg", specifier = ">=0.29" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.27" },
-    { name = "logfire", marker = "extra == 'observability'", specifier = ">=3" },
+    { name = "logfire", specifier = ">=3" },
     { name = "mcp", specifier = ">=2.0" },
     { name = "openai", specifier = ">=1.50" },
+    { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.27" },
+    { name = "opentelemetry-sdk", specifier = ">=1.27" },
     { name = "pgvector", specifier = ">=0.3" },
     { name = "pydantic-ai-slim", extras = ["openai", "anthropic"], specifier = ">=2.0" },
     { name = "pydantic-settings", specifier = ">=2.4" },
@@ -56,7 +56,6 @@ requires-dist = [
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
 ]
-provides-extras = ["observability"]
 
 [package.metadata.requires-dev]
 dbtest = [{ name = "pgserver", specifier = ">=0.1" }]

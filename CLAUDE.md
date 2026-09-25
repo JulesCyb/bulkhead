@@ -16,14 +16,16 @@ ADR wins — then update this file.
 - Data: PostgreSQL 17 + pgvector, RLS on; the app connects as `app` (no superuser); a separate
   `app_owner` role (no superuser either) owns every object and runs migrations; operator-owned
   facts live in a `control` schema `app` can only read through views
-- Observability: Langfuse via OTel (`app/observability.py`, optionally `logfire`)
+- Observability: Langfuse via OTel (`app/observability.py`; `logfire`/OTel SDK are regular
+  dependencies, always installed — content-free by default, per-tenant opt-in, one trace sink
+  per residency, ADR-0008)
 - Frontend: none in this repo — Next.js + Vercel AI SDK against `POST /v1/t/{tenant_id}/api/chat`, see `docs/frontend.md`; a mobile app as another client, see `docs/mobile.md`
 - Operations: Docker Compose (`docker-compose.yml`), hosted in an EU region
 
 ## Commands
 
 ```bash
-uv sync                                   # environment (+ --extra observability, --group dbtest)
+uv sync                                   # environment (+ --group dbtest for the real RLS test)
 docker compose up -d --wait postgres      # database locally
 uv run python scripts/migrate.py          # migrations run once per database alias: every alias to head
 uv run python scripts/migrate.py <alias>  # migrations for just that one alias (owner role)

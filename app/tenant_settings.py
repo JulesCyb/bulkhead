@@ -77,6 +77,16 @@ class TenantSettings(BaseModel):
     # ADR-0008), so a tenant cannot move itself to another jurisdiction.
     model: str | None = None
 
+    # `tenants.settings["content_tracing_opt_in"]` (Spec 8 / #62, ADR-0008): whether this
+    # tenant's agent runs may include prompts, tool arguments, and document text in the spans
+    # sent to the trace sink. Off by default -- tracing always carries identifiers, timings, and
+    # errors, never content, until the tenant admin explicitly opts in. Deliberately a tenant
+    # preference (not an operator-owned control-plane fact like residency): ADR-0008's user
+    # stories describe it as something "a tenant admin" turns on for their own tenant, scoped to
+    # the whole tenant, not a per-run toggle -- see `app.observability`, which is the one place
+    # this value is turned into an actual `InstrumentationSettings.include_content`.
+    content_tracing_opt_in: bool = False
+
     @model_validator(mode="before")
     @classmethod
     def _reject_alias_isolation_and_dsn_shaped_input(cls, data: Any) -> Any:
