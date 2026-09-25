@@ -97,8 +97,9 @@ class Settings(BaseSettings):
     # The owner/migrations connection string is NOT a field here (issue #14 / ADR-0011): it is
     # removed from the application's configuration object entirely, so no code path in the
     # long-running API process can ever construct a connection with the database owner's
-    # privileges. Alembic's own environment module and scripts/seed.py resolve it from
-    # app.migration_settings instead — a source app.main and app.deps never import.
+    # privileges. Alembic's own environment module and the operator tool (app/operator/cli.py)
+    # resolve it from app.migration_settings instead — a source app.main and app.deps never
+    # import.
 
     # Explicit pool sizing (Spec 7 / #55) — named configuration instead of SQLAlchemy/driver
     # defaults, so the deployment's real concurrency ceiling (pool_size + max_overflow, per
