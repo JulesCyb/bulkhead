@@ -18,6 +18,7 @@ from pydantic_ai.result import StreamedRunResult
 from app.context import RequestContext
 from app.llm import get_model
 from app.repositories.documents import DocumentHit
+from app.run_limits import RunLimits, build_run_limits, run_deadline
 from app.tools import documents as document_tools
 
 SearchFn = Callable[[RequestContext, str, int], Awaitable[list[DocumentHit]]]
@@ -63,22 +64,33 @@ async def search_documents(
     return await ctx.deps.search(ctx.deps.ctx, query, limit)
 
 
-async def run_assistant(prompt: str, deps: AssistantDeps) -> str:
-    result = await assistant.run(
-        prompt,
-        deps=deps,
-        model=get_model(deps.model_name),
-        metadata=deps.ctx.trace_attributes(),
-    )
+async def run_assistant(prompt: str, deps: AssistantDeps, limits: RunLimits | None = None) -> str:
+    limits = limits or build_run_limits()
+    async with run_deadline(limits):
+        result = await assistant.run(
+            prompt,
+            deps=deps,
+            model=get_model(deps.model_name),
+            usage_limits=limits.usage_limits,
+            metadata=deps.ctx.trace_attributes(),
+        )
     return result.output
 
 
-def stream_assistant(prompt: str, deps: AssistantDeps):
-    """Async context manager yielding a StreamedRunResult; use it via `async with` in routes."""
+def stream_assistant(prompt: str, deps: AssistantDeps, limits: RunLimits | None = None):
+    """Async context manager yielding a StreamedRunResult; use it via `async with` in routes.
+
+    Does NOT itself enforce the run's wall-clock deadline: the deadline must bound the full
+    open-and-consume lifecycle (opening the stream, then reading every delta from it), which
+    means wrapping the caller's `async with ... as result: async for ...` block in
+    `run_limits.run_deadline(limits)` — see `app/api/agents.py`'s `/assistant/stream` route.
+    """
+    limits = limits or build_run_limits()
     return assistant.run_stream(
         prompt,
         deps=deps,
         model=get_model(deps.model_name),
+        usage_limits=limits.usage_limits,
         metadata=deps.ctx.trace_attributes(),
     )
 
