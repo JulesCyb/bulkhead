@@ -1,6 +1,6 @@
 # ADR-0006: Conversations live on the server, the client contributes only new messages
 
-- **Status:** proposed
+- **Status:** accepted
 - **Date:** 2026-09-12
 - **Deciders:** JulesCyb
 - **Skill version:** ai-app-blueprints v2.0.0 (research 2026-08)

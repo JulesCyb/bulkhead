@@ -31,6 +31,7 @@ from pydantic_ai.result import StreamedRunResult
 
 from app.context import RequestContext
 from app.llm import get_model
+from app.observability import instrumentation_capabilities, tenant_span_attributes
 from app.repositories.documents import DocumentHit
 from app.run_limits import RunLimits, build_run_limits, run_deadline
 from app.tools import conversations as conversation_tools
@@ -38,6 +39,7 @@ from app.tools import documents as document_tools
 
 SearchFn = Callable[[RequestContext, str, int], Awaitable[list[DocumentHit]]]
 LoadHistoryFn = Callable[[RequestContext, str], Awaitable[list[ModelMessage]]]
+SaveRunFn = Callable[[RequestContext, str, list[ModelMessage]], Awaitable[None]]
 
 
 @dataclass
@@ -49,13 +51,26 @@ class AssistantDeps:
     # server-held message history for it. None = the real ConversationsRepository, scoped to
     # the tenant and to the member who started the conversation.
     load_history: LoadHistoryFn | None = None
+    # Injectable the same way (ADR-0006, #34): given a conversation id and the messages a
+    # completed run produced, persist them. None = the real ConversationsRepository, in a
+    # session of its own, independent of the streamed response's own lifecycle.
+    save_run: SaveRunFn | None = None
     model_name: str | None = None  # e.g. from tenants.settings["model"]
+    # Tracing (Spec 8 / #62, ADR-0008): the caller resolves both from the database before
+    # building these deps (`app.observability.resolve_tenant_tracing_selection`) and passes them
+    # straight through — `None`/`False` here (the defaults) mean "trace this run, if at all, with
+    # no residency resolved and no content", which `instrumentation_capabilities()` below always
+    # treats as untraced, never as a fallback to some other tenant's sink.
+    residency: str | None = None
+    content_tracing_opt_in: bool = False
 
     def __post_init__(self) -> None:
         if self.search is None:
             self.search = document_tools.search_documents
         if self.load_history is None:
             self.load_history = conversation_tools.load_conversation_history
+        if self.save_run is None:
+            self.save_run = conversation_tools.save_conversation_run
 
 
 # Shared by both agents: every tool's result — a search hit today, a writing tool's outcome once
@@ -108,14 +123,19 @@ _register_reading_tools(chat_assistant)
 async def run_assistant(prompt: str, deps: AssistantDeps, limits: RunLimits | None = None) -> str:
     """Runs the one-shot (reading-only) agent — backs `/v1/t/{tenant_id}/agents/assistant/run`."""
     limits = limits or build_run_limits()
+    capabilities = instrumentation_capabilities(deps.residency, deps.content_tracing_opt_in)
     async with run_deadline(limits):
-        result = await one_shot_assistant.run(
-            prompt,
-            deps=deps,
-            model=get_model(deps.model_name),
-            usage_limits=limits.usage_limits,
-            metadata=deps.ctx.trace_attributes(),
-        )
+        # The whole run happens inside this one awaited call, so wrapping it here (rather than at
+        # the route) is enough for every span it produces to carry tenant/user attributes.
+        with tenant_span_attributes(deps.ctx.trace_attributes()):
+            result = await one_shot_assistant.run(
+                prompt,
+                deps=deps,
+                model=get_model(deps.model_name),
+                usage_limits=limits.usage_limits,
+                metadata=deps.ctx.trace_attributes(),
+                capabilities=capabilities,
+            )
     return result.output
 
 
@@ -124,18 +144,22 @@ def stream_assistant(prompt: str, deps: AssistantDeps, limits: RunLimits | None 
 
     Backs `/v1/t/{tenant_id}/agents/assistant/stream` — runs the one-shot (reading-only) agent.
 
-    Does NOT itself enforce the run's wall-clock deadline: the deadline must bound the full
-    open-and-consume lifecycle (opening the stream, then reading every delta from it), which
-    means wrapping the caller's `async with ... as result: async for ...` block in
-    `run_limits.run_deadline(limits)` — see `app/api/agents.py`'s `/assistant/stream` route.
+    Does NOT itself enforce the run's wall-clock deadline, and does NOT itself wrap
+    `tenant_span_attributes` (Spec 8 / #62): both must bound the full open-and-consume lifecycle
+    (opening the stream, then reading every delta from it), not just the call that starts it —
+    the caller's `async with ... as result: async for ...` block is what needs wrapping, in
+    `run_limits.run_deadline(limits)` and `app.observability.tenant_span_attributes(...)`. See
+    `app/api/agents.py`'s `/assistant/stream` route.
     """
     limits = limits or build_run_limits()
+    capabilities = instrumentation_capabilities(deps.residency, deps.content_tracing_opt_in)
     return one_shot_assistant.run_stream(
         prompt,
         deps=deps,
         model=get_model(deps.model_name),
         usage_limits=limits.usage_limits,
         metadata=deps.ctx.trace_attributes(),
+        capabilities=capabilities,
     )
 
 
