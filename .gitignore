@@ -2,6 +2,10 @@
 __pycache__/
 *.pyc
 .env
+# Any locally created env-var-file variant (.env.local, .env.production, ...) is ignored by
+# default too (#18) — only the tracked example template is exempted.
+.env.*
+!.env.example
 .pytest_cache/
 .ruff_cache/
 dist/

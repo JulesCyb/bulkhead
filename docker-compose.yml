@@ -1,6 +1,14 @@
 services:
   postgres:
-    image: pgvector/pgvector:pg17
+    image: pgvector/pgvector:0.8.6-pg17  # pinned release, not the floating pg17 tag (#18)
+    networks:
+      # `db`: the application's own path to postgres (api, migrate). `gatewaydb`: a separate,
+      # disjoint network carrying only the gateway's own database traffic (#18) — the gateway
+      # never joins `db`, so it has no route to the application's connections to postgres, even
+      # though postgres itself bridges both (its own database and the gateway's live on the same
+      # cluster instance; see docker/postgres/01-init.sh and ADR-0009).
+      - db
+      - gatewaydb
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
@@ -32,21 +40,62 @@ services:
 
   # One-shot: runs migrations with the owner role, then exits. Keeps the owner role's DSN
   # out of the long-running api container.
+  #
+  # No `env_file: .env` (#18): that used to hand this one-shot job every variable in .env,
+  # including secrets it has no business reading (LITELLM_MASTER_KEY, the app/gateway role
+  # passwords, provider API keys). It gets only its own owner DSN plus the trace-sink/residency
+  # wiring it shares with `api` (ADR-0008, tests/test_residency_trace_sink_compose.py).
   migrate:
     build: .
-    env_file: .env
+    networks: [db]
     environment:
       DATABASE_URL_MIGRATIONS: postgresql+asyncpg://app_owner:${APP_OWNER_DB_PASSWORD:-app_owner}@postgres:5432/app
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-}
+      RESIDENCY: ${RESIDENCY:-eu}
     depends_on:
       postgres:
         condition: service_healthy
     command: uv run --no-sync alembic upgrade head
 
+  # No `env_file: .env` (#18): the api container used to receive the whole file, including the
+  # database owner's DSN/password, the gateway's own DB password, and the gateway's master key —
+  # none of which its own job needs. Every variable app.config.Settings can read is named
+  # explicitly below instead.
   api:
     build: .
-    env_file: .env
+    # `db` to reach postgres; `gateway` only to call the gateway's HTTP API
+    # (LITELLM_BASE_URL=http://litellm:4000) — never `gatewaydb`, the network carrying the
+    # gateway's own database traffic (#18).
+    networks: [db, gateway]
     environment:
+      APP_NAME: ${APP_NAME:-ai-app}
+      ENVIRONMENT: ${ENVIRONMENT}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
       DATABASE_URL: postgresql+asyncpg://app:${APP_DB_PASSWORD:-app}@postgres:5432/app
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
+      DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-30}
+      DB_POOL_RECYCLE: ${DB_POOL_RECYCLE:-1800}
+      DB_STATEMENT_TIMEOUT_MS: ${DB_STATEMENT_TIMEOUT_MS:-30000}
+      LLM_MODEL: ${LLM_MODEL:-anthropic:claude-sonnet-4-5}
+      LITELLM_BASE_URL: ${LITELLM_BASE_URL:-}
+      # The per-tenant virtual key minted against the gateway's master key — never the master
+      # key itself, which stays out of this container entirely (see the litellm service below).
+      LITELLM_API_KEY: ${LITELLM_API_KEY:-}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
+      EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1536}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      RESIDENCY: ${RESIDENCY:-eu}
+      AUTH_MODE: ${AUTH_MODE}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      MCP_TENANT_ID: ${MCP_TENANT_ID:-}
+      MCP_IDENTITY_ID: ${MCP_IDENTITY_ID:-}
+      REQUEST_LIMIT_MAX: ${REQUEST_LIMIT_MAX:-30}
+      REQUEST_LIMIT_WINDOW_SECONDS: ${REQUEST_LIMIT_WINDOW_SECONDS:-60}
     depends_on:
       postgres:
         condition: service_healthy
@@ -61,8 +110,15 @@ services:
   # variables it actually needs: no APP_DB_PASSWORD/APP_OWNER_DB_PASSWORD, no LANGFUSE_* secret.
   # An unset LITELLM_MASTER_KEY fails the render (`${...:?...}`) instead of shipping a gateway
   # nobody can mint a tenant key against.
+  #
+  # `gatewaydb` (its own database on postgres) and `gateway` (so `api` can call its HTTP API) —
+  # never `db`, the network `api`/`migrate` use for the application's own connections to
+  # postgres. A compromised gateway credential therefore has no network route to the
+  # application's database traffic, and `migrate` (which never calls the gateway) has no route
+  # to the gateway at all. See docker-compose.yml `networks:` and ADR-0009.
   litellm:
     image: ghcr.io/berriai/litellm:v1.80.11-stable.1  # pinned release, not a floating tag
+    networks: [gatewaydb, gateway]
     environment:
       DATABASE_URL: postgresql://gateway:${GATEWAY_DB_PASSWORD:-gateway}@postgres:5432/gateway
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY must be set — mint per-tenant virtual keys against it (docs/deployment.md)}
@@ -80,6 +136,18 @@ services:
 
   # Langfuse (v3) needs ClickHouse, Redis, and MinIO: include the official docker-compose.yml from
   # https://github.com/langfuse/langfuse (docs/deployment.md) instead of rebuilding it here.
+
+networks:
+  # The application's own path to postgres (api, migrate). The gateway is never a member (#18):
+  # it has no route to the application's own database traffic.
+  db:
+  # The gateway's own, disjoint path to its own database on the same postgres instance (#18) —
+  # see the comments on the postgres and litellm services above. Neither `api` nor `migrate` is
+  # a member: this network exists solely for litellm <-> postgres.
+  gatewaydb:
+  # `api` calling the gateway's OpenAI-compatible HTTP API (LITELLM_BASE_URL). Postgres is never
+  # a member — this is application/gateway traffic only, not database traffic.
+  gateway:
 
 volumes:
   pgdata:
