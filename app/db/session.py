@@ -3,6 +3,12 @@
 tenant_session() opens a transaction and sets app.tenant_id / app.user_id via set_config
 (is_local=true, valid for this transaction only). The RLS policies in migrations/ filter on it.
 Without a set context, current_setting(..., true) returns NULL -> the policies block everything.
+
+Defense in depth: the pool also wipes all session-local Postgres settings from a connection
+when it is checked back in (see `_reset_session_state` below). is_local=true settings already
+disappear at transaction end on their own, but a future bug that sets context at session scope
+(set_config(..., false) or plain SET, then commits) would otherwise survive in the pool and
+leak into whichever request happens to reuse that physical connection next.
 """
 
 from __future__ import annotations
@@ -10,13 +16,14 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.pool import ConnectionPoolEntry
 
 from app.config import get_settings
 from app.context import RequestContext
@@ -25,11 +32,22 @@ _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 
 
+def _reset_session_state(dbapi_connection: object, connection_record: ConnectionPoolEntry) -> None:
+    """Pool `checkin` hook: clear any session-local settings before the connection goes
+    back into the pool, so no tenant context can ever ride along to the next checkout."""
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("RESET ALL")
+    finally:
+        cursor.close()
+
+
 def get_engine() -> AsyncEngine:
     global _engine, _session_factory
     if _engine is None:
         _engine = create_async_engine(get_settings().database_url, pool_pre_ping=True)
         _session_factory = async_sessionmaker(_engine, expire_on_commit=False)
+        event.listen(_engine.sync_engine, "checkin", _reset_session_state)
     return _engine
 
 
