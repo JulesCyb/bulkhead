@@ -211,3 +211,30 @@ class Message(Base):
         server_default=text("current_setting('app.identity_id', true)::uuid"),
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class PendingAction(Base):
+    """A writing-tool call awaiting or having received an approval (ADR-0007, Spec 5 / #37):
+    tenant, conversation, tool, a hash of the exact arguments, the asking membership, and an
+    expiry -- written down *before* the approval is ever shown to the member, so verification
+    always has a trustworthy record to check against, never the client's own message.
+
+    `asking_membership_id`/`resolved_by` reference `memberships`, not `control.identities`: a
+    pending action is a tenant-scoped fact about a *membership*'s role, unlike the
+    `created_by`/`updated_by` audit columns elsewhere in this schema, which name a global
+    identity (migration 0010's docstring)."""
+
+    __tablename__ = "pending_actions"
+    __table_args__ = (Index("pending_actions_tenant_idx", "tenant_id"),)
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[UUID] = mapped_column(ForeignKey("tenants.id"))
+    conversation_id: Mapped[str] = mapped_column(String(200))
+    tool_name: Mapped[str] = mapped_column(String(200))
+    args_hash: Mapped[str] = mapped_column(String(64))
+    asking_membership_id: Mapped[UUID] = mapped_column(ForeignKey("memberships.id"))
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_by: Mapped[UUID | None] = mapped_column(ForeignKey("memberships.id"), nullable=True)
