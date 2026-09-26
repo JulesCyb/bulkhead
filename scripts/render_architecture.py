@@ -219,51 +219,20 @@ def build(p: dict[str, str]) -> str:
         spacing=1.6,
     )
 
-    # Wall 2 — approval
-    c.raw(
-        f'<rect x="160" y="404" width="330" height="122" rx="14" fill="{p["card"]}" '
-        f'stroke="{p["card_s"]}" stroke-width="1.2"/>'
-    )
-    c.text(325, 438, "Your AI agents", 18, p["text"], 700)
-    c.text(325, 462, "read, answer, propose changes", 15, p["text2"])
-    c.text(325, 484, "never hold a database password", 15, p["text2"])
-    c.text(325, 512, "PydanticAI · tools only · run limits", 11.5, p["muted"], mono=True)
-    c.line(490, 465, 552, 465, arrow=True)
-    c.slab(560, 400, 12, 130, "2")
-    c.text(604, 434, "Wall 2 — a human says yes", 20, p["text"], 700, "start")
-    c.text(
-        604,
-        462,
-        "Before an agent changes anything, a person approves that exact change.",
-        15.5,
-        p["text2"],
-        anchor="start",
-    )
-    c.text(604, 486, "There is no “always allow”.", 15.5, p["text2"], anchor="start")
-    c.text(
-        604,
-        514,
-        "pending action stored server-side  ·  standing grants for unattended agents  ·  audited",
-        11.5,
-        p["muted"],
-        anchor="start",
-        mono=True,
-    )
-
-    # Wall 1 — sealed compartments
-    c.text(200, 582, "Wall 1 — sealed compartments", 20, p["text"], 700, "start")
+    # Wall 1 — sealed compartments (the tenant context is set before any query runs)
+    c.text(200, 424, "Wall 1 — sealed compartments", 20, p["text"], 700, "start")
     for x, label in ((200, "Customer A"), (544, "Customer B"), (888, "Customer C")):
         c.raw(
-            f'<rect x="{x}" y="612" width="300" height="104" rx="14" fill="{p["teal_bg"]}" '
+            f'<rect x="{x}" y="454" width="300" height="104" rx="14" fill="{p["teal_bg"]}" '
             f'stroke="{p["teal_s"]}" stroke-width="1.2"/>'
         )
-        c.text(x + 150, 656, label, 18, p["teal"], 700)
-        c.text(x + 150, 684, "only their data", 15, p["text2"])
-    c.slab(516, 596, 12, 138, "1")
-    c.slab(860, 596, 12, 138)
+        c.text(x + 150, 498, label, 18, p["teal"], 700)
+        c.text(x + 150, 526, "only their data", 15, p["text2"])
+    c.slab(516, 438, 12, 138, "1")
+    c.slab(860, 438, 12, 138)
     c.text(
         200,
-        766,
+        608,
         "Each customer's data sits in its own compartment. The database enforces the wall — "
         "not the developer, not the agent, not a code review.",
         15.5,
@@ -272,9 +241,40 @@ def build(p: dict[str, str]) -> str:
     )
     c.text(
         200,
-        794,
+        636,
         "Postgres 17  ·  Row-Level Security forced on every table  ·  "
         "the app's DB role has no superuser and cannot bypass RLS",
+        11.5,
+        p["muted"],
+        anchor="start",
+        mono=True,
+    )
+
+    # Wall 2 — approval (the agents work inside a compartment; a write still needs a person)
+    c.raw(
+        f'<rect x="160" y="670" width="330" height="122" rx="14" fill="{p["card"]}" '
+        f'stroke="{p["card_s"]}" stroke-width="1.2"/>'
+    )
+    c.text(325, 704, "Your AI agents", 18, p["text"], 700)
+    c.text(325, 728, "read, answer, propose changes", 15, p["text2"])
+    c.text(325, 750, "never hold a database password", 15, p["text2"])
+    c.text(325, 778, "PydanticAI · tools only · run limits", 11.5, p["muted"], mono=True)
+    c.line(490, 731, 552, 731, arrow=True)
+    c.slab(560, 666, 12, 130, "2")
+    c.text(604, 700, "Wall 2 — a human says yes", 20, p["text"], 700, "start")
+    c.text(
+        604,
+        728,
+        "Before an agent changes anything, a person approves that exact change.",
+        15.5,
+        p["text2"],
+        anchor="start",
+    )
+    c.text(604, 752, "There is no “always allow”.", 15.5, p["text2"], anchor="start")
+    c.text(
+        604,
+        780,
+        "pending action stored server-side  ·  standing grants for unattended agents  ·  audited",
         11.5,
         p["muted"],
         anchor="start",
