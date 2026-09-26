@@ -110,6 +110,29 @@ def test_adr_0011_is_accepted_not_proposed() -> None:
     assert "proposed" not in status_line
 
 
+def test_claude_md_rule_3_and_adr_0011_name_the_control_repository_as_the_one_path() -> None:
+    """Spec A5's closing ticket (#115, acceptance criterion 3): `app/repositories/control.py`'s
+    `ControlRepository` is named, in both `CLAUDE.md` rule 3 and ADR-0011, as the one path for
+    every SQL statement against the `control` schema -- not only stated once and left to drift --
+    and rule 3 also names `run_operator` as the operator tool's own public, test-drivable entry
+    point (`main` is only its synchronous script wrapper)."""
+    rule_3 = next(
+        line
+        for line in CLAUDE_MD.splitlines()
+        if line.strip().startswith("3. **DB access only through repositories**")
+    )
+    section_start = CLAUDE_MD.index(rule_3)
+    section_end = CLAUDE_MD.index("\n4. ", section_start)
+    section = " ".join(CLAUDE_MD[section_start:section_end].split())
+
+    assert "ControlRepository" in section
+    assert "one path" in section
+    assert "app.operator.cli.run_operator" in section
+
+    assert "ControlRepository" in ADR_0011
+    assert "one path" in ADR_0011
+
+
 # Spec 10's closing ticket (#79): ADR-0002 moves from proposed to accepted now that the seam it
 # describes (engine-per-tenant resolution, per-alias migrations, the runtime alias guard) is the
 # one actually built, and the contributor guide / onboarding docs describe that behaviour instead

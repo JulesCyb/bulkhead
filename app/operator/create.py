@@ -112,6 +112,46 @@ class CreateTenantResult:
     database_alias: str | None  # only set for isolation_tier == "dedicated"
     dedicated_database: str | None = None  # "provisioned" | "already provisioned" | None (pooled)
 
+    def render(self) -> str:
+        """Byte-identical to what `app.operator.cli`'s retired `_run_create` printed (spec A5 /
+        #115): the MCP env vars, the credential alias (and, for a dedicated tenant, its database
+        alias), the one-line summary, a blank line, and the worked curl command."""
+        lines = [
+            f"MCP_TENANT_ID={self.tenant_id}",
+            f"MCP_IDENTITY_ID={self.identity_id}",
+            f"Gateway credential alias: {self.gateway_credential_alias}",
+        ]
+        if self.isolation_tier == "dedicated":
+            lines.append(f"Database alias: {self.database_alias}")
+        lines.append(
+            f"control-plane record: {self.control_plane}; "
+            f"gateway credential: {self.gateway_credential}; "
+            f"admin membership: {self.admin_membership}"
+            + (
+                f"; dedicated database: {self.dedicated_database}"
+                if self.isolation_tier == "dedicated"
+                else ""
+            )
+        )
+        lines.append("")
+        lines.append(
+            f"curl -H 'X-Identity-Id: {self.identity_id}' "
+            f"http://localhost:8000/v1/t/{self.tenant_id}/agents/assistant/run ..."
+        )
+        return "\n".join(lines)
+
+    @property
+    def audit_outcome(self) -> str:
+        """The one line `app.operator.cli` writes to the operator-action log for this command --
+        never printed to stdout (see `render()`), only the audit trail's own summary."""
+        return (
+            f"ok: tenant {self.tenant_id} "
+            f"(control-plane: {self.control_plane}, "
+            f"isolation tier: {self.isolation_tier}, "
+            f"gateway: {self.gateway_credential}, "
+            f"membership: {self.admin_membership})"
+        )
+
 
 def _validate_residency(residency: str, settings: Settings) -> None:
     """Rejects an unrecognized residency before any write, via `route_for` (spec A4 / #111) --

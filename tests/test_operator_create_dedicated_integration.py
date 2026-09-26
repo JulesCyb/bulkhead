@@ -258,23 +258,20 @@ async def test_pooled_tenant_never_gets_a_database_alias(environment, tmp_path):
 
 
 async def test_create_dedicated_is_recorded_in_the_operator_action_log(
-    environment, dedicated_target, tmp_path, monkeypatch
+    environment, dedicated_target, tmp_path, monkeypatch, capsys
 ):
     """Acceptance (#71): the create invocation for a dedicated tenant is recorded in the
-    operator-action log the same way a pooled create is, with the admin URL redacted."""
-    import app.operator.create as create_module
+    operator-action log the same way a pooled create is, with the admin URL redacted. The gateway
+    admin client is injected straight into `run_operator()` (spec A5 / #115), not monkeypatched
+    onto `app.operator.create.build_admin_client`."""
     from app import config
-    from app.operator.cli import _run, build_parser
+    from app.operator.cli import run_operator
 
     monkeypatch.setenv("GATEWAY_CREDENTIALS_DIR", str(tmp_path))
     config.get_settings.cache_clear()
-    monkeypatch.setattr(
-        create_module,
-        "build_admin_client",
-        lambda settings: fake_gateway_admin_client(key="sk-cli-dedicated"),
-    )
 
-    args = build_parser().parse_args(
+    engine = create_async_engine(environment.owner_url)
+    exit_code = await run_operator(
         [
             "create",
             "CLI Dedicated Co",
@@ -286,9 +283,11 @@ async def test_create_dedicated_is_recorded_in_the_operator_action_log(
             "dedicated",
             "--dedicated-db-admin-url",
             dedicated_target["admin_url"],
-        ]
+        ],
+        engine=engine,
+        admin_client=fake_gateway_admin_client(key="sk-cli-dedicated"),
     )
-    exit_code = await _run(args.command, args)
+    await engine.dispose()
     config.get_settings.cache_clear()
     assert exit_code == 0
 
@@ -307,10 +306,61 @@ async def test_create_dedicated_is_recorded_in_the_operator_action_log(
         await rows_engine.dispose()
 
     assert len(rows) >= 1
-    _, action, details = rows[-1]
+    tenant_id, action, details = rows[-1]
     if isinstance(details, str):
         details = json.loads(details)
     assert action == "create"
     assert details["outcome"].startswith("ok: tenant ")
     assert details["args"]["isolation_tier"] == "dedicated"
     assert details["args"]["dedicated_db_admin_url"] == "<redacted>"
+
+    # A dedicated tenant's control-plane record lives in the pooled database, but its own
+    # membership lives only in its own database (never the pooled one) -- see
+    # `app.operator.create`'s module docstring -- so this needs two connections, not one.
+    verify_engine = create_async_engine(environment.superuser_url)
+    try:
+        async with verify_engine.connect() as conn:
+            control_row = (
+                await conn.execute(
+                    text(
+                        "SELECT database_alias, gateway_credential_alias FROM control.tenants "
+                        "WHERE tenant_id = :tid"
+                    ),
+                    {"tid": tenant_id},
+                )
+            ).one()
+    finally:
+        await verify_engine.dispose()
+
+    dedicated_url = _owner_dsn(control_row.database_alias, dedicated_target["sockdir"])
+    dedicated_engine = create_async_engine(dedicated_url)
+    try:
+        async with dedicated_engine.begin() as conn:
+            await conn.execute(
+                text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": str(tenant_id)}
+            )
+            identity_id = (
+                await conn.execute(
+                    text("SELECT identity_id FROM memberships WHERE tenant_id = :tid"),
+                    {"tid": tenant_id},
+                )
+            ).scalar_one()
+    finally:
+        await dedicated_engine.dispose()
+
+    # Golden output (spec A5 / #115, acceptance criterion 2): byte-identical to what the retired
+    # `_run_create` printed for a dedicated tenant, reconstructed from independently-queried
+    # database state (not from the result object under test). Provisioning a fresh dedicated
+    # database prints its own role-bootstrap/migration lines first (unrelated to this command's
+    # own formatter) -- this checks the create command's own block, at the end of stdout.
+    assert capsys.readouterr().out.endswith(
+        f"MCP_TENANT_ID={tenant_id}\n"
+        f"MCP_IDENTITY_ID={identity_id}\n"
+        f"Gateway credential alias: {control_row.gateway_credential_alias}\n"
+        f"Database alias: {control_row.database_alias}\n"
+        "control-plane record: created; gateway credential: provisioned; "
+        "admin membership: created; dedicated database: provisioned\n"
+        "\n"
+        f"curl -H 'X-Identity-Id: {identity_id}' "
+        f"http://localhost:8000/v1/t/{tenant_id}/agents/assistant/run ...\n"
+    )
