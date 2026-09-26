@@ -26,8 +26,8 @@ Content-free by default, per-tenant opt-in, per-residency sink:
   all starts fine and simply never traces (`instrumentation_capabilities()` then always
   returns `[]`).
 
-Per-run wiring lives at the call sites that actually run an agent (`app/agents/assistant.py`,
-`app/api/agents.py`, `app/api/chat.py`): each takes the calling tenant's residency and content
+Per-run wiring lives in the one module that actually runs an agent (`app/agents/run.py`, behind
+every agent route): it takes the calling tenant's residency and content
 opt-in from the tenant record the request's context already carries (`resolve_tenant_tracing`,
 below -- no database read of its own, #105; the model is resolved from the very same record, so
 tracing and the model can never disagree about the tenant's residency), builds this run's

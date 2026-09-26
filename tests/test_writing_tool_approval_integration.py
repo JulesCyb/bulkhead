@@ -11,11 +11,10 @@ tool ADR-0007 and this ticket ask for; `require_approval`/`resolve_incoming_deci
 together across two real HTTP requests against a real database, in the exact order a client would
 see it.
 
-The model is swapped in the same way `tests/test_chat.py` already does --
-`monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(...))` -- rather than
-`chat_assistant.override(...)`: the chat endpoint always resolves an explicit model
-(`app.agents.assistant.resolve_chat_model`, per-tenant/residency routed, Spec 8 / #61) and passes
-it into `adapter.run_stream(...)`, which shadows an agent-level `.override(model=...)` entirely.
+The model is installed through the run module's own test hook (`tests/conftest.py`'s `use_model`
+fixture, over `route_run` / `app.agents.run.set_run_collaborators_for_tests`), with the real
+search, history, and persistence kept -- these tests need the conversation the first request
+persisted to be the history the resumed one loads. Nothing is patched onto a module.
 
 `_rename_model`, `_propose_body`, `_resume_body`, `_headers`, and `_chat_path` are reused directly
 by `tests/test_context_resolution_integration.py` rather than duplicated -- see that file's own
@@ -38,9 +37,7 @@ from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from app.api import chat as chat_module
 from app.main import app
-from tests.conftest import resolve_to_model
 
 pgserver = pytest.importorskip("pgserver")
 
@@ -310,7 +307,7 @@ def client() -> httpx.AsyncClient:
 
 
 async def test_pending_action_exists_before_the_deferred_approval_reaches_the_client(
-    environment, client, monkeypatch
+    environment, client, use_model
 ):
     """AC1: the pending action behind a deferred approval is already committed to storage before
     the response naming it reaches the client -- proven by streaming the response and checking
@@ -332,7 +329,7 @@ async def test_pending_action_exists_before_the_deferred_approval_reaches_the_cl
     )
 
     model = _rename_model(document_id=document_id, title=NEW_TITLE)
-    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(model))
+    use_model(model)
 
     async with client:
         seen_chunk = False
@@ -359,7 +356,7 @@ async def test_pending_action_exists_before_the_deferred_approval_reaches_the_cl
 
 
 async def test_approving_executes_exactly_once_and_response_reflects_the_change(
-    environment, client, monkeypatch
+    environment, client, use_model
 ):
     """AC2 (approve half): resuming with an approval executes the tool exactly once, and the
     document's title is actually changed through the repository layer."""
@@ -376,7 +373,7 @@ async def test_approving_executes_exactly_once_and_response_reflects_the_change(
     )
 
     model = _rename_model(document_id=document_id, title=NEW_TITLE)
-    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(model))
+    use_model(model)
 
     async with client:
         await _propose(client, tenant.tenant_id, identity_id)
@@ -398,7 +395,7 @@ async def test_approving_executes_exactly_once_and_response_reflects_the_change(
 
 
 async def test_refusing_never_executes_and_the_conversation_continues(
-    environment, client, monkeypatch
+    environment, client, use_model
 ):
     """AC2 (refuse half): resuming with a refusal leaves the tool never executed, and the
     conversation still produces a normal reply."""
@@ -415,7 +412,7 @@ async def test_refusing_never_executes_and_the_conversation_continues(
     )
 
     model = _rename_model(document_id=document_id, title=NEW_TITLE)
-    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(model))
+    use_model(model)
 
     async with client:
         await _propose(client, tenant.tenant_id, identity_id)
@@ -440,7 +437,7 @@ async def test_refusing_never_executes_and_the_conversation_continues(
 
 
 async def test_tampered_arguments_on_approval_are_refused_nothing_executed(
-    environment, client, monkeypatch
+    environment, client, use_model
 ):
     """AC3: an approval whose arguments differ from what was originally proposed is refused, with
     nothing executed. A real client cannot change a deferred call's own arguments through the
@@ -460,7 +457,7 @@ async def test_tampered_arguments_on_approval_are_refused_nothing_executed(
     )
 
     model = _rename_model(document_id=document_id, title=NEW_TITLE)
-    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(model))
+    use_model(model)
 
     async with client:
         await _propose(client, tenant.tenant_id, identity_id)
@@ -490,7 +487,7 @@ async def test_tampered_arguments_on_approval_are_refused_nothing_executed(
 
 
 async def test_role_downgraded_between_request_and_resume_is_refused(
-    environment, client, monkeypatch
+    environment, client, use_model
 ):
     """AC4: a membership whose role is downgraded between the initial request and the resumed
     approval causes the tool's own execution-time check to refuse -- distinct from, and in
@@ -510,7 +507,7 @@ async def test_role_downgraded_between_request_and_resume_is_refused(
     )
 
     model = _rename_model(document_id=document_id, title=NEW_TITLE)
-    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(model))
+    use_model(model)
 
     async with client:
         await _propose(client, tenant.tenant_id, identity_id)
@@ -536,7 +533,7 @@ async def test_role_downgraded_between_request_and_resume_is_refused(
     assert kinds == ["requested", "approved", "failed_to_execute"]
 
 
-async def test_expired_approval_is_refused_and_marked_expired(environment, client, monkeypatch):
+async def test_expired_approval_is_refused_and_marked_expired(environment, client, use_model):
     """AC5: an approval answered after the configured expiry window is refused, and the resulting
     audit record marks it `expired` -- exercised against the real wall clock (the pending action's
     `expires_at` is moved into the past directly, the same fail-closed check
@@ -554,7 +551,7 @@ async def test_expired_approval_is_refused_and_marked_expired(environment, clien
     )
 
     model = _rename_model(document_id=document_id, title=NEW_TITLE)
-    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(model))
+    use_model(model)
 
     async with client:
         await _propose(client, tenant.tenant_id, identity_id)
@@ -581,7 +578,7 @@ async def test_expired_approval_is_refused_and_marked_expired(environment, clien
 
 
 async def test_writing_tool_goes_through_the_shared_repository_layer(
-    environment, client, monkeypatch
+    environment, client, use_model
 ):
     """AC7: the example writing tool's data access is the same repository layer a reading tool
     uses -- proven the same way `search_documents` is: the change is visible directly at the
@@ -602,7 +599,7 @@ async def test_writing_tool_goes_through_the_shared_repository_layer(
     )
 
     model = _rename_model(document_id=document_id, title=NEW_TITLE)
-    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(model))
+    use_model(model)
 
     async with client:
         await _propose(client, tenant.tenant_id, identity_id)

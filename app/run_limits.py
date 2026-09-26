@@ -9,16 +9,17 @@ enforced outside the application, at the gateway (see the gateway-credential tic
 once per run and pass its `usage_limits` to the run, and wrap the call that starts the run — or
 the loop that consumes its stream — in `run_deadline()`. Every entry point that starts a run does
 both:
-- `app/agents/run.py` (`prepare_run` builds the limit once; `PreparedRun.answer`/`stream_text`
-  wrap it) — the one-shot and streaming agent endpoints; the deadline bounds the full
-  open-and-consume lifecycle, not just the call that opens the stream, and no route wraps it.
-- `app/api/chat.py` — the Vercel AI SDK chat adapter (moving onto `app/agents/run.py` with #108).
+- `app/agents/run.py` (`prepare_run` builds the limit once; `PreparedRun.answer`/`stream_text`/
+  `chat` wrap it) — the one-shot, streaming, and Vercel AI SDK chat endpoints alike; the deadline
+  bounds the full open-and-consume lifecycle, not just the call that opens the stream, and no
+  route wraps it.
 
 Exceeding the request/tool-call/token ceiling raises `pydantic_ai.exceptions.UsageLimitExceeded`;
 exceeding the wall-clock deadline raises `RunDeadlineExceeded` from this module. Both are plain
 exceptions raised *during* the run, so the streaming entry points' own exception handling (ours in
-`app/api/agents.py` and `app/api/chat.py`, PydanticAI's in the Vercel adapter for the ceiling case)
-turns them into one clean, terminal error instead of a raw exception or a silent stop.
+`app/api/agents.py` and `app/agents/run.py`'s chat stream, PydanticAI's in the Vercel adapter for
+the ceiling case) turns them into one clean, terminal error instead of a raw exception or a
+silent stop.
 """
 
 from __future__ import annotations

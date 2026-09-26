@@ -2,8 +2,9 @@
 (`app.agents.run`) every entry point maps to a documented, client-visible error, and how each
 transport renders it -- an HTTP status with a JSON `detail`, or a terminal SSE `event: error`.
 
-`app/api/agents.py` uses both renderings today; `app/api/chat.py` shares `ROUTING_ERRORS` and
-`routing_error_detail` and moves onto the rest with #108. A failure not in the table (a
+`app/api/agents.py` uses both renderings; `app/api/chat.py` uses the HTTP one for a failure before
+its stream starts (once streaming, the chat run ends with a Vercel AI SDK `error` chunk of its
+own, `app.agents.run`). A failure not in the table (a
 `NotFoundInTenant`, a `RoleRequired`, anything unexpected) is not mapped here: it propagates to
 the handlers `app.main` registers, exactly as before.
 
@@ -45,10 +46,6 @@ MAPPED_RUN_ERRORS: tuple[type[BaseException], ...] = (
     RunDeadlineExceeded,
     *ROUTING_ERRORS,
 )
-
-
-def routing_error_detail(exc: Exception) -> dict[str, str]:
-    return {"error": "content_routing_unavailable", "message": str(exc)}
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,7 +111,6 @@ __all__ = [
     "ROUTING_ERRORS",
     "RunError",
     "map_run_error",
-    "routing_error_detail",
     "run_error_http_exception",
     "run_error_sse_event",
     "sse",

@@ -19,12 +19,12 @@ This module holds the two agents, their instructions, and their tool registratio
 *runs* them. A run is prepared and executed by `app/agents/run.py` (spec A3 / #107): it resolves
 the model from the tenant record (no model is hard-wired here), builds the run limit, the tracing
 capabilities and span attributes, and the `AssistantDeps` below, and its execution method decides
-which of the two agents runs (`answer`/`stream_text` bind `one_shot_assistant`). Tests inject a
-TestModel/FunctionModel through that module -- no real model call.
+which of the two agents runs (`answer`/`stream_text` bind `one_shot_assistant`, only `chat` binds
+`chat_assistant`, #108). Tests inject a TestModel/FunctionModel through that module -- no real
+model call.
 
 - `AssistantDeps` is internal to a run: what the tools read from `ctx.deps`, constructed by
-  `app.agents.run.prepare_run` and never by a route (`app/api/chat.py` still builds its own until
-  #108 moves the chat route onto the run module).
+  `app.agents.run.prepare_run` and never by a route.
 - Tools are thin wrappers around app/tools/* that take the context from ctx.deps.
 - LangGraph only once a flow becomes a state machine (checkpoints, human-in-the-loop) —
   then as its own module, with an ADR.
@@ -69,10 +69,10 @@ class AssistantDeps:
     # `model` setting, else the deployment default) by `app.agents.run.prepare_run`.
     # The bare (non tenant-prefixed) conversation id this run belongs to (ADR-0007, #40): what
     # `app/tools/approvals.py` scopes a pending action to -- distinct from the tenant-scoped id
-    # `app/api/chat.py` passes as the run's own `conversation_id` for tracing (module docstring
-    # there), which a writing tool's args_validator must never parse back apart itself. `None` for
-    # a run with no conversation (the one-shot agent never registers a writing tool, so it never
-    # needs this).
+    # `app.agents.run.PreparedRun.chat` passes as the run's own `conversation_id` for tracing
+    # (module docstring there), which a writing tool's args_validator must never parse back apart
+    # itself. `None` for a run with no conversation (the one-shot agent never registers a writing
+    # tool, so it never needs this).
     conversation_id: str | None = None
     # Set by `app.tools.approvals.require_approval` just before it lets a writing tool's body run,
     # and read (then left for the next call to overwrite) by that tool's own body to record its

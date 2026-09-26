@@ -16,7 +16,6 @@ from pydantic_ai.toolsets.function import FunctionToolset
 from app.agents.assistant import chat_assistant, one_shot_assistant
 from app.config import Settings
 from app.main import app
-from app.tools import conversations as conversation_tools
 from tests.conftest import (
     looping_tool_calls,
     looping_tool_calls_stream,
@@ -41,13 +40,6 @@ def raw_client(route_run):
     route_run()
     transport = httpx.ASGITransport(app=app)
     return httpx.AsyncClient(transport=transport, base_url="http://test")
-
-
-@pytest.fixture
-def chat_history(monkeypatch, fake_history):
-    """The chat route still builds its own tool dependencies until #108 moves it onto
-    `app.agents.run`: its history loader is the real module's, replaced here."""
-    monkeypatch.setattr(conversation_tools, "load_conversation_history", fake_history)
 
 
 @pytest.fixture
@@ -284,7 +276,7 @@ async def test_one_shot_endpoints_answer_through_reading_only_agent(route_run):
         assert all(tool_def.kind != "unapproved" for tool_def in info.function_tools)
 
 
-async def test_chat_endpoint_answers_through_chat_agent(route_run, chat_history):
+async def test_chat_endpoint_answers_through_chat_agent(route_run):
     """The chat endpoint exposes the chat agent's tool set, and never touches the one-shot
     agent — the mirror image of the one-shot assertion above.
     """
@@ -310,7 +302,7 @@ async def test_chat_endpoint_answers_through_chat_agent(route_run, chat_history)
     assert seen_names == expected_names
 
 
-async def test_both_agents_instructions_state_tool_results_are_data(route_run, chat_history):
+async def test_both_agents_instructions_state_tool_results_are_data(route_run):
     """Acceptance criterion: each agent's instructions text plainly states that tool results
     are data to weigh, not instructions to follow (closes the prompt-injection gap)."""
     route_run(TestModel())

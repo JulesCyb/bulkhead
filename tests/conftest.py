@@ -273,26 +273,27 @@ def route_run(fake_search, fake_history, fake_save) -> Callable[..., RunCollabor
     set_run_collaborators_for_tests(None)
 
 
-def resolve_to_model(model):
-    """Wraps `model` as a fake of the chat route's own, transitional `resolve_chat_model(deps)`
-    seam (`app/api/chat.py`), which the chat tests and the chat integration tests still patch
-    until #108 moves the chat route onto `app.agents.run` too. The one-shot routes have no such
-    name: a test driving them injects its model with `route_run` (or `prepare_run` directly)."""
+@pytest.fixture
+def use_model(route_run) -> Callable[[object], RunCollaborators]:
+    """For a test that drives a route against a real database: `use_model(model)` installs `model`
+    as every run's model through `route_run` while keeping the *real* search, history, and
+    persistence (`None` in each collaborator field) -- e.g. the writing-tool approval suites, whose
+    resumed request must load the history the first one actually persisted."""
 
-    async def _resolve(deps):
-        return model
+    def _use(model) -> RunCollaborators:
+        return route_run(model, search=None, load_history=None, save_run=None)
 
-    return _resolve
+    return _use
 
 
 @pytest.fixture
 def test_model(route_run):
     """TestModel calls every named tool once and answers deterministically -- installed as every
-    run's model through `route_run` (so the one-shot routes and, through its transitional seam,
-    the chat route both answer with it), while search, history, and persistence stay whatever a
-    test sets up itself. Restricted to `search_documents` (`call_tools=`, rather than the default
-    `'all'`) so a plain functional test never drives `chat_assistant`'s writing tool,
-    `rename_document` (ADR-0007, #40) -- that tool's own `args_validator` needs a real
+    run's model through `route_run` (so every route answers with it), with the real search,
+    history, and persistence; a test replaces one of those by calling `route_run(search=...)`
+    etc. again, which keeps the model. Restricted to `search_documents` (`call_tools=`, rather
+    than the default `'all'`) so a plain functional test never drives `chat_assistant`'s writing
+    tool, `rename_document` (ADR-0007, #40) -- that tool's own `args_validator` needs a real
     tenant-bound database session (it writes a pending action), which a test using this fixture
     is not set up to provide. A test that specifically exercises the writing tool builds its own
     `TestModel`/`FunctionModel` against a real database instead (see
