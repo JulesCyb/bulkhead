@@ -31,6 +31,13 @@ tenant/identity is derived from its own bearer token via `MCPTenantAuthMiddlewar
 reuses the exact same shared check (`app.token_verifier.verify_tenant_token`) the HTTP API's
 `app.deps.get_context` does -- never a second, drifting copy of it.
 
+Two more conditions of the mount, closed by issue #116: the mounted sub-app's own lifespan never
+runs (Starlette forwards only `http`/`websocket` scopes to a `Mount`, never `lifespan`) --
+`app.main.lifespan` enters `server.session_manager` itself instead, for as long as the outer
+application runs; and `build_streamable_http_app` no longer leaves `transport_security`
+unconfigured -- `MCP_ALLOWED_HOSTS` (`Settings.mcp_allowed_hosts_list`) names this deployment's
+own public Host header(s), checked by `check_mcp_mode` below before `streamable-http` ever starts.
+
 Freshness note: MCP Python SDK 2.x -> `from mcp.server.mcpserver import MCPServer`
 (previously `from mcp.server.fastmcp import FastMCP`). Check on SDK updates.
 
@@ -56,6 +63,7 @@ from typing import Any
 from uuid import UUID
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 
@@ -306,8 +314,21 @@ def build_streamable_http_app(settings: Settings) -> ASGIApp:
     wrapped with `MCPTenantAuthMiddleware` above. `app.main.create_app` mounts this under
     `/v1/t/{tenant_id}/mcp` only when `settings.mcp_transport == "streamable-http"` -- the stdio
     entrypoint (`main()` below) never touches this function, so local development is unaffected.
+
+    Passes `transport_security` explicitly (issue #116), built from
+    `settings.mcp_allowed_hosts_list` (`MCP_ALLOWED_HOSTS`) -- without it,
+    `MCPServer.streamable_http_app` falls back to its own default (`host="127.0.0.1"`), which
+    auto-enables DNS-rebinding protection that only accepts a `127.0.0.1`/`localhost`/`::1` Host
+    header, rejecting a real deployment's own. `check_mcp_mode` below has already refused to let
+    this function be reached with an empty `mcp_allowed_hosts_list`.
     """
-    inner = server.streamable_http_app(streamable_http_path="/")
+    inner = server.streamable_http_app(
+        streamable_http_path="/",
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=settings.mcp_allowed_hosts_list,
+        ),
+    )
     return MCPTenantAuthMiddleware(inner, settings=settings)
 
 
@@ -316,7 +337,7 @@ def check_mcp_mode(settings: Settings) -> None:
     `app.main.check_auth_mode` (issue #48 / ADR-0005): the guardrail lives in code, not only in
     the docs.
 
-    Three independent failure modes:
+    Four independent failure modes:
 
     - The stdio transport's process-wide identity fallback (`_context_from_env`, above) is only
       reachable when `mcp_transport` is `stdio`. Exactly like `AUTH_MODE=dev-headers`, that
@@ -334,6 +355,12 @@ def check_mcp_mode(settings: Settings) -> None:
       guard existed) must never be allowed to start, since that configuration used to make every
       authenticated connection act as one fixed identity in one fixed tenant regardless of who
       actually connected: a cross-tenant leak, not a fallback.
+    - `streamable-http` is also refused without `MCP_ALLOWED_HOSTS` set (issue #116): with none
+      configured, `build_streamable_http_app` would otherwise pass no explicit
+      `transport_security` to the MCP SDK's own app, which auto-enables its own DNS-rebinding
+      protection only for its own default `host="127.0.0.1"` -- an allow-list of only
+      `127.0.0.1`/`localhost`/`::1` that a real deployment's own Host header never matches. A
+      half-finished deployment must never start and then reject every real connection.
     """
     if settings.mcp_transport == "stdio":
         if settings.environment not in ("dev", "test"):
@@ -360,6 +387,15 @@ def check_mcp_mode(settings: Settings) -> None:
             "(JWT_VERIFICATION_KEY) so app.token_verifier has something to check connections "
             "against -- without it, a networked transport would accept a tool call from whoever "
             "can open a connection."
+        )
+    if not settings.mcp_allowed_hosts_list:
+        raise RuntimeError(
+            "MCP_TRANSPORT=streamable-http requires MCP_ALLOWED_HOSTS (comma-separated, same "
+            "shape as CORS_ORIGINS) -- the deployment's own public Host header(s) -- so "
+            "build_streamable_http_app's TransportSecuritySettings has something to allow-list; "
+            'without it the MCP SDK falls back to its own default (host="127.0.0.1"), which '
+            "auto-enables DNS-rebinding protection that only accepts a localhost Host header and "
+            "would reject every real connection."
         )
 
 

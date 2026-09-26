@@ -20,6 +20,11 @@ Issue #89 closes the gap those two seams left open, separately, between them: ne
 `MCPServer.streamable_http_app()` (not the fake above), with `app.tools.documents.search_documents`
 faked only at the tool-function boundary to capture the `RequestContext` it was actually called
 with. No monkeypatching of `context_provider` (it no longer exists) or `_connection_context`.
+
+Issue #116 removes the two workarounds those `RealWireProtocol` tests still needed: they used to
+enter `MCPServer.session_manager` themselves (`app.main.lifespan` now does that, for any
+`streamable-http` deployment, not just a test) and forced a `Host: localhost` header (the mount
+now configures a real `MCP_ALLOWED_HOSTS` allow-list, exercised here instead of bypassed).
 """
 
 from __future__ import annotations
@@ -129,6 +134,9 @@ async def _fake_inner_app(scope, receive, send):
     await send({"type": "http.response.body", "body": body})
 
 
+MCP_ALLOWED_HOST = "mcp.example.com"
+
+
 def _mcp_settings(**overrides) -> Settings:
     fields = dict(
         _env_file=None,
@@ -142,6 +150,10 @@ def _mcp_settings(**overrides) -> Settings:
         agent_token_signing_key=AGENT_SECRET,
         agent_token_ttl_seconds=300,
         mcp_transport="streamable-http",
+        # Issue #116: `check_mcp_mode` refuses `streamable-http` without this; the real-wire-
+        # protocol tests below send exactly this Host header to prove it's honoured, not the MCP
+        # SDK's own localhost-only default.
+        mcp_allowed_hosts=MCP_ALLOWED_HOST,
     )
     fields.update(overrides)
     return Settings(**fields)
@@ -256,12 +268,11 @@ async def test_agent_identity_token_resolves_to_autonomous_use(monkeypatch, mcp_
 # --- #89: the real wire protocol, real tool dispatch, no fake inner app -----------------------
 
 _MCP_ACCEPT = "application/json, text/event-stream"
-# `MCPServer.streamable_http_app()` auto-enables DNS-rebinding protection when no explicit
-# `host=` is passed (its own default, "127.0.0.1", is exactly the kind of host that triggers it) --
-# `app.mcp.server.build_streamable_http_app` doesn't override it, so the allow-list is the SDK's
-# default (`127.0.0.1`/`localhost`/`::1`, each with any port). Test-only plumbing to satisfy that
-# check; unrelated to #89's own context-resolution fix.
-_DNS_REBIND_SAFE_HOST_HEADER = {"Host": "localhost:80"}
+# The configured allow-list (`_mcp_settings()` above sets `mcp_allowed_hosts=MCP_ALLOWED_HOST`,
+# issue #116) -- proves `build_streamable_http_app` honours a real deployment's own Host header,
+# not the MCP SDK's own localhost-only default (`host="127.0.0.1"`).
+_ALLOWED_HOST_HEADER = {"Host": MCP_ALLOWED_HOST}
+_UNLISTED_HOST_HEADER = {"Host": "evil.example.com"}
 _INITIALIZE_PARAMS = {
     "protocolVersion": "2025-06-18",
     "capabilities": {},
@@ -275,36 +286,36 @@ def mcp_app_real(monkeypatch):
     `MCPServer.streamable_http_app()` -- unlike `mcp_app` above, nothing here fakes the inner
     session-negotiation app: these tests speak the actual wire protocol against it.
 
-    Does *not* itself start `MCPServer.session_manager` -- see `_real_mcp_session` below for why
-    that has to happen inside the same task as the test body, not spread across a fixture's
-    setup/teardown."""
+    `run_role_rls_guard` is substituted with a no-op: driving the real ASGI lifespan (issue #116,
+    `_running_app` below) now reaches it too, and it needs a real database this unit test has
+    none of -- unrelated to what this fixture actually exercises (the MCP mount's own startup and
+    transport security)."""
     from app import main as main_module
+
+    async def _noop_role_rls_guard() -> None:
+        return None
 
     settings = _mcp_settings()
     monkeypatch.setattr(main_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(main_module, "run_role_rls_guard", _noop_role_rls_guard)
     app = main_module.create_app()
     app.dependency_overrides[get_settings] = lambda: settings
     return app, settings
 
 
 @asynccontextmanager
-async def _real_mcp_session():
-    """Starts `MCPServer.session_manager` (the anyio task group its Streamable HTTP requests
-    need) for the enclosed block.
+async def _running_app(app):
+    """Drives the ASGI application's own lifespan around the enclosed block (issue #116): this is
+    what now actually starts `MCPServer.session_manager` -- via `app.main.lifespan`, entered for
+    real, not a test-side substitute for it. `httpx.ASGITransport` never sends `lifespan` scope
+    messages on its own, so tests drive it explicitly through `app.router.lifespan_context`, the
+    same pattern `tests/test_hardening.py` already uses for the auth/RLS guards.
 
-    Starlette never starts a *mounted* sub-app's own lifespan on its parent's behalf (`Mount`
-    only matches `scope["type"] in ("http", "websocket")`, never `"lifespan"`) -- the MCP SDK
-    documents exactly this for a mounted `streamable_http_app()`, exposing `MCPServer.
-    session_manager` "to enable advanced use cases like mounting ... in a ... application" so the
-    embedder can run it itself. `httpx.ASGITransport` never sends `lifespan` scope messages at
-    all, so tests enter it explicitly -- test-only wiring, not a change to `app.main`/
-    `app.mcp.server`.
-
-    Used as `async with _real_mcp_session():` directly inside each test body, never as a
-    `pytest.fixture` spanning a `yield`: `session_manager.run()` holds an anyio cancel scope that
-    must exit in the same task it was entered in, and a fixture's setup/teardown can run as two
-    separate tasks under `pytest-asyncio`."""
-    async with mcp_server.server.session_manager.run():
+    Used as `async with _running_app(app):` directly inside each test body, never as a
+    `pytest.fixture` spanning a `yield` -- the session manager's own cancel scope must exit in the
+    same task it was entered in, and a fixture's setup/teardown can run as two separate tasks
+    under `pytest-asyncio`."""
+    async with app.router.lifespan_context(app):
         yield
 
 
@@ -317,7 +328,9 @@ async def _rpc_call(
     an SSE stream when `json_response` is left at its default `False` -- exactly how
     `app.mcp.server.build_streamable_http_app` calls it -- so this parses the `data:` line of the
     single `message` event the server sends for one request, rather than assuming a plain JSON
-    body."""
+    body. A request the transport-security middleware rejects outright (issue #116) never reaches
+    that layer at all and answers with a plain-text body instead -- `payload` stays `None` for it,
+    never a `JSONDecodeError`."""
     async with client.stream("POST", path, json=body, headers=headers) as response:
         status_code = response.status_code
         session_id = response.headers.get("mcp-session-id")
@@ -329,10 +342,12 @@ async def _rpc_call(
                     data = line[len("data:") :].strip()
                     if data:
                         payload = json.loads(data)
-        else:
+        elif "application/json" in content_type:
             raw = await response.aread()
             if raw:
                 payload = json.loads(raw)
+        else:
+            await response.aread()
         return status_code, session_id, payload
 
 
@@ -408,11 +423,11 @@ async def test_real_wire_protocol_hands_search_documents_the_verified_persons_co
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
         "Accept": _MCP_ACCEPT,
-        **_DNS_REBIND_SAFE_HOST_HEADER,
+        **_ALLOWED_HOST_HEADER,
     }
     transport = httpx.ASGITransport(app=app)
     async with (
-        _real_mcp_session(),
+        _running_app(app),
         httpx.AsyncClient(transport=transport, base_url="http://localhost") as client,
     ):
         session_headers = await _initialize_session(client, path, headers)
@@ -462,11 +477,11 @@ async def test_real_wire_protocol_hands_search_documents_the_agent_identitys_con
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
         "Accept": _MCP_ACCEPT,
-        **_DNS_REBIND_SAFE_HOST_HEADER,
+        **_ALLOWED_HOST_HEADER,
     }
     transport = httpx.ASGITransport(app=app)
     async with (
-        _real_mcp_session(),
+        _running_app(app),
         httpx.AsyncClient(transport=transport, base_url="http://localhost") as client,
     ):
         session_headers = await _initialize_session(client, path, headers)
@@ -518,14 +533,14 @@ async def test_two_concurrent_connections_each_see_only_their_own_tenant(monkeyp
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "Accept": _MCP_ACCEPT,
-            **_DNS_REBIND_SAFE_HOST_HEADER,
+            **_ALLOWED_HOST_HEADER,
         }
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as client:
             session_headers = await _initialize_session(client, path, headers)
             return await _call_search_documents(client, path, session_headers)
 
-    async with _real_mcp_session():
+    async with _running_app(app):
         result_a, result_b = await asyncio.gather(_run(tenant_a, token_a), _run(tenant_b, token_b))
 
     assert result_a["isError"] is False
@@ -536,6 +551,44 @@ async def test_two_concurrent_connections_each_see_only_their_own_tenant(monkeyp
     assert seen_by_tenant[tenant_b].identity_id == identity_b
     # Never the other connection's tenant on either call.
     assert seen_by_tenant[tenant_a].tenant_id != seen_by_tenant[tenant_b].tenant_id
+
+
+async def test_real_wire_protocol_rejects_an_unlisted_host_header(monkeypatch, mcp_app_real):
+    """Issue #116: `build_streamable_http_app` now passes `MCP_ALLOWED_HOSTS` through as the SDK's
+    `TransportSecuritySettings.allowed_hosts` -- a Host header outside that list is rejected by the
+    SDK's own DNS-rebinding middleware (421), proving the allow-list is actually enforced and not
+    just accepted-and-ignored configuration."""
+    app, _ = mcp_app_real
+    tenant_id = uuid.uuid4()
+    identity_id = uuid.uuid4()
+    _install_fake_control_plane(
+        monkeypatch,
+        auth_settings={tenant_id: (HUMAN_ISSUER, False)},
+        identities={(HUMAN_ISSUER, "sub-1"): identity_id},
+        memberships={(tenant_id, identity_id): "member"},
+    )
+    token = _make_token(secret=HUMAN_SECRET, issuer=HUMAN_ISSUER, audience=str(tenant_id))
+
+    path = f"/v1/t/{tenant_id}/mcp/"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": _MCP_ACCEPT,
+        **_UNLISTED_HOST_HEADER,
+    }
+    transport = httpx.ASGITransport(app=app)
+    async with (
+        _running_app(app),
+        httpx.AsyncClient(transport=transport, base_url="http://localhost") as client,
+    ):
+        status_code, _, _ = await _rpc_call(
+            client,
+            path,
+            headers,
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": _INITIALIZE_PARAMS},
+        )
+
+    assert status_code == 421
 
 
 async def test_streamable_http_refuses_a_tools_call_with_no_connection_context(monkeypatch):

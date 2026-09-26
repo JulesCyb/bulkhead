@@ -588,6 +588,22 @@ def test_settings_load_from_env_example_file_without_error() -> None:
     assert settings.jwt_verification_key is None
     assert settings.agent_token_signing_key is None
     assert settings.agent_token_verification_key is None
+    # Issue #116: blank by default (streamable-http is not the default transport), but the
+    # setting name itself must be present in .env.example, not only in code.
+    assert settings.mcp_allowed_hosts_list == []
+
+
+def test_env_example_documents_mcp_allowed_hosts() -> None:
+    """Issue #116: `check_mcp_mode` refuses `streamable-http` without this setting -- it must be
+    discoverable in `.env.example`, not only in `app/config.py`."""
+    assert "MCP_ALLOWED_HOSTS" in ENV_EXAMPLE
+
+
+def test_connection_guide_documents_mcp_allowed_hosts() -> None:
+    """Issue #116: `docs/mcp-connection.md` names the setting that makes the streamable-http
+    transport's Host-header allow-list configurable, not only its pre-existing token-verifier
+    requirement."""
+    assert "MCP_ALLOWED_HOSTS" in MCP_CONNECTION_MD
 
 
 def test_connection_guide_routes_match_the_agent_identity_and_token_routes() -> None:
