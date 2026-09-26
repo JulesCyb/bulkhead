@@ -4,14 +4,14 @@ resolution factored out of `app/deps.py`'s `AUTH_MODE=jwt` branch into one modul
 reuse. Its caller is `app/context_resolution.py` (#101), the one chain every adapter (HTTP, and the
 MCP transport) resolves a request's context through.
 
-Tenant suspension is decided here only when a caller asks for the tenant record
-(`read_tenant_record=True`, #104 -- `app/context_resolution.py` always does): the record is read
-right after the token's signature/issuer/expiry/audience verify (none of which touch the
-database, so an unauthenticated caller cannot make this module read the control plane) and before
-the identity and membership lookups; a suspended record raises `TenantSuspendedAtVerification`
-there, and an unsuspended one is handed to the membership lookup, whose tenant session routes from
-it instead of reading the control plane a second time. A caller that does not ask (the MCP
-middleware until #102) gets exactly the old chain, with no suspension check.
+Tenant suspension is decided here, on the tenant record (#104; always, since code review
+2026-09-26 -- there is no opt-out flag): the record is read right after the token's
+signature/issuer/expiry/audience verify (none of which touch the database, so an unauthenticated
+caller cannot make this module read the control plane) and before the identity and membership
+lookups; a suspended record raises `TenantSuspendedAtVerification` there, and an unsuspended one
+is handed to the membership lookup, whose tenant session routes from it instead of reading the
+control plane a second time. Every caller -- `app/context_resolution.py`'s bearer chain, which
+both the HTTP API and the MCP transport (#102) resolve through -- gets that check.
 
 **Gap fix (Spec 6, closing the loop between #46/#47 and this module).** An agent identity's token
 (minted by `app/agent_credential_exchange.py`) is *not* governed by a tenant's own human-IdP
@@ -146,14 +146,14 @@ class ResolvedIdentity:
     issuer: str
     credential_public_id: str | None = None
     tenant_record: TenantRecord | None = None
-    """The tenant record read during verification -- set exactly when the caller passed
-    `read_tenant_record=True` (#104); `None` otherwise."""
+    """The tenant record read during verification (#104) -- always set by
+    `verify_tenant_token`; `None` only for a value built by hand (a test)."""
 
 
 class TenantSuspendedAtVerification(TenantSuspendedError):
-    """The tenant record read during `verify_tenant_token(..., read_tenant_record=True)` says the
-    tenant is suspended (#104). A `TenantSuspendedError` like any other, carrying the issuer the
-    token was verified against for the caller's security-event log line."""
+    """The tenant record read during `verify_tenant_token` says the tenant is suspended (#104).
+    A `TenantSuspendedError` like any other, carrying the issuer the token was verified against
+    for the caller's security-event log line."""
 
     def __init__(self, tenant_id: UUID, *, issuer: str) -> None:
         super().__init__(tenant_id)
@@ -282,7 +282,6 @@ async def verify_tenant_token(
     default_issuer: str | None,
     algorithm_source: AlgorithmSource,
     adapter: ControlPlaneReads | None = None,
-    read_tenant_record: bool = False,
 ) -> ResolvedIdentity:
     """Verify `token` against `tenant_id` and resolve it to an identity and its membership.
 
@@ -303,10 +302,9 @@ async def verify_tenant_token(
     unless a test has installed an override via `set_default_adapter_for_tests`). A caller never
     needs to pass it explicitly outside a test.
 
-    `read_tenant_record=True` (#104) reads the tenant record between the audience check and the
-    identity lookup, raises `TenantSuspendedAtVerification` if it is suspended, routes the
-    membership lookup by it, and returns it on `ResolvedIdentity.tenant_record` -- see module
-    docstring. Without it, suspension is never checked here.
+    The tenant record (#104) is always read between the audience check and the identity lookup:
+    a suspended record raises `TenantSuspendedAtVerification`; otherwise the membership lookup
+    routes by it and it is returned on `ResolvedIdentity.tenant_record` -- see module docstring.
 
     Raises `TenantTokenVerificationError` with a single categorized reason on the first check
     that fails; returns the resolved identity and role on success.
@@ -340,11 +338,9 @@ async def verify_tenant_token(
             VerificationFailureReason.AUDIENCE_MISMATCH, issuer=expected_issuer
         )
 
-    tenant_record: TenantRecord | None = None
-    if read_tenant_record:
-        tenant_record = await adapter.get_tenant_record(tenant_id=tenant_id)
-        if tenant_record.suspended:
-            raise TenantSuspendedAtVerification(tenant_id, issuer=expected_issuer)
+    tenant_record = await adapter.get_tenant_record(tenant_id=tenant_id)
+    if tenant_record.suspended:
+        raise TenantSuspendedAtVerification(tenant_id, issuer=expected_issuer)
 
     identity = await adapter.find_identity_by_issuer_and_subject(
         issuer=expected_issuer, subject=claims.subject

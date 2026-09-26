@@ -22,9 +22,10 @@ What this module does, in order, for a bearer token (`resolve_bearer_context`):
    against the identity provider's settings, an agent token against this application's own) --
    signature/issuer/expiry failures are 401, an audience other than the path's tenant is 403.
    None of that reads the control-plane view.
-3. Reads the tenant record (`ControlPlaneReads.get_tenant_record`, #104, asked for with
-   `read_tenant_record=True`) -- the one read of the tenant's control-plane facts and settings for
-   the whole request; a suspended record is a 403 before any identity or membership lookup.
+3. Reads the tenant record (`ControlPlaneReads.get_tenant_record`, #104, inside
+   `verify_tenant_token`) -- the one read of the tenant's control-plane facts and settings for the
+   whole request. The verifier decides suspension on it (`TenantSuspendedAtVerification`); this
+   module only maps that to a `TENANT_SUSPENDED` 403, before any identity or membership lookup.
 4. Resolves identity and membership -- unknown identity or no membership is 403. The membership
    lookup routes its tenant session by the record, so it reads no control-plane row of its own.
 5. Assigns the means (`actor_context`) and builds the context with a fresh request id, carrying
@@ -299,7 +300,6 @@ async def resolve_bearer_context(
             default_issuer=settings.default_identity_issuer,
             algorithm_source=algorithm_source or algorithm_source_for(settings),
             adapter=adapter,
-            read_tenant_record=True,
         )
     except TenantSuspendedAtVerification as exc:
         return _forbidden(RejectionReason.TENANT_SUSPENDED, request_id, exc.issuer)
@@ -367,9 +367,10 @@ def resolve_stdio_env_context(settings: Settings) -> RequestContext:
     process-wide `RequestContext` built from `MCP_TENANT_ID`/`MCP_IDENTITY_ID`, never per
     connection -- `stdio` is a single local development client, unlike `streamable-http`'s one
     context per connection (`resolve_bearer_context` above, via `actor_context`). No suspension
-    check and no means here: `app.mcp.server.resolve_context` (the MCP connection handler's own
-    entry point, #89) runs the suspension check itself for *both* the per-connection and this
-    stdio-fallback context, and a local developer's own tool calls carry no means to report.
+    check and no means here, and none in `app.mcp.server.resolve_context` either (#106): this
+    context carries no tenant record, so the first `tenant_session()` a tool call opens refuses a
+    suspended tenant through its own routing read (`app/db/session.py`'s module docstring); a
+    local developer's own tool calls carry no means to report.
 
     `app.mcp.server`'s `_context_from_env` is a thin wrapper of this function -- kept under that
     name for #89's own semantics (per-connection contextvar first, this fallback only under
