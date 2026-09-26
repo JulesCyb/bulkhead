@@ -42,6 +42,8 @@ ADR_0009 = (REPO_ROOT / "docs" / "adr" / "0009-cost-and-abuse-protection.md").re
     encoding="utf-8"
 )
 ADR_DIR = REPO_ROOT / "docs" / "adr"
+FRONTEND_MD = (REPO_ROOT / "docs" / "frontend.md").read_text(encoding="utf-8")
+MOBILE_MD = (REPO_ROOT / "docs" / "mobile.md").read_text(encoding="utf-8")
 
 RETIRED_CLAIMS = {
     "superuser-DSN wording": [
@@ -813,3 +815,36 @@ def test_readme_four_rules_summary_names_the_approval_mechanism() -> None:
     assert "writing tool requires approval" in rules_section
     assert "standing grant" in rules_section
     assert "always allow" in rules_section.lower()
+
+
+# --- The run module and the writing_tool decorator are findable from the docs (#109) -----------
+
+
+def test_claude_md_writing_tool_rule_points_at_the_decorator_not_a_copy_by_hand() -> None:
+    """Rule 4's old "copy this shape verbatim" instruction is gone -- a second writing tool
+    applies the decorator instead of copying `rename_document`'s former hand-written wrapper."""
+    rule_4 = CLAUDE_MD.split("4. **Agents access data only through tools**", 1)[1].split(
+        "\n5. ", 1
+    )[0]
+    assert "copy this shape verbatim" not in rule_4
+    assert "writing_tool` decorator" in rule_4
+    assert "app/agents/writing_tools.py" in rule_4
+    assert "app/agents/run.py" in rule_4
+
+
+def test_frontend_and_mobile_docs_point_at_the_run_module_and_the_decorator() -> None:
+    """#109's own doc-claims check: a developer reading either client-attachment guide can find
+    where the reading/writing split lives (`app/agents/run.py`) and how a writing tool declares
+    itself (the `writing_tool` decorator, `app/agents/writing_tools.py`) without opening the ADR."""
+    for doc in (FRONTEND_MD, MOBILE_MD):
+        assert "app/agents/run.py" in doc
+        assert "writing_tool" in doc
+        assert "app/agents/writing_tools.py" in doc
+
+
+def test_adr_0007_points_at_the_run_module_and_the_decorator() -> None:
+    """ADR-0007 gets a one-line implementation note for #109, not a decision change: the
+    approval policy stays option 1 (module docstring above), only the note is new."""
+    assert "app/agents/run.py" in ADR_0007
+    assert "writing_tool" in ADR_0007
+    assert "app/agents/writing_tools.py" in ADR_0007

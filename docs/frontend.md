@@ -35,6 +35,11 @@ export default function Page() {
 Notes:
 - CORS: set `CORS_ORIGINS` in the backend to the frontend URL.
 - Tool calls (`search_documents`) arrive as tool parts in the stream — display them so users see what the agent is doing.
+- A writing tool (e.g. `rename_document`) can pause mid-stream for the member's approval —
+  `useChat`'s deferred-tool-approval flow, not a custom endpoint. The reading/writing split behind
+  it lives in `app/agents/run.py`: `chat(adapter)` is the only execution method that binds the
+  writing-capable agent, and any writing tool applies the `writing_tool` decorator
+  (`app/agents/writing_tools.py`) instead of its own approval bookkeeping — see CLAUDE.md rule 4.
 - In production, solve auth in the frontend via the session (cookie/JWT); never ship the dev header.
 - The tenant lives only in the URL path (ADR-0012) — a re-login in one tenant's tab can never
   redirect another tenant's tab.
