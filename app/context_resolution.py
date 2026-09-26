@@ -22,12 +22,16 @@ What this module does, in order, for a bearer token (`resolve_bearer_context`):
    issuer (`key_source_for`/`algorithm_source_for`: a person's token against the identity
    provider's settings, an agent token against this application's own) -- signature/issuer/expiry
    failures are 401, audience/identity/membership failures are 403.
-3. Checks suspension (`app.tenant_suspension.ensure_tenant_not_suspended`) -- otherwise 403.
-4. Assigns the means (`actor_context`) and builds the context with a fresh request id.
+3. Reads the tenant record (`ControlPlaneReads.get_tenant_record`, #104) -- one read of the
+   tenant's control-plane facts and settings for the whole request; a suspended record is a 403.
+   (A suspension the membership lookup's own session routing already saw is the same 403.)
+4. Assigns the means (`actor_context`) and builds the context with a fresh request id, carrying
+   the record (`RequestContext.tenant_record`) for `tenant_session` to route by.
 
 `AUTH_MODE=dev-headers` (local development only) is its own function, `resolve_dev_headers_context`,
 returning the same value type: the identity and roles come from `X-Identity-Id`/`X-Roles`, the
-tenant still from the path, suspension is still checked, and the means is still delegation.
+tenant still from the path, the tenant record is still read (suspension checked there) and
+attached, and the means is still delegation.
 `resolve_request_context` selects between the two by `settings.auth_mode`; it is the one function
 an adapter calls.
 
@@ -40,8 +44,9 @@ a bearer token makes sense), and render a `ContextRejection` in their transport'
 (`tests/test_context_resolution.py` greps for it).
 
 `adapter` (`app.token_verifier.ControlPlaneReads`, #100) is the one seam for every control-plane
-read the chain makes -- identity, tenant auth settings (issuer and suspension), membership; it
-defaults to the real repositories. Tests pass (or install) `tests.conftest.FakeControlPlaneReads`.
+read the chain makes -- identity, tenant auth settings (issuer), membership, tenant record
+(suspension, routing, residency, settings); it defaults to the real repositories. Tests pass (or
+install) `tests.conftest.FakeControlPlaneReads`.
 """
 
 from __future__ import annotations
@@ -54,8 +59,9 @@ from uuid import UUID
 
 from app.config import Settings
 from app.context import MeansKind, RequestContext
+from app.db.session import TenantSuspendedError
 from app.jwt_verifier import KeySource, TokenVerificationError
-from app.tenant_suspension import TenantSuspendedError, ensure_tenant_not_suspended
+from app.tenant_record import TenantRecord
 from app.token_verifier import (
     AGENT_IDENTITY_ISSUER,
     AlgorithmSource,
@@ -63,6 +69,7 @@ from app.token_verifier import (
     ResolvedIdentity,
     TenantTokenVerificationError,
     VerificationFailureReason,
+    default_adapter,
     verify_tenant_token,
 )
 
@@ -192,6 +199,7 @@ def _new_context(
     roles: frozenset[str],
     means: tuple[MeansKind, str],
     request_id: str | None,
+    tenant_record: TenantRecord | None = None,
 ) -> RequestContext:
     # The one construction site of a request's context.
     ctx = RequestContext(
@@ -199,23 +207,34 @@ def _new_context(
         identity_id=identity_id,
         roles=roles,
         request_id=request_id or uuid.uuid4().hex,
+        tenant_record=tenant_record,
     )
     kind, means_id = means
     return ctx.acting_through(kind, means_id)
 
 
 def actor_context(
-    tenant_id: UUID, resolved: ResolvedIdentity, *, request_id: str | None = None
+    tenant_id: UUID,
+    resolved: ResolvedIdentity,
+    *,
+    request_id: str | None = None,
+    tenant_record: TenantRecord | None = None,
 ) -> RequestContext:
     """The context a verified token acts as, naming its means (ADR-0005): a person's token is
     delegation (the assistant as the means); an agent identity's token is autonomous use (the
-    credential from the token's own `cred` claim as the means)."""
+    credential from the token's own `cred` claim as the means). `tenant_record`, when given, rides
+    on the context for `tenant_session` to route by (#104)."""
     if resolved.issuer == AGENT_IDENTITY_ISSUER:
         means: tuple[MeansKind, str] = ("credential", resolved.credential_public_id or "unknown")
     else:
         means = _DELEGATION
     return _new_context(
-        tenant_id, resolved.identity_id, frozenset({resolved.role}), means, request_id
+        tenant_id,
+        resolved.identity_id,
+        frozenset({resolved.role}),
+        means,
+        request_id,
+        tenant_record,
     )
 
 
@@ -229,16 +248,17 @@ def _forbidden(reason: RejectionReason, request_id: str, issuer: str | None) -> 
     )
 
 
-async def _suspension_rejection(
+async def _read_tenant_record(
     tenant_id: UUID, request_id: str, issuer: str | None, adapter: ControlPlaneReads | None
-) -> ContextRejection | None:
-    """Suspension, checked inside the module so no adapter can hand out a context for a
-    suspended tenant (ADR-0010). A tenant with no control-plane row is not suspended."""
-    try:
-        await ensure_tenant_not_suspended(tenant_id, adapter=adapter)
-    except TenantSuspendedError:
+) -> TenantRecord | ContextRejection:
+    """The request's one tenant-record read (#104), and suspension decided on it inside the
+    module, so no adapter can hand out a context for a suspended tenant (ADR-0010). A tenant with
+    no control-plane row is the pooled, unsuspended default."""
+    adapter = adapter if adapter is not None else default_adapter()
+    record = await adapter.get_tenant_record(tenant_id=tenant_id)
+    if record.suspended:
         return _forbidden(RejectionReason.TENANT_SUSPENDED, request_id, issuer)
-    return None
+    return record
 
 
 async def resolve_bearer_context(
@@ -273,6 +293,10 @@ async def resolve_bearer_context(
             algorithm_source=algorithm_source or algorithm_source_for(settings),
             adapter=adapter,
         )
+    except TenantSuspendedError:
+        # The membership lookup's own tenant session routes itself (it has no record yet) and so
+        # already enforces suspension: the same rejection as the record's, never a 500.
+        return _forbidden(RejectionReason.TENANT_SUSPENDED, request_id, None)
     except TenantTokenVerificationError as exc:
         reason = RejectionReason(exc.reason.value)
         if exc.reason is VerificationFailureReason.INVALID_OR_EXPIRED:
@@ -289,10 +313,10 @@ async def resolve_bearer_context(
             )
         return _forbidden(reason, request_id, exc.issuer)
 
-    rejection = await _suspension_rejection(tenant_id, request_id, resolved.issuer, adapter)
-    if rejection is not None:
-        return rejection
-    return actor_context(tenant_id, resolved, request_id=request_id)
+    record = await _read_tenant_record(tenant_id, request_id, resolved.issuer, adapter)
+    if isinstance(record, ContextRejection):
+        return record
+    return actor_context(tenant_id, resolved, request_id=request_id, tenant_record=record)
 
 
 async def resolve_dev_headers_context(
@@ -304,7 +328,8 @@ async def resolve_dev_headers_context(
 ) -> RequestContext | ContextRejection:
     """`AUTH_MODE=dev-headers` (local development only): the identity from `X-Identity-Id`, the
     roles from `X-Roles` (a development-only convenience with no production equivalent), the
-    tenant from the path, suspension checked, the means delegation."""
+    tenant from the path, the tenant record read (suspension checked on it), the means
+    delegation."""
     request_id = uuid.uuid4().hex
     if not identity_header:
         return ContextRejection(
@@ -326,10 +351,10 @@ async def resolve_dev_headers_context(
         )
     roles = frozenset(r.strip() for r in (roles_header or "").split(",") if r.strip())
 
-    rejection = await _suspension_rejection(tenant_id, request_id, DEV_HEADERS_ISSUER, adapter)
-    if rejection is not None:
-        return rejection
-    return _new_context(tenant_id, identity_id, roles, _DELEGATION, request_id)
+    record = await _read_tenant_record(tenant_id, request_id, DEV_HEADERS_ISSUER, adapter)
+    if isinstance(record, ContextRejection):
+        return record
+    return _new_context(tenant_id, identity_id, roles, _DELEGATION, request_id, record)
 
 
 async def resolve_request_context(

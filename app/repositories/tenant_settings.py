@@ -14,6 +14,8 @@ never read another tenant's settings even if `ctx.tenant_id` were somehow wrong.
 
 from __future__ import annotations
 
+from uuid import UUID
+
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -30,10 +32,16 @@ class TenantSettingsRepository:
         -- never raises, since every field here is optional and content tracing must default to
         off regardless of what is or isn't recorded yet.
         """
+        return await self.get_for_tenant(session, tenant_id=ctx.tenant_id)
+
+    async def get_for_tenant(self, session: AsyncSession, *, tenant_id: UUID) -> TenantSettings:
+        """`get` by bare tenant id, for the one caller that has no `RequestContext` yet: the
+        tenant-record read (`app.repositories.control.ControlRepository.get_tenant_record`,
+        #104), whose session has `app.tenant_id` set to `tenant_id` the same way."""
         row = (
             await session.execute(
                 text("SELECT settings FROM tenants WHERE id = :tid"),
-                {"tid": str(ctx.tenant_id)},
+                {"tid": str(tenant_id)},
             )
         ).first()
         if row is None or row[0] is None:

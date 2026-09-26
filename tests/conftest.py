@@ -7,6 +7,7 @@ import os
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 import pytest
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
@@ -41,7 +42,12 @@ from app.api import chat as chat_module
 from app.context import RequestContext
 from app.repositories.control import Identity, TenantAuthSettings
 from app.repositories.documents import DocumentHit
+from app.tenant_record import TenantRecord
 from app.token_verifier import set_default_adapter_for_tests
+
+# The suspension timestamp `FakeControlPlaneReads` reports for a tenant its `auth_settings` marks
+# suspended (a fixed value: only whether it is set ever matters).
+_SUSPENDED_AT = datetime(2026, 1, 1, tzinfo=UTC)
 
 
 @pytest.fixture
@@ -68,6 +74,10 @@ class FakeControlPlaneReads:
     `auth_settings`: {tenant_id: (issuer, suspended)} -- a missing key means no control-plane row
     at all, mirroring the real repository's own "no row -> not suspended, fall back to the
     caller's default_issuer" behaviour (ADR-0002).
+    `records`: {tenant_id: TenantRecord} (#104). A missing key is the pooled, residency-less
+    default record, mirroring the real read's "no row -> pooled, not suspended" -- except that a
+    tenant `auth_settings` reports suspended gets a record suspended too, since both real reads
+    answer from the same `control.tenants` row and one fake must not contradict itself.
     `explode`: names of `ControlPlaneReads` methods that must never be called at all -- raises
     `AssertionError` if one of them is, for the tests proving an agent-issued token never
     consults the tenant's own auth settings.
@@ -76,6 +86,7 @@ class FakeControlPlaneReads:
     identities: dict[tuple[str, str], uuid.UUID] = field(default_factory=dict)
     memberships: dict[tuple[uuid.UUID, uuid.UUID], str] = field(default_factory=dict)
     auth_settings: dict[uuid.UUID, tuple[str | None, bool]] = field(default_factory=dict)
+    records: dict[uuid.UUID, TenantRecord] = field(default_factory=dict)
     explode: frozenset[str] = frozenset()
 
     def _forbid(self, name: str) -> None:
@@ -105,6 +116,13 @@ class FakeControlPlaneReads:
     ) -> str | None:
         self._forbid("get_membership_role")
         return self.memberships.get((tenant_id, identity_id))
+
+    async def get_tenant_record(self, *, tenant_id: uuid.UUID) -> TenantRecord:
+        self._forbid("get_tenant_record")
+        if tenant_id in self.records:
+            return self.records[tenant_id]
+        _, suspended = self.auth_settings.get(tenant_id, (None, False))
+        return TenantRecord(tenant_id=tenant_id, suspended_at=_SUSPENDED_AT if suspended else None)
 
 
 @pytest.fixture(autouse=True)

@@ -67,6 +67,15 @@ residency, where their data lives. Owned by the operator, never by a tenant; a t
 can read what it needs of it and change nothing.
 _Avoid_: admin data, master data, tenant catalog
 
+**Tenant record**:
+What the control plane says about one tenant at the moment a request starts — isolation tier,
+database alias, residency, suspension, gateway credential alias — together with the tenant's own
+settings, read once when the request's context is resolved and carried with it, unchanged, to
+every session and resolver the request uses. A suspended record ends the request there; the next
+request reads the record again, never a cached one.
+_Avoid_: tenant config, tenant info, tenant row, tenant metadata, tenant settings (as the whole —
+the settings are one part of it)
+
 **Tenant secret**:
 A secret the operator holds and uses on one tenant's behalf: the gateway credential, access to a
 dedicated database. Delivered to the deployment, never stored in a database, and rotated by the

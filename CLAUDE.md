@@ -55,7 +55,10 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    `app/context_resolution.py` -- the one chain (bearer parsing, per-issuer key/algorithm
    pinning, audience against the path, membership, suspension, means) that returns a context or a
    typed `ContextRejection`; `app/deps.py` is only its HTTP adapter -- and passed through every
-   request, agent run, tool call, and job. No global state.
+   request, agent run, tool call, and job. No global state. The chain reads the tenant's
+   **tenant record** (`app/tenant_record.py`: tier, alias, residency, suspension, gateway
+   credential alias, settings) once, right after the membership check, refuses a suspended one,
+   and attaches it as `ctx.tenant_record` -- never cached across requests (#104).
 1a. **Roles gate actions, never visibility** (ADR-0004): a role check is `ctx.require_role(role)`,
    called at the top of a tool (`app/tools/`) or a route (`app/api/`) — before any data access —
    never inside a repository's read path (`app/repositories/`), since RLS already handles the only
@@ -107,6 +110,8 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    `tenant_session(ctx)`. `tenant_session(ctx)` resolves which engine to use internally, from the
    tenant's isolation tier and database alias in the control plane (ADR-0002) — pooled by
    default — with no change to how callers use it: same signature, same transaction behaviour.
+   When `ctx.tenant_record` is present it routes by the record and reads nothing; without one (a
+   job, a test) it reads the control plane itself and enforces suspension there (#104).
    The app connects as `app` (no superuser, `NOBYPASSRLS`); migrations and the operator tool
    (`app/operator/`, `scripts/operator.py`) run as the separate `app_owner` role (no superuser,
    `NOBYPASSRLS`, owns every object) via `DATABASE_URL_MIGRATIONS` — a DSN the API container's

@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from typing import Literal, get_args
 from uuid import UUID
 
+from app.tenant_record import TenantRecord
+
 Role = Literal["admin", "member", "support", "agent"]
 """The four legal membership roles (CONTEXT.md's "Role" glossary entry, ADR-0004, ADR-0005).
 
@@ -78,6 +80,11 @@ class RequestContext:
     means: Means | None = None
     """Set only via `acting_through(...)`. `None` for a context built the ordinary way (no
     means to report) -- the common, unchanged shape every existing caller still constructs."""
+    tenant_record: TenantRecord | None = None
+    """The tenant's control-plane record (`app.tenant_record`, #104), read once by
+    `app.context_resolution` for a request and consumed by `tenant_session` instead of a second
+    control-plane read. `None` for a context built without that step (a job, a test, the stdio
+    MCP fallback): `tenant_session` then reads the control plane itself, suspension included."""
 
     def has_role(self, role: Role) -> bool:
         return role in self.roles

@@ -44,15 +44,17 @@ from uuid import UUID
 import jwt as _pyjwt
 
 from app.context import RequestContext
-from app.db.session import control_session, tenant_session
+from app.db.session import control_session, tenant_record_session, tenant_session
 from app.jwt_verifier import KeySource, TokenVerificationError, verify_token
 from app.repositories.control import (
+    ControlRepository,
     Identity,
     IdentityRepository,
     TenantAuthSettings,
     TenantAuthSettingsRepository,
 )
 from app.repositories.memberships import MembershipRepository
+from app.tenant_record import TenantRecord
 
 # (issuer) -> the algorithm(s) a token claiming that issuer may be verified with -- the algorithm
 # half of the same per-issuer pinning `KeySource` does for the verification key (see
@@ -137,7 +139,8 @@ class ResolvedIdentity:
 class ControlPlaneReads(Protocol):
     """The one seam through which `verify_tenant_token` (and `app.tenant_suspension.
     ensure_tenant_not_suspended`) reach a tenant's auth settings, an identity, and a membership
-    role (#100) -- never a repository class or a session function imported directly. Every method
+    role (#100), and through which `app.context_resolution` reads the tenant record (#104) --
+    never a repository class or a session function imported directly. Every method
     takes plain ids/strings and returns a plain value, never a session: an implementation owns its
     own session/transaction, whatever that means for it (a real database, an in-memory dict for a
     test)."""
@@ -151,6 +154,12 @@ class ControlPlaneReads(Protocol):
     ) -> TenantAuthSettings | None: ...
 
     async def get_membership_role(self, *, tenant_id: UUID, identity_id: UUID) -> str | None: ...
+
+    async def get_tenant_record(self, *, tenant_id: UUID) -> TenantRecord:
+        """`tenant_id`'s control-plane record and settings (#104, `app.tenant_record`), read
+        once per request by `app.context_resolution`. Never `None`: a tenant the control plane
+        has no row for is the pooled default record."""
+        ...
 
 
 class RepositoryControlPlaneReads:
@@ -186,6 +195,12 @@ class RepositoryControlPlaneReads:
             return await MembershipRepository().get_role(
                 session, preliminary_ctx, identity_id=identity_id
             )
+
+    async def get_tenant_record(self, *, tenant_id: UUID) -> TenantRecord:
+        # One transaction on the pooled database, `app.tenant_id` set for it alone: the view and
+        # the settings row read together (#104).
+        async with tenant_record_session(tenant_id) as session:
+            return await ControlRepository().get_tenant_record(session, tenant_id=tenant_id)
 
 
 # Test-only override installed via `set_default_adapter_for_tests` below -- `None` means "use the
