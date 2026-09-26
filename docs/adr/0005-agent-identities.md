@@ -36,9 +36,11 @@ We choose **option 3**.
   tenant, listed for and revocable by the tenant's admins, and never shared across tenants.
   There is no global key of any kind.
 - **MCP** moves to Streamable HTTP with OAuth for anything beyond local development; the tenant
-  and identity come from the token of the connection, per connection. The process-wide
-  `context_provider` survives only as an explicit development mode guarded the same way as
-  `AUTH_MODE=dev-headers`.
+  and identity come from the token of the connection, per connection. The process-wide identity
+  fallback (`MCP_TENANT_ID`/`MCP_IDENTITY_ID`) survives only as an explicit development mode,
+  reachable only under the `stdio` transport and guarded the same way as `AUTH_MODE=dev-headers`
+  — never a fallback under Streamable HTTP, where an unset per-connection context is a hard
+  error (issue #89).
 - The request context grows a second field for the means (which agent, which credential) so
   audit records can carry both.
 

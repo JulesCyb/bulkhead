@@ -4,14 +4,18 @@ Payoff: Claude Code / Claude Desktop during development, managed platforms later
 rewriting the tools.
 
 Context: in production, the tenant/identity context comes from the MCP connection's
-authentication (OAuth/token, `app.token_verifier`), per connection. For local development
-(`MCP_TRANSPORT=stdio`, the default), from the process-wide MCP_TENANT_ID / MCP_IDENTITY_ID.
+authentication (OAuth/token, `app.token_verifier`), per connection, held in the
+`_connection_context` contextvar for the lifetime of that connection's request. For local
+development (`MCP_TRANSPORT=stdio`, the default), from the process-wide MCP_TENANT_ID /
+MCP_IDENTITY_ID -- reachable only when no per-connection context is set, and only under `stdio`
+(issue #89: never a fallback under `streamable-http`, where an unset contextvar is a hard error).
 Which transport is active is a single setting (`Settings.mcp_transport`, issue #48 / ADR-0005),
 guarded at startup by `check_mcp_mode` below the same way `AUTH_MODE=dev-headers` is guarded by
 `app.main.check_auth_mode`.
 
-Every tool resolves its context through `resolve_context()`, not `context_provider()` directly
-(Spec 9 / #69, ADR-0010): it builds the context, then checks suspension
+Every tool resolves its context through `resolve_context()`, never `_connection_context` or
+`_context_from_env` directly (Spec 9 / #69, ADR-0010, issue #89): it builds the context (per
+connection first, env fallback only under `stdio`), then checks suspension
 (`app.tenant_suspension.ensure_tenant_not_suspended`) before any tool body runs -- the MCP
 connection handler's own, independent check, alongside the HTTP API's (`app/deps.py`) and the
 agent-run entry points' (`app/agents/assistant.py`).
@@ -97,34 +101,38 @@ def _context_from_env() -> RequestContext:
 # rather than a mutable module-level value, so concurrent connections (each its own asyncio task
 # under Streamable HTTP) never see each other's tenant/identity -- the same isolation a per-request
 # FastAPI dependency gets for free, reproduced here since MCP tool functions take no request
-# object of their own to thread a context through.
+# object of their own to thread a context through. Read only from inside `resolve_context()`
+# below (issue #89) -- never a second name standing between it and a tool.
 _connection_context: contextvars.ContextVar[RequestContext | None] = contextvars.ContextVar(
     "mcp_connection_context", default=None
 )
 
 
-def _context_from_connection() -> RequestContext:
-    ctx = _connection_context.get()
-    if ctx is None:  # pragma: no cover - defensive; every request path sets it first
-        raise RuntimeError(
-            "No per-connection MCP context is set -- MCPTenantAuthMiddleware must authenticate "
-            "a connection before any tool call runs on it."
-        )
-    return ctx
-
-
-# The seam for production: replaced with `_context_from_connection` (per-connection, streamable
-# HTTP) or left as `_context_from_env` (stdio, development). Anything but the env fallback MUST be
-# per-connection — a process-wide identity on a shared transport would leak tenants.
-context_provider: Callable[[], RequestContext] = _context_from_env
-
-
 async def resolve_context() -> RequestContext:
-    """The MCP connection handler's own context resolution: builds the context, then rejects a
-    suspended tenant before any tool body runs (Spec 9 / #69, ADR-0010) -- see module docstring.
-    Every tool calls this, never `context_provider()` directly.
+    """The MCP connection handler's own context resolution (issue #89): every tool calls this,
+    never `_connection_context` directly.
+
+    Reads the per-connection contextvar first -- set by `MCPTenantAuthMiddleware` for the
+    lifetime of one `streamable-http` connection's request, module docstring above. Only when it
+    is unset *and* the active transport is `stdio` does this fall back to the process-wide
+    `MCP_TENANT_ID`/`MCP_IDENTITY_ID` development identity (`_context_from_env`); under
+    `streamable-http` an unset contextvar is a hard error -- never that fallback, which would let
+    every connection quietly act as one fixed identity in one fixed tenant (the exact leak the
+    contextvar exists to prevent, and `check_mcp_mode` below separately refuses to even start
+    with those two settings present under this transport).
+
+    Either way, rejects a suspended tenant before any tool body runs (Spec 9 / #69, ADR-0010).
     """
-    ctx = context_provider()
+    ctx = _connection_context.get()
+    if ctx is None:
+        settings = get_settings()
+        if settings.mcp_transport != "stdio":
+            raise RuntimeError(
+                "No per-connection MCP context is set -- MCPTenantAuthMiddleware must "
+                "authenticate a connection before any tool call runs on it. Under "
+                "MCP_TRANSPORT=streamable-http there is no environment fallback."
+            )
+        ctx = _context_from_env()
     await ensure_tenant_not_suspended(ctx.tenant_id)
     return ctx
 
@@ -308,7 +316,7 @@ def check_mcp_mode(settings: Settings) -> None:
     `app.main.check_auth_mode` (issue #48 / ADR-0005): the guardrail lives in code, not only in
     the docs.
 
-    Two independent failure modes:
+    Three independent failure modes:
 
     - The stdio transport's process-wide identity fallback (`_context_from_env`, above) is only
       reachable when `mcp_transport` is `stdio`. Exactly like `AUTH_MODE=dev-headers`, that
@@ -319,6 +327,13 @@ def check_mcp_mode(settings: Settings) -> None:
       (`jwt_verification_key`, the same signing configuration `app.token_verifier` checks
       connections against) -- regardless of environment, so a half-finished deployment can never
       silently serve every tenant's documents to whoever can open a connection.
+    - `streamable-http` is also refused outright if `MCP_TENANT_ID`/`MCP_IDENTITY_ID` are set at
+      all (issue #89): those two settings have no meaning under this transport --
+      `resolve_context()` above never reads them once a connection is authenticated -- but an
+      operator "fixing" an unrelated startup failure by setting them (as happened before this
+      guard existed) must never be allowed to start, since that configuration used to make every
+      authenticated connection act as one fixed identity in one fixed tenant regardless of who
+      actually connected: a cross-tenant leak, not a fallback.
     """
     if settings.mcp_transport == "stdio":
         if settings.environment not in ("dev", "test"):
@@ -330,6 +345,15 @@ def check_mcp_mode(settings: Settings) -> None:
                 "ENVIRONMENT=dev."
             )
         return
+    if settings.mcp_tenant_id or settings.mcp_identity_id:
+        raise RuntimeError(
+            "MCP_TRANSPORT=streamable-http must not have MCP_TENANT_ID/MCP_IDENTITY_ID set -- "
+            "under the networked transport every connection's identity comes from its own "
+            "verified bearer token (resolve_context() never reads these two settings here); "
+            "leaving them set is a leftover from local development that would previously have "
+            "made every authenticated connection act as this one fixed identity in this one "
+            "fixed tenant. Unset them."
+        )
     if settings.jwt_verification_key is None:
         raise RuntimeError(
             "MCP_TRANSPORT=streamable-http requires a configured token verifier "
