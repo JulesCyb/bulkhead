@@ -1,14 +1,18 @@
-"""Mint and revoke a tenant's gateway credential (Spec 7 / #53, ADR-0009, ADR-0011).
+"""Mint and revoke a tenant's gateway credential (Spec 7 / #53, ADR-0009, ADR-0011, #114).
 
 Two plain, importable functions -- `provision_gateway_credential` and
 `revoke_gateway_credential` -- with no operator-command wrapper of their own, kept usable
-standalone (e.g. a future `rotate` command). The operator tool's `create` command (Spec 9 / #70,
-`app/operator/create.py`) does not call `provision_gateway_credential` itself -- it needs the
-control-plane write, the membership write, and the credential mint to share one database
-transaction, which an engine-per-call function cannot join -- but reuses this module's lower-level
-primitives (`GatewayAdminClient`, `GatewayCredentialLimits`, `generate_gateway_credential_alias`,
-`write_gateway_credential_file`, `build_admin_client`) directly. `revoke_gateway_credential`
-remains the one call site for revocation (a future `erase` command's job, #9).
+standalone (e.g. a future `rotate` command). Both accept an already-open owner-role
+`AsyncConnection` (`conn=`) so a caller with its own transaction -- the operator tool's `create`
+command (Spec 9 / #70, `app/operator/create.py`) needs the control-plane write, the membership
+write, and the credential mint to share one transaction; `erase` (`app/operator/erase.py`) needs
+the same for revocation -- can join it instead of this module opening a second one; a caller with
+no transaction of its own (a future `rotate` command, a test) can instead pass `owner_engine=` (an
+already-built engine this module opens its own transaction on) or nothing at all (this module
+builds and disposes its own engine via `app.db.lifecycle.owner_engine`, from
+`app.migration_settings`). Exactly one of the three ever applies per call: see `_owner_connection`
+below. The admin-client lifecycle (build if not given, close if owned) lives once here too,
+reused by revocation the same way.
 
 Provisioning does three things, in order, for a given tenant id:
 
@@ -18,7 +22,8 @@ Provisioning does three things, in order, for a given tenant id:
 2. Writes the minted credential to the tenant's secret file (`app.gateway_credentials`'s own
    `gateway_credentials_dir`), named by a freshly generated alias.
 3. Records that alias in the control plane (`control.tenants.gateway_credential_alias`, #52),
-   through the owner role's write path (#12) -- the only role ever permitted to write there.
+   through `app.repositories.control.ControlRepository` -- the only module that issues SQL
+   against the control schema (#114) and the owner role's one write path (#12) onto it.
 
 Revocation reverses steps 2 and 3 and calls the gateway's own revoke operation once. A tenant
 with no credential recorded is a no-op, not an error: erasure and rotation both need to call
@@ -32,17 +37,20 @@ passed as `admin_client`.
 from __future__ import annotations
 
 import secrets
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
 
 import httpx
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from app.config import Settings, get_settings
+from app.db.lifecycle import owner_engine as _build_owner_engine_cm
 from app.gateway_credentials import GatewayCredentialUnavailable, read_gateway_credential
 from app.migration_settings import get_migration_settings
+from app.repositories.control import ControlRepository
 
 # There used to be a second, hand-maintained copy of the per-residency gateway model aliases
 # here (`GATEWAY_MODEL_ALIASES_BY_RESIDENCY`, a Python literal mirroring `config/residency.toml`'s
@@ -147,9 +155,11 @@ def _require_setting(value: str | None, name: str) -> str:
 
 def build_admin_client(settings: Settings) -> GatewayAdminClient:
     """Public (Spec 9 / #70): the operator tool's `create` command builds its own
-    `GatewayAdminClient` the same way this module's own orchestration functions do, but inline
-    within its own single database transaction rather than through `provision_gateway_credential`
-    (which manages its own engine/transaction and therefore cannot share one)."""
+    `GatewayAdminClient` this same way (a monkeypatchable module-level name a test replaces) when
+    the CLI gives it none, then passes that already-built client into
+    `provision_gateway_credential` (`admin_client=`) so exactly one client -- built once, closed
+    once, by `create_tenant` -- backs the whole call, never a second one this module would build
+    for itself."""
     base_url = _require_setting(settings.litellm_base_url, "LITELLM_BASE_URL")
     master_key = settings.litellm_master_key
     if master_key is None:
@@ -157,11 +167,6 @@ def build_admin_client(settings: Settings) -> GatewayAdminClient:
             "LITELLM_MASTER_KEY must be set to provision or revoke a gateway credential"
         )
     return GatewayAdminClient(base_url=base_url, master_key=master_key.get_secret_value())
-
-
-def _build_owner_engine() -> AsyncEngine:
-    dsn = get_migration_settings().database_url_migrations.get_secret_value()
-    return create_async_engine(dsn)
 
 
 def generate_gateway_credential_alias(tenant_id: UUID) -> str:
@@ -195,48 +200,27 @@ def remove_gateway_credential_file(alias: str, *, settings: Settings) -> None:
     path.unlink(missing_ok=True)
 
 
-async def _record_alias_in_control_plane(
-    tenant_id: UUID, alias: str | None, *, owner_engine: AsyncEngine
-) -> None:
-    """Write `alias` (or clear it, `None`) to `control.tenants.gateway_credential_alias` as the
-    owner role -- the only role ever permitted to write there (#12). `FORCE ROW LEVEL SECURITY`
-    (0001/0002) applies to the owner role too, so this still sets `app.tenant_id` to the target
-    tenant first, exactly as a real provisioning step must. `ON CONFLICT` covers both a tenant
-    provisioned for the first time (no `control.tenants` row yet) and re-provisioning/rotation of
-    one that already has a row.
-    """
-    async with owner_engine.begin() as conn:
-        await conn.execute(
-            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": str(tenant_id)}
-        )
-        await conn.execute(
-            text(
-                "INSERT INTO control.tenants (tenant_id, gateway_credential_alias) "
-                "VALUES (:tid, :alias) "
-                "ON CONFLICT (tenant_id) DO UPDATE "
-                "SET gateway_credential_alias = EXCLUDED.gateway_credential_alias"
-            ),
-            {"tid": tenant_id, "alias": alias},
-        )
-
-
-async def _read_alias_from_control_plane(
-    tenant_id: UUID, *, owner_engine: AsyncEngine
-) -> str | None:
-    """The alias currently recorded for `tenant_id`, or `None` if no `control.tenants` row
-    exists for it yet (never provisioned) or its alias column is unset (provisioned but revoked).
-    """
-    async with owner_engine.begin() as conn:
-        await conn.execute(
-            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": str(tenant_id)}
-        )
-        row = (
-            await conn.execute(
-                text("SELECT gateway_credential_alias FROM control.tenants WHERE tenant_id = :tid"),
-                {"tid": tenant_id},
-            )
-        ).first()
-    return row[0] if row and row[0] else None
+@asynccontextmanager
+async def _owner_connection(
+    conn: AsyncConnection | None, owner_engine: AsyncEngine | None
+) -> AsyncIterator[AsyncConnection]:
+    """Yields an owner-role `AsyncConnection` inside a transaction, from exactly one of three
+    sources, in this priority: `conn` (the caller's own already-open transaction -- `create`/
+    `erase` share theirs this way, #114) if given; else a transaction opened on `owner_engine` (the
+    caller built and disposes the engine itself, only the transaction is this module's); else a
+    fresh engine built from `app.migration_settings` via `app.db.lifecycle.owner_engine`, owned
+    (and disposed) for the duration of this one call -- the no-caller-transaction-at-all case (a
+    future `rotate` command, a standalone script)."""
+    if conn is not None:
+        yield conn
+        return
+    if owner_engine is not None:
+        async with owner_engine.begin() as owned_conn:
+            yield owned_conn
+        return
+    dsn = get_migration_settings().database_url_migrations.get_secret_value()
+    async with _build_owner_engine_cm(dsn) as engine, engine.begin() as owned_conn:
+        yield owned_conn
 
 
 async def provision_gateway_credential(
@@ -246,16 +230,17 @@ async def provision_gateway_credential(
     limits: GatewayCredentialLimits,
     settings: Settings | None = None,
     admin_client: GatewayAdminClient | None = None,
+    conn: AsyncConnection | None = None,
     owner_engine: AsyncEngine | None = None,
 ) -> str:
     """Mint `tenant_id` a gateway credential scoped to `limits` and `residency`'s model aliases,
-    write it to a fresh secret file, and record that file's alias in the control plane. Returns
-    the alias.
+    write it to a fresh secret file, and record that file's alias in the control plane through
+    `ControlRepository.write_gateway_credential_alias`. Returns the alias.
 
-    `admin_client`/`owner_engine` are the test seams: pass a fake or `httpx.MockTransport`-backed
-    `GatewayAdminClient` and/or an engine already pointed at a real owner-role connection. Left
-    unset, this builds real ones from `Settings`/`app.migration_settings`, exactly as the seed
-    script and a future operator tool do.
+    `admin_client` is the test seam: pass a fake or `httpx.MockTransport`-backed
+    `GatewayAdminClient`; left unset, this builds a real one from `Settings` and closes it here
+    too. `conn`/`owner_engine` pick the control-plane write's own connection -- see
+    `_owner_connection` above; leaving both unset builds and disposes a fresh owner-role engine.
     """
     settings = settings or get_settings()
     allow_list = settings.residency_allow_list
@@ -269,19 +254,16 @@ async def provision_gateway_credential(
 
     owns_admin_client = admin_client is None
     admin_client = admin_client or build_admin_client(settings)
-    owns_owner_engine = owner_engine is None
-    owner_engine = owner_engine or _build_owner_engine()
     try:
         credential = await admin_client.mint_key(tenant_id=tenant_id, limits=limits, models=models)
         alias = generate_gateway_credential_alias(tenant_id)
         write_gateway_credential_file(alias, credential, settings=settings)
-        await _record_alias_in_control_plane(tenant_id, alias, owner_engine=owner_engine)
+        async with _owner_connection(conn, owner_engine) as owner_conn:
+            await ControlRepository().write_gateway_credential_alias(owner_conn, tenant_id, alias)
         return alias
     finally:
         if owns_admin_client:
             await admin_client.aclose()
-        if owns_owner_engine:
-            await owner_engine.dispose()
 
 
 async def revoke_gateway_credential(
@@ -289,21 +271,24 @@ async def revoke_gateway_credential(
     *,
     settings: Settings | None = None,
     admin_client: GatewayAdminClient | None = None,
+    conn: AsyncConnection | None = None,
     owner_engine: AsyncEngine | None = None,
 ) -> bool:
     """Revoke `tenant_id`'s gateway credential: calls the gateway's revoke operation once,
-    removes the per-alias secret file, and clears the alias from the control plane.
+    removes the per-alias secret file, and clears the alias from the control plane through
+    `ControlRepository`.
 
     Returns `True` if a credential was actually revoked, `False` if none was recorded -- a
     tenant with no alias, or whose secret file is already gone, is a no-op, not an error. A
     second call for the same tenant always returns `False` and never calls the gateway again.
+    `conn`/`owner_engine` are the same test/composition seams `provision_gateway_credential` takes
+    -- see `_owner_connection`.
     """
     settings = settings or get_settings()
-    owns_owner_engine = owner_engine is None
-    owner_engine = owner_engine or _build_owner_engine()
     owns_admin_client = admin_client is None
     try:
-        alias = await _read_alias_from_control_plane(tenant_id, owner_engine=owner_engine)
+        async with _owner_connection(conn, owner_engine) as owner_conn:
+            alias = await ControlRepository().read_gateway_credential_alias(owner_conn, tenant_id)
         if alias is None:
             return False
 
@@ -317,10 +302,9 @@ async def revoke_gateway_credential(
             await admin_client.revoke_key(credential.get_secret_value())
 
         remove_gateway_credential_file(alias, settings=settings)
-        await _record_alias_in_control_plane(tenant_id, None, owner_engine=owner_engine)
+        async with _owner_connection(conn, owner_engine) as owner_conn:
+            await ControlRepository().write_gateway_credential_alias(owner_conn, tenant_id, None)
         return True
     finally:
         if owns_admin_client and admin_client is not None:
             await admin_client.aclose()
-        if owns_owner_engine:
-            await owner_engine.dispose()

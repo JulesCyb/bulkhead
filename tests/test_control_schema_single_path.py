@@ -1,22 +1,19 @@
-"""The single-path rule (spec A5 / #113, spec #95's Testing Decisions): no SQL string outside the
-control repository mentions the `control` schema. Parses every module under `app/` and `scripts/`
-with `ast` (never a text grep, which would also match a comment or a docstring quoting the same
-schema-qualified name -- see `app/db/session.py`'s own module docstring, `app/tenant_record.py`'s,
-etc.) and inspects only the string literals actually passed to a call named `text` (SQLAlchemy's
-`text()`, this codebase's only way to issue a raw statement).
+"""The single-path rule (spec A5 / #113, #114, spec #95's Testing Decisions): no SQL string
+outside the control repository mentions the `control` schema. Parses every module under `app/`
+and `scripts/` with `ast` (never a text grep, which would also match a comment or a docstring
+quoting the same schema-qualified name -- see `app/db/session.py`'s own module docstring,
+`app/tenant_record.py`'s, etc.) and inspects only the string literals actually passed to a call
+named `text` (SQLAlchemy's `text()`, this codebase's only way to issue a raw statement).
 
-No exemption for anything this ticket touched: `app/db/session.py` (the session router),
-`app/db/guard.py` (the guard), and `scripts/migrate.py` (the migration runner) all read through
-`ControlRepository` now and carry no SQL string of their own that names the schema.
+No exemption for anything #113/#114 touched: `app/db/session.py` (the session router),
+`app/db/guard.py` (the guard), `scripts/migrate.py` (the migration runner), every operator command
+(`create.py`, `erase.py`, `suspend.py`, `listing.py`, `lookup.py`, `audit.py`, `dedicated_db.py`),
+and `app/gateway_provisioning.py` all read and write the control schema through
+`ControlRepository` now and carry no SQL string of their own that names it.
 
-Three exemptions remain, exactly as spec A5 documents:
+One exemption remains, exactly as spec A5 documents:
 
 - `app/repositories/control.py` -- the repository itself, the one module allowed to.
-- `app/operator/` -- the operator commands (`create.py`, `erase.py`, `suspend.py`, `listing.py`,
-  `lookup.py`, `audit.py`, `dedicated_db.py`) still carry their own inline SQL against
-  `control.*`; rewiring them onto this repository is ticket #114 (A5-T2), not this one.
-- `app/gateway_provisioning.py` -- reads/writes `control.tenants.gateway_credential_alias`
-  directly (`_record_alias_in_control_plane`/`_read_alias_from_control_plane`); also #114's job.
 
 One more, pre-existing and unrelated to spec A5: `app/repositories/agent_identities.py` calls
 `control.create_agent_identity()` (ADR-0005, Spec 6 / #46) -- a different repository, for a
@@ -39,12 +36,9 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 _EXEMPT_FILES = {
     _REPO_ROOT / "app" / "repositories" / "control.py",
-    _REPO_ROOT / "app" / "gateway_provisioning.py",
     _REPO_ROOT / "app" / "repositories" / "agent_identities.py",
 }
-_EXEMPT_DIRS = {
-    _REPO_ROOT / "app" / "operator",
-}
+_EXEMPT_DIRS: set[Path] = set()
 
 
 def _is_exempt(path: Path) -> bool:
@@ -91,9 +85,8 @@ def test_no_sql_string_outside_the_control_repository_mentions_the_control_schem
     offenders = _offending_files()
     assert offenders == {}, (
         "the following file(s) issue SQL naming the `control` schema outside "
-        "app/repositories/control.py, app/operator/, app/gateway_provisioning.py, and "
-        "app/repositories/agent_identities.py (see this test's own module docstring for why "
-        "those four are exempt): " + repr(offenders)
+        "app/repositories/control.py and app/repositories/agent_identities.py (see this test's "
+        "own module docstring for why that second one is exempt): " + repr(offenders)
     )
 
 
