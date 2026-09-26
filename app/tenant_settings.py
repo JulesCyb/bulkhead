@@ -116,7 +116,9 @@ class TenantSettings(BaseModel):
     reopen that hole.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    # `frozen`: a validated settings object rides on the immutable `app.tenant_record.TenantRecord`
+    # for a whole request (#104) -- nothing may change it half-way through.
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     # `tenants.settings["model"]` (app/llm.py): per-tenant model override. Residency is not
     # here on purpose: it is an operator-owned control-plane fact (`control.tenants.residency`,

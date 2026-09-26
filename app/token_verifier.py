@@ -4,9 +4,14 @@ resolution factored out of `app/deps.py`'s `AUTH_MODE=jwt` branch into one modul
 reuse. Its caller is `app/context_resolution.py` (#101), the one chain every adapter (HTTP, and the
 MCP transport) resolves a request's context through.
 
-Deliberately excluded: tenant suspension. That is not one of the checks this module owns --
-`app/context_resolution.py` checks it right after this module's verification succeeds (issue #69,
-#101), so no adapter can obtain a context for a suspended tenant.
+Tenant suspension is decided here only when a caller asks for the tenant record
+(`read_tenant_record=True`, #104 -- `app/context_resolution.py` always does): the record is read
+right after the token's signature/issuer/expiry/audience verify (none of which touch the
+database, so an unauthenticated caller cannot make this module read the control plane) and before
+the identity and membership lookups; a suspended record raises `TenantSuspendedAtVerification`
+there, and an unsuspended one is handed to the membership lookup, whose tenant session routes from
+it instead of reading the control plane a second time. A caller that does not ask (the MCP
+middleware until #102) gets exactly the old chain, with no suspension check.
 
 **Gap fix (Spec 6, closing the loop between #46/#47 and this module).** An agent identity's token
 (minted by `app/agent_credential_exchange.py`) is *not* governed by a tenant's own human-IdP
@@ -44,15 +49,22 @@ from uuid import UUID
 import jwt as _pyjwt
 
 from app.context import RequestContext
-from app.db.session import control_session, tenant_session
+from app.db.session import (
+    TenantSuspendedError,
+    control_session,
+    tenant_record_session,
+    tenant_session,
+)
 from app.jwt_verifier import KeySource, TokenVerificationError, verify_token
 from app.repositories.control import (
+    ControlRepository,
     Identity,
     IdentityRepository,
     TenantAuthSettings,
     TenantAuthSettingsRepository,
 )
 from app.repositories.memberships import MembershipRepository
+from app.tenant_record import TenantRecord
 
 # (issuer) -> the algorithm(s) a token claiming that issuer may be verified with -- the algorithm
 # half of the same per-issuer pinning `KeySource` does for the verification key (see
@@ -132,12 +144,26 @@ class ResolvedIdentity:
     role: str
     issuer: str
     credential_public_id: str | None = None
+    tenant_record: TenantRecord | None = None
+    """The tenant record read during verification -- set exactly when the caller passed
+    `read_tenant_record=True` (#104); `None` otherwise."""
+
+
+class TenantSuspendedAtVerification(TenantSuspendedError):
+    """The tenant record read during `verify_tenant_token(..., read_tenant_record=True)` says the
+    tenant is suspended (#104). A `TenantSuspendedError` like any other, carrying the issuer the
+    token was verified against for the caller's security-event log line."""
+
+    def __init__(self, tenant_id: UUID, *, issuer: str) -> None:
+        super().__init__(tenant_id)
+        self.issuer = issuer
 
 
 class ControlPlaneReads(Protocol):
     """The one seam through which `verify_tenant_token` (and `app.tenant_suspension.
     ensure_tenant_not_suspended`) reach a tenant's auth settings, an identity, and a membership
-    role (#100) -- never a repository class or a session function imported directly. Every method
+    role (#100), and through which `app.context_resolution` reads the tenant record (#104) --
+    never a repository class or a session function imported directly. Every method
     takes plain ids/strings and returns a plain value, never a session: an implementation owns its
     own session/transaction, whatever that means for it (a real database, an in-memory dict for a
     test)."""
@@ -150,7 +176,19 @@ class ControlPlaneReads(Protocol):
         self, *, tenant_id: UUID, default_issuer: str | None = None
     ) -> TenantAuthSettings | None: ...
 
-    async def get_membership_role(self, *, tenant_id: UUID, identity_id: UUID) -> str | None: ...
+    async def get_membership_role(
+        self, *, tenant_id: UUID, identity_id: UUID, tenant_record: TenantRecord | None = None
+    ) -> str | None:
+        """The identity's role in `tenant_id`, or `None`. `tenant_record`, when given (#104), is
+        the record this request already read: the lookup routes by it and reads no control-plane
+        row of its own."""
+        ...
+
+    async def get_tenant_record(self, *, tenant_id: UUID) -> TenantRecord:
+        """`tenant_id`'s control-plane record and settings (#104, `app.tenant_record`), read
+        once per request by `app.context_resolution`. Never `None`: a tenant the control plane
+        has no row for is the pooled default record."""
+        ...
 
 
 class RepositoryControlPlaneReads:
@@ -176,16 +214,28 @@ class RepositoryControlPlaneReads:
                 session, tenant_id=tenant_id, default_issuer=default_issuer
             )
 
-    async def get_membership_role(self, *, tenant_id: UUID, identity_id: UUID) -> str | None:
+    async def get_membership_role(
+        self, *, tenant_id: UUID, identity_id: UUID, tenant_record: TenantRecord | None = None
+    ) -> str | None:
         # A minimal, role-free context exists only to open the tenant-bound session -- never
         # returned or exposed to a caller (issue #91 story 23: an internal detail of this module).
+        # Carrying the request's record, `tenant_session` routes from it without a read (#104).
         preliminary_ctx = RequestContext(
-            tenant_id=tenant_id, identity_id=identity_id, roles=frozenset()
+            tenant_id=tenant_id,
+            identity_id=identity_id,
+            roles=frozenset(),
+            tenant_record=tenant_record,
         )
         async with tenant_session(preliminary_ctx) as session:
             return await MembershipRepository().get_role(
                 session, preliminary_ctx, identity_id=identity_id
             )
+
+    async def get_tenant_record(self, *, tenant_id: UUID) -> TenantRecord:
+        # One transaction on the pooled database, `app.tenant_id` set for it alone: the view and
+        # the settings row read together (#104).
+        async with tenant_record_session(tenant_id) as session:
+            return await ControlRepository().get_tenant_record(session, tenant_id=tenant_id)
 
 
 # Test-only override installed via `set_default_adapter_for_tests` below -- `None` means "use the
@@ -221,6 +271,7 @@ async def verify_tenant_token(
     default_issuer: str | None,
     algorithm_source: AlgorithmSource,
     adapter: ControlPlaneReads | None = None,
+    read_tenant_record: bool = False,
 ) -> ResolvedIdentity:
     """Verify `token` against `tenant_id` and resolve it to an identity and its membership.
 
@@ -241,9 +292,13 @@ async def verify_tenant_token(
     unless a test has installed an override via `set_default_adapter_for_tests`). A caller never
     needs to pass it explicitly outside a test.
 
+    `read_tenant_record=True` (#104) reads the tenant record between the audience check and the
+    identity lookup, raises `TenantSuspendedAtVerification` if it is suspended, routes the
+    membership lookup by it, and returns it on `ResolvedIdentity.tenant_record` -- see module
+    docstring. Without it, suspension is never checked here.
+
     Raises `TenantTokenVerificationError` with a single categorized reason on the first check
-    that fails; returns the resolved identity and role on success. Never checks suspension --
-    see module docstring.
+    that fails; returns the resolved identity and role on success.
     """
     adapter = adapter if adapter is not None else default_adapter()
 
@@ -274,6 +329,12 @@ async def verify_tenant_token(
             VerificationFailureReason.AUDIENCE_MISMATCH, issuer=expected_issuer
         )
 
+    tenant_record: TenantRecord | None = None
+    if read_tenant_record:
+        tenant_record = await adapter.get_tenant_record(tenant_id=tenant_id)
+        if tenant_record.suspended:
+            raise TenantSuspendedAtVerification(tenant_id, issuer=expected_issuer)
+
     identity = await adapter.find_identity_by_issuer_and_subject(
         issuer=expected_issuer, subject=claims.subject
     )
@@ -282,7 +343,9 @@ async def verify_tenant_token(
             VerificationFailureReason.UNKNOWN_IDENTITY, issuer=expected_issuer
         )
 
-    role = await adapter.get_membership_role(tenant_id=tenant_id, identity_id=identity.id)
+    role = await adapter.get_membership_role(
+        tenant_id=tenant_id, identity_id=identity.id, tenant_record=tenant_record
+    )
     if role is None:
         raise TenantTokenVerificationError(
             VerificationFailureReason.MISSING_MEMBERSHIP, issuer=expected_issuer
@@ -293,4 +356,5 @@ async def verify_tenant_token(
         role=role,
         issuer=expected_issuer,
         credential_public_id=claims.extra.get("cred"),
+        tenant_record=tenant_record,
     )
