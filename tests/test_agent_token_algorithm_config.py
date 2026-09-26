@@ -13,7 +13,8 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from pydantic import ValidationError
 
-from app.config import MIN_HS_SECRET_BYTES, Settings
+from app.config import Settings
+from app.jwt_verifier import MIN_HS_SECRET_BYTES
 
 _BASE_FIELDS = dict(
     _env_file=None,

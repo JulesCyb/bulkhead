@@ -22,7 +22,8 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from app.config import ROLE_STATEMENT_TIMEOUT_MS, Settings
+from app.config import Settings
+from app.db.guard import ROLE_STATEMENT_TIMEOUT_MS
 from app.gateway_provisioning import GatewayAdminClient
 from app.operator.create import create_tenant
 from app.operator.erase import EraseResult, TenantNotSuspendedError, erase_tenant, record_erasure

@@ -29,7 +29,7 @@ from urllib.parse import parse_qs, urlparse
 import pgserver
 import pytest
 
-from app.config import ROLE_STATEMENT_TIMEOUT_MS
+from app.db.guard import ROLE_STATEMENT_TIMEOUT_MS
 
 ROLE_BOOTSTRAP_SQL = (
     "CREATE EXTENSION IF NOT EXISTS vector; "

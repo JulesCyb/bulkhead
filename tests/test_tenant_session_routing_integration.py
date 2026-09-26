@@ -40,7 +40,7 @@ def _psql(server, command: str) -> None:
 def _bootstrap_and_migrate(server) -> dict[str, str]:
     """Mirrors docker/postgres/01-init.sh + `alembic upgrade head` (see test_rls_integration.py)
     against one ephemeral instance, returning its owner/app connection strings."""
-    from app.config import ROLE_STATEMENT_TIMEOUT_MS
+    from app.db.guard import ROLE_STATEMENT_TIMEOUT_MS
 
     sockdir = parse_qs(urlparse(server.get_uri()).query)["host"][0]
     _psql(

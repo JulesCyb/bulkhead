@@ -367,25 +367,15 @@ def test_residency_doc_claim_names_what_the_code_actually_enforces() -> None:
     assert "default `False`" in RESIDENCY_MD
 
 
-def test_residency_doc_sub_processor_list_matches_the_allow_list_object() -> None:
-    # Every host the allow-list object actually contains is named in the doc -- not a hand-copied
-    # second list that could silently drift from it.
+def test_residency_doc_table_matches_the_rendered_allow_list() -> None:
+    # spec A4 / #94, #112: the sub-processor table in docs/residency.md is generated from
+    # `ResidencyAllowList` by scripts/render_residency_table.py, not hand-maintained -- compare
+    # the doc's marked section against a fresh rendering (data, not a hand-copied list of
+    # per-residency assertions) so the two can never silently drift apart.
+    from scripts.render_residency_table import extract_section, render_section
+
     allow_list = ResidencyAllowList.load()
-    for residency in allow_list.residencies:
-        route = allow_list.route_for(residency)
-        assert residency in RESIDENCY_MD, f"residency {residency!r} not named in docs/residency.md"
-        assert route.trace_sink_host in RESIDENCY_MD, (
-            f"trace sink host {route.trace_sink_host!r} for {residency!r} not named in the doc"
-        )
-        embedding_host = route.embedding_endpoint.split("//", 1)[-1].split("/", 1)[0]
-        assert embedding_host in RESIDENCY_MD, (
-            f"embedding endpoint host {embedding_host!r} for {residency!r} not named in the doc"
-        )
-        for pattern in route.model_host_patterns:
-            bare_domain = pattern.lstrip("*.")
-            assert bare_domain in RESIDENCY_MD, (
-                f"model host domain {bare_domain!r} for {residency!r} not named in the doc"
-            )
+    assert extract_section(RESIDENCY_MD) == render_section(allow_list)
 
 
 def test_residency_doc_has_a_worked_second_residency_recipe() -> None:

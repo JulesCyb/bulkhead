@@ -16,7 +16,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from app.config import ROLE_CONNECTION_LIMIT, ROLE_STATEMENT_TIMEOUT_MS
+from app.db.guard import ROLE_CONNECTION_LIMIT, ROLE_STATEMENT_TIMEOUT_MS
 
 pgserver = pytest.importorskip("pgserver")
 

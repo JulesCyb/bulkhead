@@ -31,6 +31,38 @@ from jwt import PyJWTError
 KeySource = Callable[[str, str | None], Any]
 
 
+# Algorithm-confusion guard, shared by `Settings.jwt_algorithm` and `Settings.agent_token_
+# algorithm` (relocated here by spec A4 / #94, #112: this is the pure JWT module, the natural
+# home for "which algorithms this codebase ever signs or verifies with" -- `app/config.py`'s
+# validators import these to check a deployment's configured algorithms before this module ever
+# sees a token). Every algorithm PyJWT's `cryptography` backend supports for signing --
+# deliberately never includes "none" or an empty string, so `Settings` construction itself is the
+# first place a downgrade-to-unsigned configuration is refused, before `verify_token` (which also
+# never accepts "none" -- it always passes an explicit `algorithms` allow-list to `jwt.decode`)
+# ever sees a token.
+SUPPORTED_JWT_ALGORITHMS = frozenset(
+    {
+        "HS256",
+        "HS384",
+        "HS512",
+        "RS256",
+        "RS384",
+        "RS512",
+        "ES256",
+        "ES384",
+        "ES512",
+        "PS256",
+        "PS384",
+        "PS512",
+    }
+)
+HS_ALGORITHMS = frozenset({"HS256", "HS384", "HS512"})
+# NIST SP 800-107 / RFC 2104: an HMAC key shorter than its hash's output size is weaker than the
+# hash offers -- 32 bytes is the floor for every HS* algorithm above (HS256's own digest size),
+# so one constant covers all three rather than sizing per algorithm.
+MIN_HS_SECRET_BYTES = 32
+
+
 class TokenVerificationError(Exception):
     """Every reason a bearer token fails verification: bad signature, expired, wrong issuer,
     malformed, or missing claims. Callers map this to 401 Unauthorized. The message is for logs

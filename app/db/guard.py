@@ -36,6 +36,16 @@ from app.db.models import TENANT_ISOLATION_EXCEPTIONS
 log = logging.getLogger(__name__)
 
 
+# Role-level settings for the `app` role (Spec 7 / #55; relocated next to this guard, the
+# module that actually cares about the `app` role's privileges, by spec A4 / #94, #112): applied
+# once in docker/postgres/01-init.sh, mirrored here so the embedded-Postgres integration test can
+# assert them without duplicating literals. Independent of `Settings.db_statement_timeout_ms`
+# (`app/config.py`), which is the per-transaction timeout the application sets on every
+# tenant_session().
+ROLE_STATEMENT_TIMEOUT_MS = 60_000
+ROLE_CONNECTION_LIMIT = 50
+
+
 class PrivilegedRoleOrMissingRLSError(RuntimeError):
     """The connected role is privileged (superuser/BYPASSRLS), or a table in the `public` schema
     lacks forced Row-Level Security. The message never names the offending role or table — those

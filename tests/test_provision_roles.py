@@ -107,7 +107,7 @@ async def test_creates_app_owner_and_app_roles_matching_init_script(admin_url):
 
 
 async def test_app_statement_timeout_matches_role_bootstrap(admin_url):
-    from app.config import ROLE_STATEMENT_TIMEOUT_MS
+    from app.db.guard import ROLE_STATEMENT_TIMEOUT_MS
 
     await provision(admin_url)
 
