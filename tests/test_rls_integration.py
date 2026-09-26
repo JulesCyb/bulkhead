@@ -6,15 +6,19 @@ app works as the `app` role (no superuser, NOBYPASSRLS), and that the role boots
 superuser or holds BYPASSRLS, `app_owner` owns the schema and runs the whole migration suite,
 a freshly created table grants `app` nothing until a migration says so explicitly, and `app`'s
 statement timeout matches the role-level setting the bootstrap script configures.
+
+Seeding: the shared `cluster`/`environment` fixtures and `seed_tenant`/`seed_membership` (issue
+#96 / spec #90 "A6"), exactly like every other integration file. Most tests below only need a
+bare tenant id or two (`seed_tenant(environment, via_operator=False)`); a handful that assert on
+a document's own title, embedding, or search ranking, or that plant a specific control-plane or
+pending-action edge case, keep that setup as test-local raw SQL -- the RLS policy or invariant
+under test *is* that raw SQL, not scaffolding around it (ticket #99's own carve-out for this
+file).
 """
 
 from __future__ import annotations
 
-import os
 import re
-import subprocess
-import sys
-import tempfile
 import uuid
 from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlparse
@@ -27,128 +31,56 @@ from app.db.guard import ROLE_STATEMENT_TIMEOUT_MS  # noqa: E402
 
 pgserver = pytest.importorskip("pgserver")
 
+from tests.support import (  # noqa: E402
+    cluster,
+    environment,
+    seed_conversation,
+    seed_document,
+    seed_membership,
+    seed_tenant,
+    vector_literal,
+)
+
+_ = (cluster, environment)
+
 DIM = 1536
 
 
-def _vec(seed: float) -> str:
-    values = [0.0] * DIM
-    values[0] = 1.0
-    values[1] = seed
-    return "[" + ",".join(f"{v:.3f}" for v in values) + "]"
-
-
-def _psql(server, command: str) -> None:
-    """`server.psql` without a shell: pgserver's own version breaks on paths with spaces."""
-    from pgserver.postgres_server import POSTGRES_BIN_PATH
-
-    subprocess.run(
-        [str(POSTGRES_BIN_PATH / "psql"), server.get_uri()],
-        input=command.encode(),
-        check=True,
-        capture_output=True,
-    )
-
-
-@pytest.fixture(scope="module")
-def database_urls():
-    """Mirrors docker/postgres/01-init.sh: the cluster's own bootstrap superuser (here,
-    pgserver's default `postgres` role) creates the extension once, then `app_owner` (owns the
-    schema, runs every migration) and `app` (unchanged: no superuser, NOBYPASSRLS, a statement
-    timeout), with no default privileges on future tables for either.
-    """
-    pgdata = tempfile.mkdtemp(prefix="pgdata-")
-    server = pgserver.get_server(pgdata, cleanup_mode="delete")
-    sockdir = parse_qs(urlparse(server.get_uri()).query)["host"][0]
-    _psql(
-        server,
-        "CREATE EXTENSION IF NOT EXISTS vector; "
-        "CREATE ROLE app_owner LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE; "
-        "ALTER SCHEMA public OWNER TO app_owner; "
-        "GRANT CREATE ON DATABASE postgres TO app_owner; "
-        "CREATE ROLE app LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE; "
-        "GRANT USAGE ON SCHEMA public TO app; "
-        f"ALTER ROLE app SET statement_timeout = '{ROLE_STATEMENT_TIMEOUT_MS}ms';",
-    )
-    urls = {
-        # The owner role: the only one migrations, seeding, and this fixture's own schema
-        # setup connect as — never the cluster superuser.
-        "migrations": f"postgresql+asyncpg://app_owner@/postgres?host={sockdir}",
-        "app": f"postgresql+asyncpg://app@/postgres?host={sockdir}",
-        # Test-only: `app_owner` does not bypass RLS (FORCE ROW LEVEL SECURITY applies to it
-        # like any other non-superuser), so seeding test fixtures without a tenant context
-        # needs the real superuser, exactly like production never would.
-        "superuser": f"postgresql+asyncpg://postgres@/postgres?host={sockdir}",
-    }
-    env = {**os.environ, "DATABASE_URL_MIGRATIONS": urls["migrations"], "DATABASE_URL": urls["app"]}
-    subprocess.run(
-        [sys.executable, "-m", "alembic", "upgrade", "head"], check=True, env=env, timeout=120
-    )
-    yield urls
-    server.cleanup()
-
-
-@pytest.fixture
-def app_settings(database_urls, monkeypatch):
-    from app import config
-    from app.db import session as db_session
-
-    monkeypatch.setenv("DATABASE_URL", database_urls["app"])
-    monkeypatch.setenv("DATABASE_URL_MIGRATIONS", database_urls["migrations"])
-    config.get_settings.cache_clear()
-    db_session._engine = None
-    db_session._session_factory = None
-    yield
-    config.get_settings.cache_clear()
-    db_session._engine = None
-    db_session._session_factory = None
-
-
-async def _seed(url: str) -> tuple[uuid.UUID, uuid.UUID]:
-    """Two tenants with one document each — as the owner; without context RLS blocks all.
-
-    Documents' created_by/updated_by (#29) are NOT NULL foreign keys to control.identities,
-    defaulted from the session's app.identity_id -- so seeding needs a real identity row and
-    that setting in scope before the INSERTs, exactly like a real tenant_session() would supply.
-    """
-    engine = create_async_engine(url)
-    tenant_a, tenant_b = uuid.uuid4(), uuid.uuid4()
-    seed_identity = uuid.uuid4()
-    async with engine.begin() as conn:
-        await conn.execute(
-            text("INSERT INTO control.identities (id, issuer, subject) VALUES (:id, 'seed', :sub)"),
-            {"id": seed_identity, "sub": str(seed_identity)},
-        )
-        await conn.execute(
-            text("SELECT set_config('app.identity_id', :iid, true)"),
-            {"iid": str(seed_identity)},
-        )
-        for tenant_id, name, seed in ((tenant_a, "A", 0.1), (tenant_b, "B", 0.9)):
-            await conn.execute(
-                text("INSERT INTO tenants (id, name) VALUES (:id, :name)"),
-                {"id": tenant_id, "name": name},
-            )
-            await conn.execute(
-                text(
-                    "INSERT INTO documents (tenant_id, title, content, embedding) "
-                    "VALUES (:tid, :title, :content, CAST(:emb AS vector))"
-                ),
-                {
-                    "tid": tenant_id,
-                    "title": f"Document {name}",
-                    "content": f"Content of tenant {name}",
-                    "emb": _vec(seed),
-                },
-            )
-    await engine.dispose()
-    return tenant_a, tenant_b
-
-
-async def test_search_sees_only_own_tenant(app_settings, database_urls):
+async def test_search_sees_only_own_tenant(environment):
     from app.context import RequestContext
     from app.db.session import tenant_session
     from app.repositories.documents import DocumentRepository
 
-    tenant_a, tenant_b = await _seed(database_urls["superuser"])
+    tenant_a_seed = await seed_tenant(environment, via_operator=False)
+    tenant_b_seed = await seed_tenant(environment, via_operator=False)
+    tenant_a, tenant_b = tenant_a_seed.tenant_id, tenant_b_seed.tenant_id
+    for seeded, label, vec_seed in ((tenant_a_seed, "A", 0.1), (tenant_b_seed, "B", 0.9)):
+        async with seeded.superuser_connection() as conn:
+            async with conn.begin():
+                identity_id = uuid.uuid4()
+                await conn.execute(
+                    text(
+                        "INSERT INTO control.identities (id, issuer, subject) "
+                        "VALUES (:id, 'seed', :sub)"
+                    ),
+                    {"id": identity_id, "sub": str(identity_id)},
+                )
+                await conn.execute(
+                    text("SELECT set_config('app.identity_id', :iid, true)"),
+                    {"iid": str(identity_id)},
+                )
+                await conn.execute(
+                    text(
+                        "INSERT INTO documents (tenant_id, title, content, embedding) "
+                        "VALUES (:tid, :title, :content, CAST(:emb AS vector))"
+                    ),
+                    {
+                        "tid": seeded.tenant_id,
+                        "title": f"Document {label}",
+                        "content": f"Content of tenant {label}",
+                        "emb": vector_literal(vec_seed),
+                    },
+                )
     query = [0.0] * DIM
     query[0] = 1.0
 
@@ -163,74 +95,30 @@ async def test_search_sees_only_own_tenant(app_settings, database_urls):
     assert [h.title for h in hits] == ["Document B"]
 
 
-async def _seed_tenant_with_memberships_of_every_role(
-    url: str,
-) -> tuple[uuid.UUID, dict[str, uuid.UUID]]:
-    """One tenant, one document, and one membership per legal role (#30 / S3-T5) -- the fixture
-    the visibility-regression test needs: a real `memberships` row (not a hand-built context) for
-    each of `admin`, `member`, `support`, `agent`, all in the same tenant, all pointing at their
-    own `control.identities` row (the document's own `created_by` seam, #29)."""
-    from app.context import ROLES
-
-    engine = create_async_engine(url)
-    tenant_id = uuid.uuid4()
-    identities_by_role: dict[str, uuid.UUID] = {}
-    async with engine.begin() as conn:
-        await conn.execute(
-            text("INSERT INTO tenants (id, name) VALUES (:id, 'Visibility')"), {"id": tenant_id}
-        )
-        for role in sorted(ROLES):
-            identity_id = uuid.uuid4()
-            await conn.execute(
-                text(
-                    "INSERT INTO control.identities (id, issuer, subject) "
-                    "VALUES (:id, 'seed', :sub)"
-                ),
-                {"id": identity_id, "sub": str(identity_id)},
-            )
-            await conn.execute(
-                text(
-                    "INSERT INTO memberships (tenant_id, identity_id, role) "
-                    "VALUES (:tid, :iid, :role)"
-                ),
-                {"tid": tenant_id, "iid": identity_id, "role": role},
-            )
-            identities_by_role[role] = identity_id
-
-        # Seed the document as the admin identity -- created_by/updated_by (#29) need a real
-        # session identity, and which one seeds it is irrelevant to the property under test.
-        await conn.execute(
-            text("SELECT set_config('app.identity_id', :iid, true)"),
-            {"iid": str(identities_by_role["admin"])},
-        )
-        await conn.execute(
-            text(
-                "INSERT INTO documents (tenant_id, title, content, embedding) "
-                "VALUES (:tid, :title, :content, CAST(:emb AS vector))"
-            ),
-            {
-                "tid": tenant_id,
-                "title": "Shared Document",
-                "content": "Visible to every role in this tenant",
-                "emb": _vec(0.5),
-            },
-        )
-    await engine.dispose()
-    return tenant_id, identities_by_role
-
-
-async def test_roles_never_affect_document_visibility(app_settings, database_urls):
+async def test_roles_never_affect_document_visibility(environment):
     """#30 (S3-T5) AC1: the regression guard for ADR-0004's "roles gate actions, never
     visibility" -- memberships of all four roles in the same tenant, resolved from real
     `memberships` rows through the embedded-Postgres seam, get identical `search_documents`
     results over the same tenant's documents."""
-    from app.context import RequestContext
+    from app.context import ROLES, RequestContext
     from app.db.session import tenant_session
     from app.repositories.documents import DocumentRepository
     from app.repositories.memberships import MembershipRepository
 
-    tenant_id, identities_by_role = await _seed_tenant_with_memberships_of_every_role(
-        database_urls["superuser"]
+    # One tenant with a real `memberships` row (not a hand-built context) for each of `admin`,
+    # `member`, `support`, `agent`, all pointing at their own `control.identities` row (the
+    # document's own `created_by` seam, #29) -- and one document, seeded as the admin identity,
+    # visibility of which is the property under test.
+    seeded = await seed_tenant(environment, roles=sorted(ROLES), via_operator=False)
+    tenant_id = seeded.tenant_id
+    identities_by_role = seeded.identities
+    await seed_document(
+        environment,
+        tenant_id=tenant_id,
+        identity_id=identities_by_role["admin"],
+        title="Shared Document",
+        content="Visible to every role in this tenant",
+        embedding=vector_literal(0.5),
     )
     query = [0.0] * DIM
     query[0] = 1.0
@@ -260,13 +148,15 @@ async def test_roles_never_affect_document_visibility(app_settings, database_url
     )
 
 
-async def test_insert_for_other_tenant_is_rejected(app_settings, database_urls):
+async def test_insert_for_other_tenant_is_rejected(environment):
     from sqlalchemy.exc import DBAPIError
 
     from app.context import RequestContext
     from app.db.session import tenant_session
 
-    tenant_a, tenant_b = await _seed(database_urls["superuser"])
+    tenant_a = (await seed_tenant(environment, via_operator=False)).tenant_id
+
+    tenant_b = (await seed_tenant(environment, via_operator=False)).tenant_id
     ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
     with pytest.raises(DBAPIError):
         async with tenant_session(ctx_a) as session:
@@ -279,7 +169,7 @@ async def test_insert_for_other_tenant_is_rejected(app_settings, database_urls):
             )
 
 
-async def test_app_role_cannot_delete_tenants(app_settings, database_urls):
+async def test_app_role_cannot_delete_tenants(environment):
     """The migration revokes INSERT/DELETE on tenants from the app role — a DELETE would
     cascade an entire tenant away in one statement."""
     from sqlalchemy.exc import DBAPIError, ProgrammingError
@@ -287,31 +177,14 @@ async def test_app_role_cannot_delete_tenants(app_settings, database_urls):
     from app.context import RequestContext
     from app.db.session import tenant_session
 
-    tenant_a, _ = await _seed(database_urls["superuser"])
+    tenant_a = (await seed_tenant(environment, via_operator=False)).tenant_id
     ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
     with pytest.raises((DBAPIError, ProgrammingError)):
         async with tenant_session(ctx_a) as session:
             await session.execute(text("DELETE FROM tenants WHERE id = :tid"), {"tid": tenant_a})
 
 
-async def _create_tenant_and_identity(url: str) -> tuple[uuid.UUID, uuid.UUID]:
-    """A bare tenant and a real control.identities row — for the document audit-column tests
-    (#29), whose created_by/updated_by are NOT NULL foreign keys to control.identities."""
-    engine = create_async_engine(url)
-    tenant_id, identity_id = uuid.uuid4(), uuid.uuid4()
-    async with engine.begin() as conn:
-        await conn.execute(
-            text("INSERT INTO tenants (id, name) VALUES (:id, 'Audit')"), {"id": tenant_id}
-        )
-        await conn.execute(
-            text("INSERT INTO control.identities (id, issuer, subject) VALUES (:id, 'seed', :sub)"),
-            {"id": identity_id, "sub": str(identity_id)},
-        )
-    await engine.dispose()
-    return tenant_id, identity_id
-
-
-async def test_document_insert_sets_created_by_from_session_identity(app_settings, database_urls):
+async def test_document_insert_sets_created_by_from_session_identity(environment):
     """#29 AC1: inserting a document through the tenant-bound session sets created_by (and
     updated_by, on first write) to the session's identity without application code passing it
     explicitly -- DocumentRepository.add() never mentions the column."""
@@ -319,7 +192,9 @@ async def test_document_insert_sets_created_by_from_session_identity(app_setting
     from app.db.session import tenant_session
     from app.repositories.documents import DocumentRepository
 
-    tenant_id, identity_id = await _create_tenant_and_identity(database_urls["superuser"])
+    _seeded = await seed_tenant(environment, roles=["member"], via_operator=False)
+
+    tenant_id, identity_id = _seeded.tenant_id, _seeded.identities["member"]
     ctx = RequestContext(tenant_id=tenant_id, identity_id=identity_id)
     async with tenant_session(ctx) as session:
         doc = await DocumentRepository().add(session, ctx, title="t", content="c", embedding=None)
@@ -327,7 +202,7 @@ async def test_document_insert_sets_created_by_from_session_identity(app_setting
 
     # Re-read the row directly: the property under test is what the database persisted, not
     # what the ORM's local object happens to reflect.
-    engine = create_async_engine(database_urls["superuser"])
+    engine = create_async_engine(environment.superuser_url)
     async with engine.connect() as conn:
         row = (
             await conn.execute(
@@ -340,17 +215,18 @@ async def test_document_insert_sets_created_by_from_session_identity(app_setting
     assert row.updated_by == identity_id
 
 
-async def test_document_update_refreshes_updated_by_and_keeps_created_by(
-    app_settings, database_urls
-):
+async def test_document_update_refreshes_updated_by_and_keeps_created_by(environment):
     """#29 AC2: updating a document in a second transaction with a different session identity
     changes updated_by/updated_at, while the original creator (created_by) stays unchanged."""
     from app.context import RequestContext
     from app.db.session import tenant_session
     from app.repositories.documents import DocumentRepository
 
-    tenant_id, creator_id = await _create_tenant_and_identity(database_urls["superuser"])
-    _, editor_id = await _create_tenant_and_identity(database_urls["superuser"])
+    _seeded = await seed_tenant(environment, roles=["member"], via_operator=False)
+
+    tenant_id, creator_id = _seeded.tenant_id, _seeded.identities["member"]
+    _seeded = await seed_tenant(environment, roles=["member"], via_operator=False)
+    _, editor_id = _seeded.tenant_id, _seeded.identities["member"]
 
     creator_ctx = RequestContext(tenant_id=tenant_id, identity_id=creator_id)
     async with tenant_session(creator_ctx) as session:
@@ -365,7 +241,7 @@ async def test_document_update_refreshes_updated_by_and_keeps_created_by(
             text("UPDATE documents SET title = 'updated' WHERE id = :id"), {"id": doc_id}
         )
 
-    engine = create_async_engine(database_urls["superuser"])
+    engine = create_async_engine(environment.superuser_url)
     async with engine.connect() as conn:
         row = (
             await conn.execute(
@@ -382,7 +258,7 @@ async def test_document_update_refreshes_updated_by_and_keeps_created_by(
     assert row.updated_at > row.created_at
 
 
-async def test_document_created_by_fk_checked_as_owner_not_app_role(app_settings, database_urls):
+async def test_document_created_by_fk_checked_as_owner_not_app_role(environment):
     """#29 AC3: the creator FK resolves against control.identities even though the app role's
     only grant on it is the narrow issuer-plus-subject lookup view (ADR-0003) -- app has no
     grant at all on control.identities itself. Proves the FK is checked with the referenced
@@ -394,9 +270,11 @@ async def test_document_created_by_fk_checked_as_owner_not_app_role(app_settings
     from app.db.session import tenant_session
     from app.repositories.documents import DocumentRepository
 
-    tenant_id, identity_id = await _create_tenant_and_identity(database_urls["superuser"])
+    _seeded = await seed_tenant(environment, roles=["member"], via_operator=False)
 
-    engine = create_async_engine(database_urls["app"])
+    tenant_id, identity_id = _seeded.tenant_id, _seeded.identities["member"]
+
+    engine = create_async_engine(environment.app_url)
     async with engine.connect() as conn:
         grants = (
             await conn.execute(
@@ -415,7 +293,7 @@ async def test_document_created_by_fk_checked_as_owner_not_app_role(app_settings
         doc = await DocumentRepository().add(session, ctx, title="t", content="c", embedding=None)
         doc_id = doc.id
 
-    engine = create_async_engine(database_urls["superuser"])
+    engine = create_async_engine(environment.superuser_url)
     async with engine.connect() as conn:
         created_by = (
             await conn.execute(
@@ -433,7 +311,7 @@ async def test_document_created_by_fk_checked_as_owner_not_app_role(app_settings
             )
 
 
-async def test_tenant_session_sets_identity_id(app_settings, database_urls):
+async def test_tenant_session_sets_identity_id(environment):
     """The new session-setting name is set and readable — no policy reads it yet (Spec 3's job)."""
     from app.context import RequestContext
     from app.db.session import tenant_session
@@ -447,17 +325,17 @@ async def test_tenant_session_sets_identity_id(app_settings, database_urls):
     assert value == str(identity_id)
 
 
-async def test_no_context_means_no_rows(app_settings, database_urls):
+async def test_no_context_means_no_rows(environment):
     """Without set_config, current_setting is NULL -> the policy blocks all (app role)."""
-    await _seed(database_urls["superuser"])
-    engine = create_async_engine(database_urls["app"])
+    await seed_tenant(environment, documents=1, via_operator=False)
+    engine = create_async_engine(environment.app_url)
     async with engine.connect() as conn:
         count = (await conn.execute(text("SELECT count(*) FROM documents"))).scalar_one()
     await engine.dispose()
     assert count == 0
 
 
-async def test_pool_checkin_clears_leftover_tenant_context(app_settings):
+async def test_pool_checkin_clears_leftover_tenant_context(environment):
     """A connection returned to the pool carries none of a request's session-local
     settings. Simulates the bug this guards against: a context committed at session
     scope (set_config(..., false)), not transaction scope (is_local=true) — a plain
@@ -487,11 +365,11 @@ async def test_pool_checkin_clears_leftover_tenant_context(app_settings):
     assert leftover in (None, "")
 
 
-async def test_neither_role_is_superuser_or_bypasses_rls(database_urls):
+async def test_neither_role_is_superuser_or_bypasses_rls(environment):
     """docker/postgres/01-init.sh's whole point: `app_owner` and `app` must both be ordinary,
     non-privileged roles — only the cluster's own bootstrap superuser, used once, may bypass
     Row-Level Security."""
-    engine = create_async_engine(database_urls["app"])
+    engine = create_async_engine(environment.app_url)
     async with engine.connect() as conn:
         rows = (
             await conn.execute(
@@ -509,11 +387,11 @@ async def test_neither_role_is_superuser_or_bypasses_rls(database_urls):
         assert by_name[role].rolbypassrls is False
 
 
-async def test_owner_owns_public_schema_and_ran_the_migrations(database_urls):
+async def test_owner_owns_public_schema_and_ran_the_migrations(environment):
     """`app_owner` owns `public`, and — since the fixture points DATABASE_URL_MIGRATIONS at it
     and the whole migration suite already ran against it to get here — every table it created is
     owned by it too, not by the cluster superuser."""
-    engine = create_async_engine(database_urls["migrations"])
+    engine = create_async_engine(environment.owner_url)
     async with engine.connect() as conn:
         schema_owner = (
             await conn.execute(
@@ -540,10 +418,10 @@ async def test_owner_owns_public_schema_and_ran_the_migrations(database_urls):
     assert table_owners == ["app_owner", "app_owner", "app_owner"]
 
 
-async def test_new_table_gets_no_default_privileges(database_urls):
+async def test_new_table_gets_no_default_privileges(environment):
     """The blanket ALTER DEFAULT PRIVILEGES grant is gone: a freshly created table is
     unreadable and unwritable by `app` until a migration explicitly grants it."""
-    engine = create_async_engine(database_urls["migrations"])
+    engine = create_async_engine(environment.owner_url)
     try:
         async with engine.begin() as conn:
             await conn.execute(text("CREATE TABLE scratch_no_default_grants (id int)"))
@@ -563,13 +441,13 @@ async def test_new_table_gets_no_default_privileges(database_urls):
     assert grants == []
 
 
-async def test_app_has_no_dml_on_control_schema_only_select_on_the_view(database_urls):
+async def test_app_has_no_dml_on_control_schema_only_select_on_the_view(environment):
     """The control-plane schema (#12, extended by #22, #77): `app` gets no INSERT/UPDATE/DELETE
     anywhere in `control`, only SELECT on the three exposed read-only views (tenant facts,
     identity lookup, database-alias enumeration for the runtime guard) -- plus, separately,
     EXECUTE on the one narrow function (#22, asserted in its own test), which is not a table
     privilege at all."""
-    engine = create_async_engine(database_urls["app"])
+    engine = create_async_engine(environment.app_url)
     async with engine.connect() as conn:
         table_grants = (
             await conn.execute(
@@ -586,9 +464,7 @@ async def test_app_has_no_dml_on_control_schema_only_select_on_the_view(database
     }
 
 
-async def test_app_can_update_own_settings_but_not_other_tenant_columns(
-    app_settings, database_urls
-):
+async def test_app_can_update_own_settings_but_not_other_tenant_columns(environment):
     """Column-level grant (#12): `app` may UPDATE tenants.settings but nothing else on that
     row -- rejected by Postgres's own privilege check, not by RLS/policy."""
     from sqlalchemy.exc import DBAPIError
@@ -596,7 +472,7 @@ async def test_app_can_update_own_settings_but_not_other_tenant_columns(
     from app.context import RequestContext
     from app.db.session import tenant_session
 
-    tenant_a, _ = await _seed(database_urls["superuser"])
+    tenant_a = (await seed_tenant(environment, via_operator=False)).tenant_id
     ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
 
     async with tenant_session(ctx_a) as session:
@@ -614,7 +490,7 @@ async def test_app_can_update_own_settings_but_not_other_tenant_columns(
             )
 
 
-async def test_tenants_self_only_policy_validates_writes_too(database_urls):
+async def test_tenants_self_only_policy_validates_writes_too(environment):
     """`tenants_self_only` (#12) now carries a WITH CHECK matching its USING clause: a write
     that would move a row out of the caller's own tenant is rejected by the policy itself.
 
@@ -626,7 +502,7 @@ async def test_tenants_self_only_policy_validates_writes_too(database_urls):
     """
     from sqlalchemy.exc import DBAPIError
 
-    superuser_engine = create_async_engine(database_urls["superuser"])
+    superuser_engine = create_async_engine(environment.superuser_url)
     tenant_a, tenant_b = uuid.uuid4(), uuid.uuid4()
     async with superuser_engine.begin() as conn:
         for tenant_id, name in ((tenant_a, "A"), (tenant_b, "B")):
@@ -636,7 +512,7 @@ async def test_tenants_self_only_policy_validates_writes_too(database_urls):
             )
     await superuser_engine.dispose()
 
-    engine = create_async_engine(database_urls["migrations"])
+    engine = create_async_engine(environment.owner_url)
     async with engine.connect() as conn:
         await conn.execute(
             text("SELECT set_config('app.tenant_id', :t, false)"), {"t": str(tenant_a)}
@@ -660,9 +536,9 @@ async def test_tenants_self_only_policy_validates_writes_too(database_urls):
     await engine.dispose()
 
 
-async def test_control_tenants_owned_by_app_owner_never_app(database_urls):
+async def test_control_tenants_owned_by_app_owner_never_app(environment):
     """The control-plane schema and its table are owned by `app_owner`, never `app` (#12)."""
-    engine = create_async_engine(database_urls["migrations"])
+    engine = create_async_engine(environment.owner_url)
     async with engine.connect() as conn:
         schema_owner = (
             await conn.execute(
@@ -685,13 +561,13 @@ async def test_control_tenants_owned_by_app_owner_never_app(database_urls):
     assert table_owner == "app_owner"
 
 
-async def test_control_tenants_has_forced_rls_with_using_and_check(database_urls):
+async def test_control_tenants_has_forced_rls_with_using_and_check(environment):
     """`control.tenants` carries forced RLS with a policy that both restricts and validates,
     the same shape as every other tenant-scoped table (#12). Selected by name, not "the only
     policy on this table": migration 0016 (#76) adds a second, purely additive SELECT-only
     policy (a narrow migration-runner escape hatch) alongside this one -- it carries no
     with_check clause of its own and does not change this policy's shape."""
-    engine = create_async_engine(database_urls["migrations"])
+    engine = create_async_engine(environment.owner_url)
     async with engine.connect() as conn:
         row = (
             await conn.execute(
@@ -773,12 +649,12 @@ async def _public_schema_tenant_isolation_violations(conn, exceptions: frozenset
     return violations
 
 
-async def test_public_schema_tenant_isolation_invariant(database_urls):
+async def test_public_schema_tenant_isolation_invariant(environment):
     """Acceptance: every public-schema table outside TENANT_ISOLATION_EXCEPTIONS carries
     forced RLS, a tenant column, and a policy with both a restrict and a validate clause."""
     from app.db.models import TENANT_ISOLATION_EXCEPTIONS
 
-    engine = create_async_engine(database_urls["migrations"])
+    engine = create_async_engine(environment.owner_url)
     async with engine.connect() as conn:
         violations = await _public_schema_tenant_isolation_violations(
             conn, TENANT_ISOLATION_EXCEPTIONS
@@ -787,7 +663,7 @@ async def test_public_schema_tenant_isolation_invariant(database_urls):
     assert violations == {}
 
 
-async def test_alembic_bookkeeping_table_is_the_only_exception(database_urls):
+async def test_alembic_bookkeeping_table_is_the_only_exception(environment):
     """Acceptance: the migration tool's own bookkeeping table is the only table on the
     exception list, and it genuinely needs the exemption (it really does carry none of the
     three mandatory parts) -- proving the list isn't hiding an under-protected domain table."""
@@ -795,7 +671,7 @@ async def test_alembic_bookkeeping_table_is_the_only_exception(database_urls):
 
     assert TENANT_ISOLATION_EXCEPTIONS == frozenset({"alembic_version"})
 
-    engine = create_async_engine(database_urls["migrations"])
+    engine = create_async_engine(environment.owner_url)
     async with engine.connect() as conn:
         row = (
             await conn.execute(
@@ -810,12 +686,12 @@ async def test_alembic_bookkeeping_table_is_the_only_exception(database_urls):
     assert row.relrowsecurity is False
 
 
-async def test_invariant_catches_an_unprotected_table(database_urls):
+async def test_invariant_catches_an_unprotected_table(environment):
     """Acceptance: adding a table with no policy to the schema under test causes the invariant
     check to fail -- proving it walks live catalog state rather than a fixed list of names."""
     from app.db.models import TENANT_ISOLATION_EXCEPTIONS
 
-    engine = create_async_engine(database_urls["migrations"])
+    engine = create_async_engine(environment.owner_url)
     try:
         async with engine.begin() as conn:
             await conn.execute(text("CREATE TABLE scratch_unprotected (id int)"))
@@ -832,7 +708,7 @@ async def test_invariant_catches_an_unprotected_table(database_urls):
     assert "row security not enabled" in violations["scratch_unprotected"]
 
 
-async def test_control_session_sets_no_tenant_or_identity_context(app_settings):
+async def test_control_session_sets_no_tenant_or_identity_context(environment):
     """The control-plane session mode (#22): no app.tenant_id / app.identity_id at all -- never
     the same thing as a tenant_session() with an empty context."""
     from app.db.session import control_session
@@ -848,27 +724,25 @@ async def test_control_session_sets_no_tenant_or_identity_context(app_settings):
     assert identity_setting in (None, "")
 
 
-async def test_control_session_sees_no_rows_of_a_tenants_own_tables(app_settings, database_urls):
+async def test_control_session_sees_no_rows_of_a_tenants_own_tables(environment):
     """Documents the "never used against a tenant's own tables" rule (#22) as an observable
     property: with no tenant context, RLS blocks every row of a tenant-scoped table exactly as
     it does for any other contextless session."""
     from app.db.session import control_session
 
-    await _seed(database_urls["superuser"])
+    await seed_tenant(environment, documents=1, via_operator=False)
     async with control_session() as session:
         count = (await session.execute(text("SELECT count(*) FROM documents"))).scalar_one()
     assert count == 0
 
 
-async def test_identity_lookup_finds_a_known_identity_and_nothing_for_an_unknown_one(
-    app_settings, database_urls
-):
+async def test_identity_lookup_finds_a_known_identity_and_nothing_for_an_unknown_one(environment):
     """The identity-lookup component (#22): a known issuer+subject returns the matching row
     over the control-plane session; an unknown pair returns None rather than raising."""
     from app.db.session import control_session
     from app.repositories.control import IdentityRepository
 
-    superuser_engine = create_async_engine(database_urls["superuser"])
+    superuser_engine = create_async_engine(environment.superuser_url)
     async with superuser_engine.begin() as conn:
         await conn.execute(
             text(
@@ -892,10 +766,10 @@ async def test_identity_lookup_finds_a_known_identity_and_nothing_for_an_unknown
     assert missing is None
 
 
-async def test_identity_lookup_view_exposes_only_id_issuer_subject(database_urls):
+async def test_identity_lookup_view_exposes_only_id_issuer_subject(environment):
     """(#22) control.identity_lookup never leaks display_name/email, even though
     control.identities carries those columns."""
-    engine = create_async_engine(database_urls["migrations"])
+    engine = create_async_engine(environment.owner_url)
     async with engine.connect() as conn:
         columns = (
             (
@@ -913,7 +787,7 @@ async def test_identity_lookup_view_exposes_only_id_issuer_subject(database_urls
     assert set(columns) == {"id", "issuer", "subject"}
 
 
-async def test_app_cannot_write_identities_only_read_the_lookup(app_settings, database_urls):
+async def test_app_cannot_write_identities_only_read_the_lookup(environment):
     """(#22) `app` may SELECT through control.identity_lookup and nothing else: INSERT/UPDATE/
     DELETE against either the base table or the lookup view fail on privileges."""
     from sqlalchemy.exc import DBAPIError
@@ -924,7 +798,7 @@ async def test_app_cannot_write_identities_only_read_the_lookup(app_settings, da
         result = await session.execute(text("SELECT count(*) FROM control.identity_lookup"))
         assert result.scalar_one() >= 0  # SELECT succeeds
 
-    engine = create_async_engine(database_urls["app"])
+    engine = create_async_engine(environment.app_url)
     statements = [
         "INSERT INTO control.identities (issuer, subject) VALUES ('x', 'y')",
         "UPDATE control.identities SET subject = 'z'",
@@ -941,16 +815,14 @@ async def test_app_cannot_write_identities_only_read_the_lookup(app_settings, da
     await engine.dispose()
 
 
-async def test_tenant_auth_settings_falls_back_to_default_and_reports_suspension(
-    app_settings, database_urls
-):
+async def test_tenant_auth_settings_falls_back_to_default_and_reports_suspension(environment):
     """(#22) the per-tenant read helper: the tenant's configured issuer when set, the
     process-wide default when unset, and the suspension flag either way."""
     from app.db.session import control_session
     from app.repositories.control import TenantAuthSettingsRepository
 
     tenant_id = uuid.uuid4()
-    superuser_engine = create_async_engine(database_urls["superuser"])
+    superuser_engine = create_async_engine(environment.superuser_url)
     async with superuser_engine.begin() as conn:
         await conn.execute(
             text("INSERT INTO tenants (id, name) VALUES (:id, 'Tenant with defaults')"),
@@ -970,7 +842,7 @@ async def test_tenant_auth_settings_falls_back_to_default_and_reports_suspension
     assert settings.issuer == "https://default.example.com"
     assert settings.suspended is False
 
-    superuser_engine = create_async_engine(database_urls["superuser"])
+    superuser_engine = create_async_engine(environment.superuser_url)
     async with superuser_engine.begin() as conn:
         await conn.execute(
             text(
@@ -990,7 +862,7 @@ async def test_tenant_auth_settings_falls_back_to_default_and_reports_suspension
     assert settings.suspended is True
 
 
-async def test_tenant_auth_settings_returns_none_for_unknown_tenant(app_settings):
+async def test_tenant_auth_settings_returns_none_for_unknown_tenant(environment):
     from app.db.session import control_session
     from app.repositories.control import TenantAuthSettingsRepository
 
@@ -1001,12 +873,12 @@ async def test_tenant_auth_settings_returns_none_for_unknown_tenant(app_settings
     assert settings is None
 
 
-async def test_app_cannot_write_tenant_auth_settings_columns(app_settings, database_urls):
+async def test_app_cannot_write_tenant_auth_settings_columns(environment):
     """(#22) only app_owner may write identity_issuer/suspended_at -- app has no grant on
     control.tenants at all beyond what tenant_auth_settings()/identity_lookup expose."""
     from sqlalchemy.exc import DBAPIError
 
-    engine = create_async_engine(database_urls["app"])
+    engine = create_async_engine(environment.app_url)
     async with engine.connect() as conn:
         with pytest.raises(DBAPIError):
             await conn.execute(
@@ -1015,10 +887,10 @@ async def test_app_cannot_write_tenant_auth_settings_columns(app_settings, datab
     await engine.dispose()
 
 
-async def test_app_statement_timeout_matches_bootstrap(database_urls):
+async def test_app_statement_timeout_matches_bootstrap(environment):
     """The role-level statement_timeout the bootstrap script sets for `app` is the one that
     actually applies to its connections."""
-    engine = create_async_engine(database_urls["app"])
+    engine = create_async_engine(environment.app_url)
     async with engine.connect() as conn:
         timeout_ms = (
             await conn.execute(
@@ -1029,9 +901,7 @@ async def test_app_statement_timeout_matches_bootstrap(database_urls):
     assert int(timeout_ms) == ROLE_STATEMENT_TIMEOUT_MS
 
 
-async def test_tenant_auth_settings_does_not_switch_the_callers_tenant_context(
-    app_settings, database_urls
-):
+async def test_tenant_auth_settings_does_not_switch_the_callers_tenant_context(environment):
     """control.tenant_auth_settings() sets app.tenant_id internally to satisfy the forced RLS
     policy on control.tenants. It must restore the caller's context before returning —
     otherwise calling it for tenant B inside tenant A's session would leave the rest of that
@@ -1040,7 +910,36 @@ async def test_tenant_auth_settings_does_not_switch_the_callers_tenant_context(
     from app.db.session import tenant_session
     from app.repositories.documents import DocumentRepository
 
-    tenant_a, tenant_b = await _seed(database_urls["superuser"])
+    tenant_a_seed = await seed_tenant(environment, via_operator=False)
+    tenant_b_seed = await seed_tenant(environment, via_operator=False)
+    tenant_a, tenant_b = tenant_a_seed.tenant_id, tenant_b_seed.tenant_id
+    for seeded, label, vec_seed in ((tenant_a_seed, "A", 0.1), (tenant_b_seed, "B", 0.9)):
+        async with seeded.superuser_connection() as conn:
+            async with conn.begin():
+                identity_id = uuid.uuid4()
+                await conn.execute(
+                    text(
+                        "INSERT INTO control.identities (id, issuer, subject) "
+                        "VALUES (:id, 'seed', :sub)"
+                    ),
+                    {"id": identity_id, "sub": str(identity_id)},
+                )
+                await conn.execute(
+                    text("SELECT set_config('app.identity_id', :iid, true)"),
+                    {"iid": str(identity_id)},
+                )
+                await conn.execute(
+                    text(
+                        "INSERT INTO documents (tenant_id, title, content, embedding) "
+                        "VALUES (:tid, :title, :content, CAST(:emb AS vector))"
+                    ),
+                    {
+                        "tid": seeded.tenant_id,
+                        "title": f"Document {label}",
+                        "content": f"Content of tenant {label}",
+                        "emb": vector_literal(vec_seed),
+                    },
+                )
     query = [0.0] * DIM
     query[0] = 1.0
 
@@ -1057,10 +956,10 @@ async def test_tenant_auth_settings_does_not_switch_the_callers_tenant_context(
     assert [h.title for h in hits] == ["Document A"]
 
 
-async def test_control_tenants_has_suspension_columns_defaulting_unsuspended(database_urls):
+async def test_control_tenants_has_suspension_columns_defaulting_unsuspended(environment):
     """`control.tenants` gains a suspension flag and timestamp (#66), both defaulting to
     not-suspended so every existing and newly inserted tenant starts active."""
-    superuser_engine = create_async_engine(database_urls["superuser"])
+    superuser_engine = create_async_engine(environment.superuser_url)
     tenant_id = uuid.uuid4()
     async with superuser_engine.begin() as conn:
         await conn.execute(
@@ -1080,11 +979,11 @@ async def test_control_tenants_has_suspension_columns_defaulting_unsuspended(dat
     assert row.suspended_at is None
 
 
-async def test_tenant_erasure_record_has_no_fk_and_survives_tenant_deletion(database_urls):
+async def test_tenant_erasure_record_has_no_fk_and_survives_tenant_deletion(environment):
     """The erasure record (#66) is keyed by `tenant_id` with no foreign key back to the tenant
     it describes, so its row survives after the tenant row is deleted -- verified two ways:
     the column carries no FK constraint, and a real delete leaves the erasure row in place."""
-    superuser_engine = create_async_engine(database_urls["superuser"])
+    superuser_engine = create_async_engine(environment.superuser_url)
     tenant_id = uuid.uuid4()
     async with superuser_engine.begin() as conn:
         fk_count = (
@@ -1119,10 +1018,10 @@ async def test_tenant_erasure_record_has_no_fk_and_survives_tenant_deletion(data
     assert row.tenant_id == tenant_id
 
 
-async def test_operator_actions_table_also_has_no_fk_to_tenants(database_urls):
+async def test_operator_actions_table_also_has_no_fk_to_tenants(environment):
     """Same reasoning as the erasure record: an `erase` action's own log entry must outlive the
     tenant it names, so `control.operator_actions` carries no foreign key either (#66)."""
-    superuser_engine = create_async_engine(database_urls["superuser"])
+    superuser_engine = create_async_engine(environment.superuser_url)
     async with superuser_engine.begin() as conn:
         fk_count = (
             await conn.execute(
@@ -1138,14 +1037,14 @@ async def test_operator_actions_table_also_has_no_fk_to_tenants(database_urls):
 
 
 @pytest.mark.parametrize("table", ["tenant_erasures", "operator_actions"])
-async def test_append_only_tables_accept_insert_reject_update_delete_by_owner(database_urls, table):
+async def test_append_only_tables_accept_insert_reject_update_delete_by_owner(environment, table):
     """Both new tables (#66) accept INSERT from `app_owner`, which owns them, but reject UPDATE
     and DELETE from that same role: table ownership grants privileges exactly as if by GRANT,
     and migration 0004 explicitly revokes everything but INSERT from `app_owner` -- append-only
     applies to the owner too, not just to unprivileged roles."""
     from sqlalchemy.exc import DBAPIError
 
-    superuser_engine = create_async_engine(database_urls["superuser"])
+    superuser_engine = create_async_engine(environment.superuser_url)
     tenant_id = uuid.uuid4()
     async with superuser_engine.begin() as conn:
         await conn.execute(
@@ -1153,7 +1052,7 @@ async def test_append_only_tables_accept_insert_reject_update_delete_by_owner(da
         )
     await superuser_engine.dispose()
 
-    owner_engine = create_async_engine(database_urls["migrations"])
+    owner_engine = create_async_engine(environment.owner_url)
     if table == "tenant_erasures":
         insert_sql = "INSERT INTO control.tenant_erasures (tenant_id) VALUES (:id)"
     else:
@@ -1188,13 +1087,13 @@ async def test_append_only_tables_accept_insert_reject_update_delete_by_owner(da
 
 
 @pytest.mark.parametrize("table", ["tenant_erasures", "operator_actions"])
-async def test_select_on_append_only_tables_is_grantable_to_an_auditor_role(database_urls, table):
+async def test_select_on_append_only_tables_is_grantable_to_an_auditor_role(environment, table):
     """SELECT on either table is grantable to a distinct role without handing that role any
     write access (#66) -- proving the two privileges are independent, not bundled."""
     from sqlalchemy.exc import DBAPIError
 
     role = f"test_auditor_{table}"
-    superuser_engine = create_async_engine(database_urls["superuser"])
+    superuser_engine = create_async_engine(environment.superuser_url)
     tenant_id = uuid.uuid4()
     try:
         async with superuser_engine.begin() as conn:
@@ -1203,7 +1102,7 @@ async def test_select_on_append_only_tables_is_grantable_to_an_auditor_role(data
                 text("INSERT INTO tenants (id, name) VALUES (:id, 'A')"), {"id": tenant_id}
             )
 
-        owner_engine = create_async_engine(database_urls["migrations"])
+        owner_engine = create_async_engine(environment.owner_url)
         insert_sql = (
             f"INSERT INTO control.{table} (tenant_id) VALUES (:id)"
             if table == "tenant_erasures"
@@ -1215,7 +1114,7 @@ async def test_select_on_append_only_tables_is_grantable_to_an_auditor_role(data
             await conn.execute(text(f"GRANT SELECT ON control.{table} TO {role}"))
         await owner_engine.dispose()
 
-        parsed = urlparse(database_urls["app"])
+        parsed = urlparse(environment.app_url)
         sockdir = parse_qs(parsed.query)["host"][0]
         auditor_engine = create_async_engine(
             f"postgresql+asyncpg://{role}@/postgres?host={sockdir}"
@@ -1235,7 +1134,7 @@ async def test_select_on_append_only_tables_is_grantable_to_an_auditor_role(data
                 )
         await auditor_engine.dispose()
     finally:
-        cleanup_engine = create_async_engine(database_urls["superuser"])
+        cleanup_engine = create_async_engine(environment.superuser_url)
         async with cleanup_engine.begin() as conn:
             await conn.execute(text("DELETE FROM tenants WHERE id = :id"), {"id": tenant_id})
             await conn.execute(text(f"REVOKE ALL ON control.{table} FROM {role}"))
@@ -1244,67 +1143,70 @@ async def test_select_on_append_only_tables_is_grantable_to_an_auditor_role(data
         await cleanup_engine.dispose()
 
 
-async def _insert_public_tenant(conn, tenant_id: uuid.UUID, name: str) -> None:
-    await conn.execute(
-        text("INSERT INTO tenants (id, name) VALUES (:id, :name)"), {"id": tenant_id, "name": name}
-    )
-
-
-async def _insert_control_tenant(
-    conn, tenant_id: uuid.UUID, *, isolation_tier: str, database_alias: str | None
-) -> None:
-    await conn.execute(
-        text(
-            "INSERT INTO control.tenants (tenant_id, isolation_tier, database_alias) "
-            "VALUES (:tid, :tier, :alias)"
-        ),
-        {"tid": tenant_id, "tier": isolation_tier, "alias": database_alias},
-    )
-
-
-async def test_pooled_tier_with_alias_rejected_by_schema_constraint(database_urls):
+async def test_pooled_tier_with_alias_rejected_by_schema_constraint(environment):
     """(#73) A pooled tenant's database alias must be NULL -- enforced by the `CHECK`
     constraint added in 0005, not by application code."""
     from sqlalchemy.exc import DBAPIError
 
-    engine = create_async_engine(database_urls["superuser"])
+    engine = create_async_engine(environment.superuser_url)
     tenant_id = uuid.uuid4()
     async with engine.begin() as conn:
-        await _insert_public_tenant(conn, tenant_id, "pooled-with-alias")
+        await conn.execute(
+            text("INSERT INTO tenants (id, name) VALUES (:id, :name)"),
+            {"id": tenant_id, "name": "pooled-with-alias"},
+        )
     with pytest.raises(DBAPIError):
         async with engine.begin() as conn:
-            await _insert_control_tenant(
-                conn, tenant_id, isolation_tier="pooled", database_alias="eu1"
+            await conn.execute(
+                text(
+                    "INSERT INTO control.tenants (tenant_id, isolation_tier, database_alias) "
+                    "VALUES (:tid, :tier, :alias)"
+                ),
+                {"tid": tenant_id, "tier": "pooled", "alias": "eu1"},
             )
     await engine.dispose()
 
 
-async def test_dedicated_tier_without_alias_rejected_by_schema_constraint(database_urls):
+async def test_dedicated_tier_without_alias_rejected_by_schema_constraint(environment):
     """(#73) A dedicated tenant's database alias must be set -- enforced the same way."""
     from sqlalchemy.exc import DBAPIError
 
-    engine = create_async_engine(database_urls["superuser"])
+    engine = create_async_engine(environment.superuser_url)
     tenant_id = uuid.uuid4()
     async with engine.begin() as conn:
-        await _insert_public_tenant(conn, tenant_id, "dedicated-without-alias")
+        await conn.execute(
+            text("INSERT INTO tenants (id, name) VALUES (:id, :name)"),
+            {"id": tenant_id, "name": "dedicated-without-alias"},
+        )
     with pytest.raises(DBAPIError):
         async with engine.begin() as conn:
-            await _insert_control_tenant(
-                conn, tenant_id, isolation_tier="dedicated", database_alias=None
+            await conn.execute(
+                text(
+                    "INSERT INTO control.tenants (tenant_id, isolation_tier, database_alias) "
+                    "VALUES (:tid, :tier, :alias)"
+                ),
+                {"tid": tenant_id, "tier": "dedicated", "alias": None},
             )
     await engine.dispose()
 
 
-async def test_database_aliases_view_enumerates_distinct_aliases(database_urls):
+async def test_database_aliases_view_enumerates_distinct_aliases(environment):
     """(#73) `control.database_aliases` returns exactly the pooled default while every tenant
     is pooled, and includes a newly seeded alias once a dedicated tenant is added."""
-    engine = create_async_engine(database_urls["superuser"])
+    engine = create_async_engine(environment.superuser_url)
     pooled_a, pooled_b, dedicated = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     async with engine.begin() as conn:
         for tenant_id, name in ((pooled_a, "pooled-a"), (pooled_b, "pooled-b")):
-            await _insert_public_tenant(conn, tenant_id, name)
-            await _insert_control_tenant(
-                conn, tenant_id, isolation_tier="pooled", database_alias=None
+            await conn.execute(
+                text("INSERT INTO tenants (id, name) VALUES (:id, :name)"),
+                {"id": tenant_id, "name": name},
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO control.tenants (tenant_id, isolation_tier, database_alias) "
+                    "VALUES (:tid, :tier, :alias)"
+                ),
+                {"tid": tenant_id, "tier": "pooled", "alias": None},
             )
 
     async with engine.connect() as conn:
@@ -1316,9 +1218,16 @@ async def test_database_aliases_view_enumerates_distinct_aliases(database_urls):
     assert aliases == {"pooled"}
 
     async with engine.begin() as conn:
-        await _insert_public_tenant(conn, dedicated, "dedicated-eu1")
-        await _insert_control_tenant(
-            conn, dedicated, isolation_tier="dedicated", database_alias="eu1"
+        await conn.execute(
+            text("INSERT INTO tenants (id, name) VALUES (:id, :name)"),
+            {"id": dedicated, "name": "dedicated-eu1"},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO control.tenants (tenant_id, isolation_tier, database_alias) "
+                "VALUES (:tid, :tier, :alias)"
+            ),
+            {"tid": dedicated, "tier": "dedicated", "alias": "eu1"},
         )
 
     async with engine.connect() as conn:
@@ -1331,12 +1240,12 @@ async def test_database_aliases_view_enumerates_distinct_aliases(database_urls):
     assert aliases == {"pooled", "eu1"}
 
 
-async def test_control_tenants_stores_only_the_alias_string(database_urls):
+async def test_control_tenants_stores_only_the_alias_string(environment):
     """(#73) The dedicated-tenant record has exactly one column for "where its database
     lives" -- the alias string -- and no column for a DSN, hostname, port, user, or password:
     that connection detail lives in a tenant secret file keyed by the alias (ADR-0011), never
     in the control plane's own schema."""
-    engine = create_async_engine(database_urls["migrations"])
+    engine = create_async_engine(environment.owner_url)
     async with engine.connect() as conn:
         columns = (
             await conn.execute(
@@ -1354,10 +1263,10 @@ async def test_control_tenants_stores_only_the_alias_string(database_urls):
     assert offending == set()
 
 
-async def test_tenants_view_still_select_only_after_adding_isolation_columns(database_urls):
+async def test_tenants_view_still_select_only_after_adding_isolation_columns(environment):
     """(#73) Extending `control.tenants_view` with `isolation_tier`/`database_alias` adds no
     new grant: `app` still holds SELECT only, exactly as after #12."""
-    engine = create_async_engine(database_urls["app"])
+    engine = create_async_engine(environment.app_url)
     async with engine.connect() as conn:
         table_grants = (
             await conn.execute(
@@ -1429,25 +1338,25 @@ async def _tenant_record(tenant_id: uuid.UUID):
         return await ControlRepository().get_tenant_record(session, tenant_id=tenant_id)
 
 
-async def test_control_tenants_view_exposes_the_gateway_credential_alias(
-    app_settings, database_urls
-):
+async def test_control_tenants_view_exposes_the_gateway_credential_alias(environment):
     """The alias the owner role recorded is visible to `app` through the read-only view, on the
     tenant's record, scoped to the caller's own tenant like every other row in `control.tenants`
     (#52, #105) -- and never on the other tenant's record."""
-    tenant_a, tenant_b = await _seed(database_urls["superuser"])
-    await _set_gateway_alias(database_urls["migrations"], tenant_a, "acme-gateway-key")
+    tenant_a = (await seed_tenant(environment, via_operator=False)).tenant_id
+    tenant_b = (await seed_tenant(environment, via_operator=False)).tenant_id
+    await _set_gateway_alias(environment.owner_url, tenant_a, "acme-gateway-key")
 
     assert (await _tenant_record(tenant_a)).gateway_credential_alias == "acme-gateway-key"
     assert (await _tenant_record(tenant_b)).gateway_credential_alias is None
 
 
-async def test_control_tenants_alias_is_none_when_not_yet_recorded(app_settings, database_urls):
-    tenant_a, _ = await _seed(database_urls["superuser"])
+async def test_control_tenants_alias_is_none_when_not_yet_recorded(environment):
+    tenant_a = (await seed_tenant(environment, via_operator=False)).tenant_id
+    _ = (await seed_tenant(environment, via_operator=False)).tenant_id
     assert (await _tenant_record(tenant_a)).gateway_credential_alias is None
 
 
-async def test_app_cannot_write_the_gateway_credential_alias(app_settings, database_urls):
+async def test_app_cannot_write_the_gateway_credential_alias(environment):
     """`app` has no UPDATE (or any DML) anywhere in `control` -- only the owner role can ever
     set an alias (#12, #52); a tenant's own request cannot forge itself a credential."""
     from sqlalchemy.exc import DBAPIError, ProgrammingError
@@ -1455,8 +1364,8 @@ async def test_app_cannot_write_the_gateway_credential_alias(app_settings, datab
     from app.context import RequestContext
     from app.db.session import tenant_session
 
-    tenant_a, _ = await _seed(database_urls["superuser"])
-    await _set_gateway_alias(database_urls["migrations"], tenant_a, "acme-gateway-key")
+    tenant_a = (await seed_tenant(environment, via_operator=False)).tenant_id
+    await _set_gateway_alias(environment.owner_url, tenant_a, "acme-gateway-key")
     ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
     with pytest.raises((DBAPIError, ProgrammingError)):
         async with tenant_session(ctx_a) as session:
@@ -1470,7 +1379,7 @@ async def test_app_cannot_write_the_gateway_credential_alias(app_settings, datab
 
 
 async def test_two_tenants_with_different_aliases_resolve_different_credentials(
-    app_settings, database_urls, tmp_path
+    environment, tmp_path
 ):
     """End to end (#52, #105): the tenant record carries the control plane's alias, the resolver
     reads that alias's secret file fresh -- two tenants with different aliases get two different
@@ -1478,9 +1387,11 @@ async def test_two_tenants_with_different_aliases_resolve_different_credentials(
     from app.config import Settings
     from app.gateway_credentials import resolve_gateway_credential
 
-    tenant_a, tenant_b = await _seed(database_urls["superuser"])
-    await _set_gateway_alias(database_urls["migrations"], tenant_a, "acme-gateway-key")
-    await _set_gateway_alias(database_urls["migrations"], tenant_b, "globex-gateway-key")
+    tenant_a = (await seed_tenant(environment, via_operator=False)).tenant_id
+
+    tenant_b = (await seed_tenant(environment, via_operator=False)).tenant_id
+    await _set_gateway_alias(environment.owner_url, tenant_a, "acme-gateway-key")
+    await _set_gateway_alias(environment.owner_url, tenant_b, "globex-gateway-key")
     (tmp_path / "acme-gateway-key").write_text("sk-acme-secret")
     (tmp_path / "globex-gateway-key").write_text("sk-globex-secret")
     settings = Settings(
@@ -1495,25 +1406,21 @@ async def test_two_tenants_with_different_aliases_resolve_different_credentials(
     assert credential_b.get_secret_value() == "sk-globex-secret"
 
 
-async def test_resolver_raises_typed_error_for_a_tenant_with_no_alias_recorded(
-    app_settings, database_urls
-):
+async def test_resolver_raises_typed_error_for_a_tenant_with_no_alias_recorded(environment):
     from app.gateway_credentials import GatewayCredentialUnavailable, resolve_gateway_credential
 
-    tenant_a, _ = await _seed(database_urls["superuser"])
+    tenant_a = (await seed_tenant(environment, via_operator=False)).tenant_id
     record = await _tenant_record(tenant_a)
     with pytest.raises(GatewayCredentialUnavailable):
         resolve_gateway_credential(record)
 
 
-async def test_resolver_raises_typed_error_when_the_secret_file_is_missing(
-    app_settings, database_urls, tmp_path
-):
+async def test_resolver_raises_typed_error_when_the_secret_file_is_missing(environment, tmp_path):
     from app.config import Settings
     from app.gateway_credentials import GatewayCredentialUnavailable, resolve_gateway_credential
 
-    tenant_a, _ = await _seed(database_urls["superuser"])
-    await _set_gateway_alias(database_urls["migrations"], tenant_a, "acme-gateway-key")
+    tenant_a = (await seed_tenant(environment, via_operator=False)).tenant_id
+    await _set_gateway_alias(environment.owner_url, tenant_a, "acme-gateway-key")
     settings = Settings(
         database_url="postgresql+asyncpg://app:app@localhost:5432/app",
         gateway_credentials_dir=str(tmp_path),
@@ -1528,31 +1435,31 @@ async def test_resolver_raises_typed_error_when_the_secret_file_is_missing(
 # --- schema-invariant test above, exercised through the actual runtime check. ---
 
 
-async def test_role_rls_guard_passes_for_the_unprivileged_app_role(database_urls):
+async def test_role_rls_guard_passes_for_the_unprivileged_app_role(environment):
     """Acceptance: the live guard does not raise for a correctly configured, unprivileged
     connection — proving the earlier failure tests below are not tautologies."""
     from app.db.guard import check_role_and_rls
 
-    engine = create_async_engine(database_urls["app"])
+    engine = create_async_engine(environment.app_url)
     async with engine.connect() as conn:
         await check_role_and_rls(conn)  # must not raise
     await engine.dispose()
 
 
-async def test_role_rls_guard_raises_for_a_superuser_or_bypassrls_role(database_urls):
+async def test_role_rls_guard_raises_for_a_superuser_or_bypassrls_role(environment):
     """Acceptance: the live check raises when connected as a role that is a superuser or holds
     BYPASSRLS — pgserver's own bootstrap `postgres` role, mirroring the cluster's real
     bootstrap superuser."""
     from app.db.guard import PrivilegedRoleOrMissingRLSError, check_role_and_rls
 
-    engine = create_async_engine(database_urls["superuser"])
+    engine = create_async_engine(environment.superuser_url)
     async with engine.connect() as conn:
         with pytest.raises(PrivilegedRoleOrMissingRLSError):
             await check_role_and_rls(conn)
     await engine.dispose()
 
 
-async def test_role_rls_guard_raises_for_a_table_missing_forced_rls(database_urls):
+async def test_role_rls_guard_raises_for_a_table_missing_forced_rls(environment):
     """Acceptance: a table in `public` outside `TENANT_ISOLATION_EXCEPTIONS` that lacks forced
     Row-Level Security makes the live guard raise, even when connected as the unprivileged
     `app` role — the same exception list the schema-invariant test enforces, checked here
@@ -1561,12 +1468,12 @@ async def test_role_rls_guard_raises_for_a_table_missing_forced_rls(database_url
     from app.db.models import TENANT_ISOLATION_EXCEPTIONS
 
     assert "scratch_unforced" not in TENANT_ISOLATION_EXCEPTIONS
-    owner_engine = create_async_engine(database_urls["migrations"])
+    owner_engine = create_async_engine(environment.owner_url)
     try:
         async with owner_engine.begin() as conn:
             await conn.execute(text("CREATE TABLE scratch_unforced (id int)"))
 
-        app_engine = create_async_engine(database_urls["app"])
+        app_engine = create_async_engine(environment.app_url)
         try:
             async with app_engine.connect() as conn:
                 with pytest.raises(PrivilegedRoleOrMissingRLSError):
@@ -1582,11 +1489,22 @@ async def test_role_rls_guard_raises_for_a_table_missing_forced_rls(database_url
 # --- Tenant residency (#54): the control-plane fact the model allow-list check reads --------
 
 
-async def test_control_tenants_residency_has_no_default(database_urls):
+async def test_control_tenants_residency_has_no_default(environment):
     """A tenant row with no residency specified has none (NULL): ADR-0008 fails closed rather than
     silently assigning the deployment's residency."""
-    tenant_id, _ = await _seed(database_urls["superuser"])
-    engine = create_async_engine(database_urls["migrations"])
+    # A bare `tenants` row, deliberately not through `seed_tenant` (which always writes its own
+    # `control.tenants` row): the fresh INSERT into `control.tenants` below *is* the thing under
+    # test.
+    tenant_id = uuid.uuid4()
+    superuser_engine = create_async_engine(environment.superuser_url)
+    async with superuser_engine.begin() as conn:
+        await conn.execute(
+            text("INSERT INTO tenants (id, name) VALUES (:id, 'NoResidencyDefault')"),
+            {"id": tenant_id},
+        )
+    await superuser_engine.dispose()
+
+    engine = create_async_engine(environment.owner_url)
     async with engine.connect() as conn:
         await conn.execute(
             text("SELECT set_config('app.tenant_id', :t, false)"), {"t": str(tenant_id)}
@@ -1605,14 +1523,25 @@ async def test_control_tenants_residency_has_no_default(database_urls):
     assert residency is None
 
 
-async def test_control_tenants_residency_rejects_an_unknown_value(database_urls):
+async def test_control_tenants_residency_rejects_an_unknown_value(environment):
     """The database-level CHECK constraint rejects a residency this deployment's configuration
     doesn't know about, mirroring 0005's `isolation_tier` constraint -- adding a residency is a
     migration, never an unchecked string."""
     from sqlalchemy.exc import DBAPIError, IntegrityError
 
-    tenant_id, _ = await _seed(database_urls["superuser"])
-    engine = create_async_engine(database_urls["migrations"])
+    # Same reasoning as the previous test: a bare `tenants` row, not through `seed_tenant`, so
+    # the INSERT below really is a fresh attempt against the CHECK constraint, not a conflict
+    # with a `control.tenants` row `seed_tenant` would otherwise have already written.
+    tenant_id = uuid.uuid4()
+    superuser_engine = create_async_engine(environment.superuser_url)
+    async with superuser_engine.begin() as conn:
+        await conn.execute(
+            text("INSERT INTO tenants (id, name) VALUES (:id, 'UnknownResidency')"),
+            {"id": tenant_id},
+        )
+    await superuser_engine.dispose()
+
+    engine = create_async_engine(environment.owner_url)
     async with engine.connect() as conn:
         await conn.execute(
             text("SELECT set_config('app.tenant_id', :t, false)"), {"t": str(tenant_id)}
@@ -1627,25 +1556,25 @@ async def test_control_tenants_residency_rejects_an_unknown_value(database_urls)
     await engine.dispose()
 
 
-async def test_control_tenants_view_exposes_residency(app_settings, database_urls):
+async def test_control_tenants_view_exposes_residency(environment):
     """The residency the owner role recorded is visible to `app` through the read-only view, on
     the tenant's record, scoped to the caller's own tenant like every other row in
     `control.tenants` -- never on the other tenant's record."""
-    tenant_a, tenant_b = await _seed(database_urls["superuser"])
-    await _set_residency(database_urls["superuser"], tenant_a, "us")
+    tenant_a = (await seed_tenant(environment, via_operator=False)).tenant_id
+    tenant_b = (await seed_tenant(environment, via_operator=False)).tenant_id
+    await _set_residency(environment.superuser_url, tenant_a, "us")
 
     assert (await _tenant_record(tenant_a)).residency == "us"
     assert (await _tenant_record(tenant_b)).residency is None
 
 
-async def test_control_tenants_residency_is_none_when_no_control_plane_row(
-    app_settings, database_urls
-):
-    tenant_a, _ = await _seed(database_urls["superuser"])
+async def test_control_tenants_residency_is_none_when_no_control_plane_row(environment):
+    tenant_a = (await seed_tenant(environment, via_operator=False)).tenant_id
+    _ = (await seed_tenant(environment, via_operator=False)).tenant_id
     assert (await _tenant_record(tenant_a)).residency is None
 
 
-async def test_app_cannot_write_residency(app_settings, database_urls):
+async def test_app_cannot_write_residency(environment):
     """`app` has no UPDATE (or any DML) anywhere in `control` -- only the owner role can ever
     set a tenant's residency; a tenant's own request cannot move itself to another jurisdiction."""
     from sqlalchemy.exc import DBAPIError, ProgrammingError
@@ -1653,8 +1582,8 @@ async def test_app_cannot_write_residency(app_settings, database_urls):
     from app.context import RequestContext
     from app.db.session import tenant_session
 
-    tenant_a, _ = await _seed(database_urls["superuser"])
-    await _set_residency(database_urls["superuser"], tenant_a, "us")
+    tenant_a = (await seed_tenant(environment, via_operator=False)).tenant_id
+    await _set_residency(environment.superuser_url, tenant_a, "us")
     ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
     with pytest.raises((DBAPIError, ProgrammingError)):
         async with tenant_session(ctx_a) as session:
@@ -1664,9 +1593,7 @@ async def test_app_cannot_write_residency(app_settings, database_urls):
             )
 
 
-async def test_ready_endpoint_succeeds_against_real_postgres_as_the_app_role(
-    app_settings, database_urls
-):
+async def test_ready_endpoint_succeeds_against_real_postgres_as_the_app_role(environment):
     """ASGI seam, real backing Postgres (issue #15): the readiness endpoint's default
     dependency — left as-is, not overridden with a fake — succeeds against a real,
     correctly-configured connection as the unprivileged `app` role. The guard (#77) now also
@@ -1679,7 +1606,7 @@ async def test_ready_endpoint_succeeds_against_real_postgres_as_the_app_role(
 
     from app.main import app as main_app
 
-    superuser_engine = create_async_engine(database_urls["superuser"])
+    superuser_engine = create_async_engine(environment.superuser_url)
     async with superuser_engine.begin() as conn:
         await conn.execute(
             text("UPDATE control.tenants SET isolation_tier = 'pooled', database_alias = NULL")
@@ -1727,9 +1654,7 @@ async def _set_tenant_model(url: str, tenant_id: uuid.UUID, model: str) -> None:
     await engine.dispose()
 
 
-async def test_residency_resolves_through_real_rls_and_never_crosses_tenants(
-    app_settings, database_urls, tmp_path
-):
+async def test_residency_resolves_through_real_rls_and_never_crosses_tenants(environment, tmp_path):
     """Given two tenants set to different residencies, resolving one tenant's route never
     returns the other's -- each from its own record, read through the RLS-scoped record read
     (#60, #105)."""
@@ -1737,14 +1662,15 @@ async def test_residency_resolves_through_real_rls_and_never_crosses_tenants(
     from app.residency import ResidencyAllowList, resolve_residency_route
 
     allow_list = ResidencyAllowList.load()
-    tenant_eu, tenant_us = await _seed(database_urls["superuser"])
-    await _set_residency(database_urls["superuser"], tenant_eu, "eu")
-    await _set_residency(database_urls["superuser"], tenant_us, "us")
-    await _set_gateway_alias(database_urls["migrations"], tenant_eu, "acme-gateway-key")
-    await _set_gateway_alias(database_urls["migrations"], tenant_us, "globex-gateway-key")
+    tenant_eu = (await seed_tenant(environment, via_operator=False)).tenant_id
+    tenant_us = (await seed_tenant(environment, via_operator=False)).tenant_id
+    await _set_residency(environment.superuser_url, tenant_eu, "eu")
+    await _set_residency(environment.superuser_url, tenant_us, "us")
+    await _set_gateway_alias(environment.owner_url, tenant_eu, "acme-gateway-key")
+    await _set_gateway_alias(environment.owner_url, tenant_us, "globex-gateway-key")
     (tmp_path / "acme-gateway-key").write_text("sk-acme-secret")
     (tmp_path / "globex-gateway-key").write_text("sk-globex-secret")
-    settings = Settings(database_url=database_urls["app"], gateway_credentials_dir=str(tmp_path))
+    settings = Settings(database_url=environment.app_url, gateway_credentials_dir=str(tmp_path))
 
     resolved_eu = resolve_residency_route(await _tenant_record(tenant_eu), settings=settings)
     resolved_us = resolve_residency_route(await _tenant_record(tenant_us), settings=settings)
@@ -1767,7 +1693,7 @@ async def test_residency_resolves_through_real_rls_and_never_crosses_tenants(
 
 
 async def test_residency_resolution_is_scoped_by_rls_not_just_the_where_clause(
-    app_settings, database_urls, tmp_path
+    environment, tmp_path
 ):
     """Even if the resolver's own WHERE clause were removed or broken, RLS on `tenants` (0001)
     would still stop tenant A's session from ever reading tenant B's row: `tenant_session(ctx)`
@@ -1775,9 +1701,11 @@ async def test_residency_resolution_is_scoped_by_rls_not_just_the_where_clause(
     from app.context import RequestContext
     from app.db.session import tenant_session
 
-    tenant_eu, tenant_us = await _seed(database_urls["superuser"])
-    await _set_residency(database_urls["superuser"], tenant_eu, "eu")
-    await _set_residency(database_urls["superuser"], tenant_us, "us")
+    tenant_eu = (await seed_tenant(environment, via_operator=False)).tenant_id
+
+    tenant_us = (await seed_tenant(environment, via_operator=False)).tenant_id
+    await _set_residency(environment.superuser_url, tenant_eu, "eu")
+    await _set_residency(environment.superuser_url, tenant_us, "us")
 
     ctx_eu = RequestContext(tenant_id=tenant_eu, identity_id=uuid.uuid4())
     async with tenant_session(ctx_eu) as session:
@@ -1792,30 +1720,26 @@ async def test_residency_resolution_is_scoped_by_rls_not_just_the_where_clause(
     assert row is None
 
 
-async def test_resolver_fails_closed_for_a_tenant_with_no_residency_set(
-    app_settings, database_urls
-):
+async def test_resolver_fails_closed_for_a_tenant_with_no_residency_set(environment):
     from app.residency import ResidencyUnresolved, resolve_residency_route
 
-    tenant_a, _ = await _seed(database_urls["superuser"])
+    tenant_a = (await seed_tenant(environment, via_operator=False)).tenant_id
     record = await _tenant_record(tenant_a)
     with pytest.raises(ResidencyUnresolved):
         resolve_residency_route(record)
 
 
-async def test_resolver_fails_closed_for_a_tenant_with_an_unknown_residency(
-    app_settings, database_urls
-):
+async def test_resolver_fails_closed_for_a_tenant_with_an_unknown_residency(environment):
     from app.config import Settings
     from app.residency import ResidencyAllowList, ResidencyUnresolved, resolve_residency_route
 
-    tenant_a, _ = await _seed(database_urls["superuser"])
-    await _set_residency(database_urls["superuser"], tenant_a, "us")
+    tenant_a = (await seed_tenant(environment, via_operator=False)).tenant_id
+    await _set_residency(environment.superuser_url, tenant_a, "us")
     # The database only stores residencies it knows; a deployment whose configuration drops one
     # must still fail closed for tenants recorded under it. No global to patch (spec A4 / #110):
     # the allow-list is swapped on the settings object itself, then handed to the resolver
     # explicitly.
-    settings = Settings(database_url=database_urls["app"])
+    settings = Settings(database_url=environment.app_url)
     settings.residency_allow_list = ResidencyAllowList.from_data(
         {
             "residency": {
@@ -1836,7 +1760,7 @@ async def test_resolver_fails_closed_for_a_tenant_with_an_unknown_residency(
 
 
 async def test_tenant_chat_and_embedding_clients_route_through_real_residency_and_never_cross(
-    app_settings, database_urls, tmp_path
+    environment, tmp_path
 ):
     """`resolve_tenant_chat_model` (app/llm.py) and `resolve_tenant_embedding_client`
     (app/embeddings.py) -- the two entry points the running assistant and the document-search
@@ -1856,16 +1780,18 @@ async def test_tenant_chat_and_embedding_clients_route_through_real_residency_an
     reset_tenant_chat_model_cache()
     reset_tenant_embedding_client_cache()
 
-    tenant_eu, tenant_us = await _seed(database_urls["superuser"])
-    await _set_residency(database_urls["superuser"], tenant_eu, "eu")
-    await _set_residency(database_urls["superuser"], tenant_us, "us")
-    await _set_gateway_alias(database_urls["migrations"], tenant_eu, "acme-gateway-key")
-    await _set_gateway_alias(database_urls["migrations"], tenant_us, "globex-gateway-key")
-    await _set_tenant_model(database_urls["superuser"], tenant_us, "claude")
+    tenant_eu = (await seed_tenant(environment, via_operator=False)).tenant_id
+
+    tenant_us = (await seed_tenant(environment, via_operator=False)).tenant_id
+    await _set_residency(environment.superuser_url, tenant_eu, "eu")
+    await _set_residency(environment.superuser_url, tenant_us, "us")
+    await _set_gateway_alias(environment.owner_url, tenant_eu, "acme-gateway-key")
+    await _set_gateway_alias(environment.owner_url, tenant_us, "globex-gateway-key")
+    await _set_tenant_model(environment.superuser_url, tenant_us, "claude")
     (tmp_path / "acme-gateway-key").write_text("sk-acme-secret")
     (tmp_path / "globex-gateway-key").write_text("sk-globex-secret")
     settings = Settings(
-        database_url=database_urls["app"],
+        database_url=environment.app_url,
         gateway_credentials_dir=str(tmp_path),
         litellm_base_url="http://litellm.internal:4000",
     )
@@ -1896,16 +1822,14 @@ async def test_tenant_chat_and_embedding_clients_route_through_real_residency_an
         reset_tenant_embedding_client_cache()
 
 
-async def test_tenant_with_no_resolvable_residency_fails_closed_on_chat_and_embedding(
-    app_settings, database_urls
-):
+async def test_tenant_with_no_resolvable_residency_fails_closed_on_chat_and_embedding(environment):
     """#61 AC3: a tenant with no resolvable residency is refused cleanly on both the chat and the
     document-search (embedding) path -- neither silently falls back to a default route."""
     from app.embeddings import resolve_tenant_embedding_client
     from app.llm import resolve_tenant_chat_model
     from app.residency import ResidencyUnresolved
 
-    tenant_a, _ = await _seed(database_urls["superuser"])
+    tenant_a = (await seed_tenant(environment, via_operator=False)).tenant_id
     record = await _tenant_record(tenant_a)
 
     with pytest.raises(ResidencyUnresolved):
@@ -1918,44 +1842,12 @@ async def test_tenant_with_no_resolvable_residency_fails_closed_on_chat_and_embe
 # --- Tenant memberships replace per-tenant users (ADR-0003, Spec 2 / #23) ---
 
 
-async def _seed_identity(url: str, *, subject: str) -> uuid.UUID:
-    """A global identity, inserted with the superuser exactly like `_seed`'s tenants/documents:
-    `control.identities` carries no tenant_id and no RLS (ADR-0003)."""
-    engine = create_async_engine(url)
-    identity_id = uuid.uuid4()
-    async with engine.begin() as conn:
-        await conn.execute(
-            text(
-                "INSERT INTO control.identities (id, issuer, subject) "
-                "VALUES (:id, 'https://idp.example.com', :subject)"
-            ),
-            {"id": identity_id, "subject": subject},
-        )
-    await engine.dispose()
-    return identity_id
-
-
-async def _seed_membership(
-    url: str, *, tenant_id: uuid.UUID, identity_id: uuid.UUID, role: str
-) -> None:
-    engine = create_async_engine(url)
-    async with engine.begin() as conn:
-        await conn.execute(
-            text(
-                "INSERT INTO memberships (tenant_id, identity_id, role) "
-                "VALUES (:tenant_id, :identity_id, :role)"
-            ),
-            {"tenant_id": tenant_id, "identity_id": identity_id, "role": role},
-        )
-    await engine.dispose()
-
-
-async def test_migration_drops_users_and_memberships_has_the_expected_shape(database_urls):
+async def test_migration_drops_users_and_memberships_has_the_expected_shape(environment):
     """Acceptance: migrating drops the old per-tenant `users` table and creates `memberships`
     with a required indexed tenant reference, a cross-schema reference to `control.identities`,
     a role restricted to the four defined roles, one membership per identity per tenant, and RLS
     enabled and forced."""
-    engine = create_async_engine(database_urls["migrations"])
+    engine = create_async_engine(environment.owner_url)
     async with engine.connect() as conn:
         users_exists = (
             await conn.execute(
@@ -2025,44 +1917,48 @@ async def test_migration_drops_users_and_memberships_has_the_expected_shape(data
         "identities",
     )
 
-    # One membership per identity per tenant.
-    tenant_id = uuid.uuid4()
-    identity_id = await _seed_identity(database_urls["superuser"], subject="s-unique")
-    superuser_engine = create_async_engine(database_urls["superuser"])
-    async with superuser_engine.begin() as conn:
-        await conn.execute(
-            text("INSERT INTO tenants (id, name) VALUES (:id, 'Uniq')"), {"id": tenant_id}
-        )
-    await superuser_engine.dispose()
-    await _seed_membership(
-        database_urls["superuser"], tenant_id=tenant_id, identity_id=identity_id, role="member"
-    )
+    # One membership per identity per tenant, and role restricted to the four defined roles --
+    # both are database constraints, proven here directly against the constraint, not through a
+    # shared seed helper: a tenant plus one identity holding one membership.
+    seeded = await seed_tenant(environment, roles=["member"], via_operator=False)
+    tenant_id, identity_id = seeded.tenant_id, seeded.identities["member"]
+
     from sqlalchemy.exc import DBAPIError, IntegrityError
 
+    superuser_engine = create_async_engine(environment.superuser_url)
     with pytest.raises((DBAPIError, IntegrityError)):
-        await _seed_membership(
-            database_urls["superuser"], tenant_id=tenant_id, identity_id=identity_id, role="admin"
-        )
+        async with superuser_engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO memberships (tenant_id, identity_id, role) "
+                    "VALUES (:tid, :iid, 'admin')"
+                ),
+                {"tid": tenant_id, "iid": identity_id},
+            )
+    await superuser_engine.dispose()
 
-    # Role restricted to the four defined roles.
-    other_identity_id = await _seed_identity(database_urls["superuser"], subject="s-bad-role")
+    other_identity_id, _ = await seed_membership(environment, tenant_id=tenant_id, role="support")
+    superuser_engine = create_async_engine(environment.superuser_url)
     with pytest.raises((DBAPIError, IntegrityError)):
-        await _seed_membership(
-            database_urls["superuser"],
-            tenant_id=tenant_id,
-            identity_id=other_identity_id,
-            role="owner",
-        )
+        async with superuser_engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO memberships (tenant_id, identity_id, role) "
+                    "VALUES (:tid, :iid, 'owner')"
+                ),
+                {"tid": tenant_id, "iid": other_identity_id},
+            )
+    await superuser_engine.dispose()
 
 
-async def test_role_type_matches_the_database_check_constraint(database_urls):
+async def test_role_type_matches_the_database_check_constraint(environment):
     """Acceptance (#28): the `memberships_role_valid` CHECK constraint's legal values match,
     string for string, `app.context.ROLES` -- the single source of truth the application's role
     check (`RequestContext.require_role`) is built against. Read from the database itself
     rather than hard-coded here, so a change to either side without the other fails this test."""
     from app.context import ROLES
 
-    engine = create_async_engine(database_urls["migrations"])
+    engine = create_async_engine(environment.owner_url)
     async with engine.connect() as conn:
         definition = (
             await conn.execute(
@@ -2078,9 +1974,9 @@ async def test_role_type_matches_the_database_check_constraint(database_urls):
     assert db_roles == set(ROLES)
 
 
-async def test_memberships_grants_mirror_the_retired_users_grants(database_urls):
+async def test_memberships_grants_mirror_the_retired_users_grants(environment):
     """Acceptance: grants on `memberships` for `app` mirror the retired `users` grants."""
-    engine = create_async_engine(database_urls["app"])
+    engine = create_async_engine(environment.app_url)
     async with engine.connect() as conn:
         privileges = (
             (
@@ -2099,9 +1995,7 @@ async def test_memberships_grants_mirror_the_retired_users_grants(database_urls)
     assert set(privileges) == {"SELECT", "INSERT", "UPDATE", "DELETE"}
 
 
-async def test_second_tenants_memberships_are_invisible_without_its_own_context(
-    app_settings, database_urls
-):
+async def test_second_tenants_memberships_are_invisible_without_its_own_context(environment):
     """Acceptance (mirrors the retired users coverage): a second tenant's membership rows are
     invisible without that tenant's own context set, and a cross-tenant insert or update fails
     the write check."""
@@ -2110,15 +2004,10 @@ async def test_second_tenants_memberships_are_invisible_without_its_own_context(
     from app.context import RequestContext
     from app.db.session import tenant_session
 
-    tenant_a, tenant_b = await _seed(database_urls["superuser"])
-    identity_a = await _seed_identity(database_urls["superuser"], subject="s-a")
-    identity_b = await _seed_identity(database_urls["superuser"], subject="s-b")
-    await _seed_membership(
-        database_urls["superuser"], tenant_id=tenant_a, identity_id=identity_a, role="admin"
-    )
-    await _seed_membership(
-        database_urls["superuser"], tenant_id=tenant_b, identity_id=identity_b, role="admin"
-    )
+    seeded_a = await seed_tenant(environment, roles=["admin"], via_operator=False)
+    seeded_b = await seed_tenant(environment, roles=["admin"], via_operator=False)
+    tenant_a, identity_a = seeded_a.tenant_id, seeded_a.identities["admin"]
+    tenant_b, identity_b = seeded_b.tenant_id, seeded_b.identities["admin"]
 
     ctx_a = RequestContext(tenant_id=tenant_a, identity_id=identity_a)
     async with tenant_session(ctx_a) as session:
@@ -2146,18 +2035,15 @@ async def test_second_tenants_memberships_are_invisible_without_its_own_context(
         assert result.rowcount == 0
 
 
-async def test_membership_lookup_returns_role_or_none(app_settings, database_urls):
+async def test_membership_lookup_returns_role_or_none(environment):
     """Acceptance: the membership lookup returns the role for an existing tenant/identity pair
     and returns nothing rather than raising when no row matches."""
     from app.context import RequestContext
     from app.db.session import tenant_session
     from app.repositories.memberships import MembershipRepository
 
-    tenant_a, _ = await _seed(database_urls["superuser"])
-    identity_a = await _seed_identity(database_urls["superuser"], subject="s-lookup")
-    await _seed_membership(
-        database_urls["superuser"], tenant_id=tenant_a, identity_id=identity_a, role="support"
-    )
+    seeded = await seed_tenant(environment, roles=["support"], via_operator=False)
+    tenant_a, identity_a = seeded.tenant_id, seeded.identities["support"]
 
     ctx_a = RequestContext(tenant_id=tenant_a, identity_id=identity_a)
     async with tenant_session(ctx_a) as session:
@@ -2167,22 +2053,17 @@ async def test_membership_lookup_returns_role_or_none(app_settings, database_url
     assert missing is None
 
 
-async def test_list_for_tenant_returns_every_role_unfiltered(app_settings, database_urls):
+async def test_list_for_tenant_returns_every_role_unfiltered(environment):
     """Acceptance: listing a tenant's memberships returns every row including a support-role
     one, with no role-based filtering."""
     from app.context import RequestContext
     from app.db.session import tenant_session
     from app.repositories.memberships import MembershipRepository
 
-    tenant_a, _ = await _seed(database_urls["superuser"])
-    identities = {
-        role: await _seed_identity(database_urls["superuser"], subject=f"s-{role}")
-        for role in ("admin", "member", "support", "agent")
-    }
-    for role, identity_id in identities.items():
-        await _seed_membership(
-            database_urls["superuser"], tenant_id=tenant_a, identity_id=identity_id, role=role
-        )
+    seeded = await seed_tenant(
+        environment, roles=["admin", "member", "support", "agent"], via_operator=False
+    )
+    tenant_a, identities = seeded.tenant_id, seeded.identities
 
     ctx_a = RequestContext(tenant_id=tenant_a, identity_id=identities["admin"])
     async with tenant_session(ctx_a) as session:
@@ -2193,20 +2074,29 @@ async def test_list_for_tenant_returns_every_role_unfiltered(app_settings, datab
 
 
 async def test_app_cannot_widen_its_control_plane_view_with_the_migration_read_flag(
-    database_urls,
+    environment,
 ):
     """0016's migration-read policy exists for the owner-role migration runner only. `app` can
     set any custom setting itself, so setting `app.control_migration_read` must still leave it
     seeing nothing but its own tenant's control-plane row."""
     tenant_a, tenant_b = uuid.uuid4(), uuid.uuid4()
-    owner = create_async_engine(database_urls["superuser"])
+    owner = create_async_engine(environment.superuser_url)
     async with owner.begin() as conn:
         for tid, name in ((tenant_a, "Flag A"), (tenant_b, "Flag B")):
-            await _insert_public_tenant(conn, tid, name)
-            await _insert_control_tenant(conn, tid, isolation_tier="pooled", database_alias=None)
+            await conn.execute(
+                text("INSERT INTO tenants (id, name) VALUES (:id, :name)"),
+                {"id": tid, "name": name},
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO control.tenants (tenant_id, isolation_tier, database_alias) "
+                    "VALUES (:tid, :tier, :alias)"
+                ),
+                {"tid": tid, "tier": "pooled", "alias": None},
+            )
     await owner.dispose()
 
-    app = create_async_engine(database_urls["app"])
+    app = create_async_engine(environment.app_url)
     async with app.begin() as conn:
         await conn.execute(text("SELECT set_config('app.control_migration_read', 'true', true)"))
         await conn.execute(
@@ -2219,20 +2109,27 @@ async def test_app_cannot_widen_its_control_plane_view_with_the_migration_read_f
     assert visible == [tenant_a]
 
 
-async def test_app_without_tenant_context_sees_no_control_plane_rows(database_urls):
+async def test_app_without_tenant_context_sees_no_control_plane_rows(environment):
     """No context means no rows -- for the control plane too. The guard's cross-tenant alias
     enumeration goes through `control.enumerate_database_aliases()` only, never by widening what
     a context-less `app` session can read from `control.tenants_view`."""
     tenant_id = uuid.uuid4()
-    owner = create_async_engine(database_urls["superuser"])
+    owner = create_async_engine(environment.superuser_url)
     async with owner.begin() as conn:
-        await _insert_public_tenant(conn, tenant_id, "No-context")
-        await _insert_control_tenant(
-            conn, tenant_id, isolation_tier="dedicated", database_alias="no-context-alias"
+        await conn.execute(
+            text("INSERT INTO tenants (id, name) VALUES (:id, :name)"),
+            {"id": tenant_id, "name": "No-context"},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO control.tenants (tenant_id, isolation_tier, database_alias) "
+                "VALUES (:tid, :tier, :alias)"
+            ),
+            {"tid": tenant_id, "tier": "dedicated", "alias": "no-context-alias"},
         )
     await owner.dispose()
 
-    app = create_async_engine(database_urls["app"])
+    app = create_async_engine(environment.app_url)
     async with app.begin() as conn:
         visible = (await conn.execute(text("SELECT tenant_id FROM control.tenants_view"))).all()
         aliases = (
@@ -2261,13 +2158,11 @@ def _run_response_message(text_content: str):
     return ModelResponse(parts=[TextPart(content=text_content)])
 
 
-async def test_conversations_and_messages_have_forced_rls_and_app_grants(
-    app_settings, database_urls
-):
+async def test_conversations_and_messages_have_forced_rls_and_app_grants(environment):
     """#32 AC1: both tables get tenant_id NOT NULL, a tenant index, FORCE ROW LEVEL SECURITY, the
     standard USING/WITH CHECK tenant policy, and a grant to app for exactly select/insert/delete
     (no update)."""
-    engine = create_async_engine(database_urls["migrations"])
+    engine = create_async_engine(environment.owner_url)
     async with engine.connect() as conn:
         for table in ("conversations", "messages"):
             rls = (
@@ -2324,7 +2219,7 @@ async def test_conversations_and_messages_have_forced_rls_and_app_grants(
             )
     await engine.dispose()
 
-    app_engine = create_async_engine(database_urls["app"])
+    app_engine = create_async_engine(environment.app_url)
     async with app_engine.connect() as conn:
         for table in ("conversations", "messages"):
             privileges = (
@@ -2345,15 +2240,18 @@ async def test_conversations_and_messages_have_forced_rls_and_app_grants(
     await app_engine.dispose()
 
 
-async def test_conversation_and_messages_invisible_to_another_tenant(app_settings, database_urls):
+async def test_conversation_and_messages_invisible_to_another_tenant(environment):
     """#32 AC2: a conversation and its messages created under one tenant's context are invisible
     to another tenant's context -- mirrors test_search_sees_only_own_tenant."""
     from app.context import RequestContext
     from app.db.session import tenant_session
     from app.repositories.conversations import ConversationsRepository
 
-    tenant_a, identity_a = await _create_tenant_and_identity(database_urls["superuser"])
-    tenant_b, identity_b = await _create_tenant_and_identity(database_urls["superuser"])
+    _seeded = await seed_tenant(environment, roles=["member"], via_operator=False)
+
+    tenant_a, identity_a = _seeded.tenant_id, _seeded.identities["member"]
+    _seeded = await seed_tenant(environment, roles=["member"], via_operator=False)
+    tenant_b, identity_b = _seeded.tenant_id, _seeded.identities["member"]
 
     ctx_a = RequestContext(tenant_id=tenant_a, identity_id=identity_a)
     async with tenant_session(ctx_a) as session:
@@ -2371,7 +2269,7 @@ async def test_conversation_and_messages_invisible_to_another_tenant(app_setting
         )
     assert history == []
 
-    engine = create_async_engine(database_urls["superuser"])
+    engine = create_async_engine(environment.superuser_url)
     async with engine.connect() as conn:
         count = (
             await conn.execute(
@@ -2382,7 +2280,7 @@ async def test_conversation_and_messages_invisible_to_another_tenant(app_setting
     assert count == 0
 
 
-async def test_conversation_insert_for_other_tenant_is_rejected(app_settings, database_urls):
+async def test_conversation_insert_for_other_tenant_is_rejected(environment):
     """#32 AC3: an insert attempting to write another tenant's tenant_id is rejected by the
     policy's WITH CHECK -- mirrors test_insert_for_other_tenant_is_rejected."""
     from sqlalchemy.exc import DBAPIError
@@ -2390,8 +2288,11 @@ async def test_conversation_insert_for_other_tenant_is_rejected(app_settings, da
     from app.context import RequestContext
     from app.db.session import tenant_session
 
-    tenant_a, identity_a = await _create_tenant_and_identity(database_urls["superuser"])
-    tenant_b, _ = await _create_tenant_and_identity(database_urls["superuser"])
+    _seeded = await seed_tenant(environment, roles=["member"], via_operator=False)
+
+    tenant_a, identity_a = _seeded.tenant_id, _seeded.identities["member"]
+    _seeded = await seed_tenant(environment, roles=["member"], via_operator=False)
+    tenant_b, _ = _seeded.tenant_id, _seeded.identities["member"]
     ctx_a = RequestContext(tenant_id=tenant_a, identity_id=identity_a)
     with pytest.raises(DBAPIError):
         async with tenant_session(ctx_a) as session:
@@ -2404,7 +2305,7 @@ async def test_conversation_insert_for_other_tenant_is_rejected(app_settings, da
             )
 
 
-async def test_conversation_loaded_by_another_member_comes_back_empty(app_settings, database_urls):
+async def test_conversation_loaded_by_another_member_comes_back_empty(environment):
     """#32 AC4: loading a conversation through the repository under one member's context never
     returns a conversation created under a different member's context in the same tenant -- it
     comes back empty, not as an error."""
@@ -2412,8 +2313,10 @@ async def test_conversation_loaded_by_another_member_comes_back_empty(app_settin
     from app.db.session import tenant_session
     from app.repositories.conversations import ConversationsRepository
 
-    tenant_id, creator_id = await _create_tenant_and_identity(database_urls["superuser"])
-    other_identity = await _seed_identity(database_urls["superuser"], subject="s-other-member")
+    _seeded = await seed_tenant(environment, roles=["member"], via_operator=False)
+
+    tenant_id, creator_id = _seeded.tenant_id, _seeded.identities["member"]
+    other_identity, _ = await seed_membership(environment, tenant_id=tenant_id, role="support")
 
     creator_ctx = RequestContext(tenant_id=tenant_id, identity_id=creator_id)
     async with tenant_session(creator_ctx) as session:
@@ -2439,21 +2342,23 @@ async def test_conversation_loaded_by_another_member_comes_back_empty(app_settin
     assert history == []
 
 
-async def test_message_created_by_matches_session_identity(app_settings, database_urls):
+async def test_message_created_by_matches_session_identity(environment):
     """#32 AC5: a freshly appended message's created_by column matches the session's identity
     with no explicit value passed by the caller."""
     from app.context import RequestContext
     from app.db.session import tenant_session
     from app.repositories.conversations import ConversationsRepository
 
-    tenant_id, identity_id = await _create_tenant_and_identity(database_urls["superuser"])
+    _seeded = await seed_tenant(environment, roles=["member"], via_operator=False)
+
+    tenant_id, identity_id = _seeded.tenant_id, _seeded.identities["member"]
     ctx = RequestContext(tenant_id=tenant_id, identity_id=identity_id)
     async with tenant_session(ctx) as session:
         await ConversationsRepository().append_run(
             session, ctx, conversation_id="conv-audit", messages=[_run_request_message("hi")]
         )
 
-    engine = create_async_engine(database_urls["superuser"])
+    engine = create_async_engine(environment.superuser_url)
     async with engine.connect() as conn:
         created_by = (
             await conn.execute(
@@ -2468,16 +2373,16 @@ async def test_message_created_by_matches_session_identity(app_settings, databas
     assert created_by == identity_id
 
 
-async def test_messages_reload_in_the_exact_sequence_they_were_appended(
-    app_settings, database_urls
-):
+async def test_messages_reload_in_the_exact_sequence_they_were_appended(environment):
     """#32 AC6: messages reload in the exact sequence they were appended, verified via the
     monotonic sequence column rather than timestamps."""
     from app.context import RequestContext
     from app.db.session import tenant_session
     from app.repositories.conversations import ConversationsRepository
 
-    tenant_id, identity_id = await _create_tenant_and_identity(database_urls["superuser"])
+    _seeded = await seed_tenant(environment, roles=["member"], via_operator=False)
+
+    tenant_id, identity_id = _seeded.tenant_id, _seeded.identities["member"]
     ctx = RequestContext(tenant_id=tenant_id, identity_id=identity_id)
 
     async with tenant_session(ctx) as session:
@@ -2505,7 +2410,7 @@ async def test_messages_reload_in_the_exact_sequence_they_were_appended(
 
     assert [_text_of(m) for m in history] == ["first", "second", "third", "fourth"]
 
-    engine = create_async_engine(database_urls["superuser"])
+    engine = create_async_engine(environment.superuser_url)
     async with engine.connect() as conn:
         sequences = (
             (
@@ -2525,16 +2430,16 @@ async def test_messages_reload_in_the_exact_sequence_they_were_appended(
     assert sequences == [1, 2, 3, 4]
 
 
-async def test_message_payload_round_trips_through_the_library_native_type(
-    app_settings, database_urls
-):
+async def test_message_payload_round_trips_through_the_library_native_type(environment):
     """#32 AC7: a stored message's payload deserializes back into the exact library-native
     message object it was created from."""
     from app.context import RequestContext
     from app.db.session import tenant_session
     from app.repositories.conversations import ConversationsRepository
 
-    tenant_id, identity_id = await _create_tenant_and_identity(database_urls["superuser"])
+    _seeded = await seed_tenant(environment, roles=["member"], via_operator=False)
+
+    tenant_id, identity_id = _seeded.tenant_id, _seeded.identities["member"]
     ctx = RequestContext(tenant_id=tenant_id, identity_id=identity_id)
 
     request_message = _run_request_message("round trip me")
@@ -2556,23 +2461,23 @@ async def test_message_payload_round_trips_through_the_library_native_type(
     assert history == [request_message, response_message]
 
 
-async def test_deleting_a_tenant_cascades_to_conversations_and_messages(
-    app_settings, database_urls
-):
+async def test_deleting_a_tenant_cascades_to_conversations_and_messages(environment):
     """#32 AC8: deleting a tenant row removes its conversations and messages via the existing
     cascading foreign key."""
     from app.context import RequestContext
     from app.db.session import tenant_session
     from app.repositories.conversations import ConversationsRepository
 
-    tenant_id, identity_id = await _create_tenant_and_identity(database_urls["superuser"])
+    _seeded = await seed_tenant(environment, roles=["member"], via_operator=False)
+
+    tenant_id, identity_id = _seeded.tenant_id, _seeded.identities["member"]
     ctx = RequestContext(tenant_id=tenant_id, identity_id=identity_id)
     async with tenant_session(ctx) as session:
         await ConversationsRepository().append_run(
             session, ctx, conversation_id="conv-cascade", messages=[_run_request_message("bye")]
         )
 
-    engine = create_async_engine(database_urls["superuser"])
+    engine = create_async_engine(environment.superuser_url)
     async with engine.begin() as conn:
         await conn.execute(text("DELETE FROM tenants WHERE id = :tid"), {"tid": tenant_id})
     async with engine.connect() as conn:
@@ -2593,7 +2498,7 @@ async def test_deleting_a_tenant_cascades_to_conversations_and_messages(
 
 
 async def test_conversations_migration_downgrade_after_upgrade_drops_both_tables_cleanly(
-    database_urls,
+    environment,
 ):
     """#32 AC9: running the migration's downgrade after its upgrade drops both tables cleanly.
     Runs against a savepoint on the shared module-scoped database so it does not disturb the
@@ -2602,7 +2507,7 @@ async def test_conversations_migration_downgrade_after_upgrade_drops_both_tables
     `alembic downgrade` would run 0022's downgrade (dropping `pending_actions`) before 0020's --
     this manual replay of 0020's own downgrade steps needs the same ordering to avoid a dependent-
     object error unrelated to what this test actually checks."""
-    engine = create_async_engine(database_urls["migrations"])
+    engine = create_async_engine(environment.owner_url)
     async with engine.begin() as conn:
         await conn.execute(text("SAVEPOINT before_downgrade"))
         await conn.execute(text("DROP TABLE IF EXISTS pending_actions"))
@@ -2623,9 +2528,7 @@ async def test_conversations_migration_downgrade_after_upgrade_drops_both_tables
     await engine.dispose()
 
 
-async def test_last_activity_at_advances_on_append_without_app_holding_update_grant(
-    app_settings, database_urls
-):
+async def test_last_activity_at_advances_on_append_without_app_holding_update_grant(environment):
     """The trigger-based escape hatch (module docstring in migration 0020): app can never issue
     UPDATE on conversations directly, yet last_activity_at still advances when a message is
     appended through the repository."""
@@ -2633,7 +2536,9 @@ async def test_last_activity_at_advances_on_append_without_app_holding_update_gr
     from app.db.session import tenant_session
     from app.repositories.conversations import ConversationsRepository
 
-    tenant_id, identity_id = await _create_tenant_and_identity(database_urls["superuser"])
+    _seeded = await seed_tenant(environment, roles=["member"], via_operator=False)
+
+    tenant_id, identity_id = _seeded.tenant_id, _seeded.identities["member"]
     ctx = RequestContext(tenant_id=tenant_id, identity_id=identity_id)
 
     async with tenant_session(ctx) as session:
@@ -2641,7 +2546,7 @@ async def test_last_activity_at_advances_on_append_without_app_holding_update_gr
             session, ctx, conversation_id="conv-touch", messages=[_run_request_message("one")]
         )
 
-    engine = create_async_engine(database_urls["superuser"])
+    engine = create_async_engine(environment.superuser_url)
     async with engine.connect() as conn:
         row = (
             await conn.execute(
@@ -2668,9 +2573,7 @@ async def test_last_activity_at_advances_on_append_without_app_holding_update_gr
             )
 
 
-async def test_delete_expired_removes_only_this_tenants_expired_conversations(
-    app_settings, database_urls
-):
+async def test_delete_expired_removes_only_this_tenants_expired_conversations(environment):
     """Repository contract: given a context and an age cutoff, delete_expired removes that
     tenant's expired conversations (and, via cascade, their messages) in one tenant-scoped
     operation -- leaving a still-fresh conversation, and another tenant's conversations,
@@ -2681,8 +2584,11 @@ async def test_delete_expired_removes_only_this_tenants_expired_conversations(
     from app.db.session import tenant_session
     from app.repositories.conversations import ConversationsRepository
 
-    tenant_a, identity_a = await _create_tenant_and_identity(database_urls["superuser"])
-    tenant_b, identity_b = await _create_tenant_and_identity(database_urls["superuser"])
+    _seeded = await seed_tenant(environment, roles=["member"], via_operator=False)
+
+    tenant_a, identity_a = _seeded.tenant_id, _seeded.identities["member"]
+    _seeded = await seed_tenant(environment, roles=["member"], via_operator=False)
+    tenant_b, identity_b = _seeded.tenant_id, _seeded.identities["member"]
     ctx_a = RequestContext(tenant_id=tenant_a, identity_id=identity_a)
     ctx_b = RequestContext(tenant_id=tenant_b, identity_id=identity_b)
 
@@ -2700,7 +2606,7 @@ async def test_delete_expired_removes_only_this_tenants_expired_conversations(
 
     # Backdate tenant A's "old" conversation only, as the superuser (bypasses RLS by role, not
     # by policy shape -- this is fixture setup, exactly like `_seed`'s direct inserts).
-    engine = create_async_engine(database_urls["superuser"])
+    engine = create_async_engine(environment.superuser_url)
     backdated = datetime.now(UTC) - timedelta(days=365)
     async with engine.begin() as conn:
         await conn.execute(
@@ -2717,7 +2623,7 @@ async def test_delete_expired_removes_only_this_tenants_expired_conversations(
         deleted = await ConversationsRepository().delete_expired(session, ctx_a, older_than=cutoff)
     assert deleted == 1
 
-    engine = create_async_engine(database_urls["superuser"])
+    engine = create_async_engine(environment.superuser_url)
     async with engine.connect() as conn:
         remaining_a = (
             (
@@ -2760,53 +2666,16 @@ async def test_delete_expired_removes_only_this_tenants_expired_conversations(
 # --- Pending actions for writing-tool approval (ADR-0007, Spec 5 / #37) ---
 
 
-async def _seed_pending_action_fixture(
-    url: str, *, conversation_id: str = "conv-1"
-) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
-    """A tenant with one identity holding a membership, and one conversation for it to reference
-    -- the minimum a pending action's foreign keys require. Seeded with the superuser, exactly
-    like `_seed`'s/`_create_tenant_and_identity`'s direct inserts. Returns
-    `(tenant_id, membership_id, identity_id)`."""
-    engine = create_async_engine(url)
-    tenant_id, identity_id = uuid.uuid4(), uuid.uuid4()
-    async with engine.begin() as conn:
-        await conn.execute(
-            text("INSERT INTO tenants (id, name) VALUES (:id, 'PendingActions')"), {"id": tenant_id}
-        )
-        await conn.execute(
-            text("INSERT INTO control.identities (id, issuer, subject) VALUES (:id, 'seed', :sub)"),
-            {"id": identity_id, "sub": str(identity_id)},
-        )
-        membership_id = (
-            await conn.execute(
-                text(
-                    "INSERT INTO memberships (tenant_id, identity_id, role) "
-                    "VALUES (:tid, :iid, 'member') RETURNING id"
-                ),
-                {"tid": tenant_id, "iid": identity_id},
-            )
-        ).scalar_one()
-        await conn.execute(
-            text(
-                "INSERT INTO conversations (tenant_id, conversation_id, created_by) "
-                "VALUES (:tid, :cid, :creator)"
-            ),
-            {"tid": tenant_id, "cid": conversation_id, "creator": identity_id},
-        )
-    await engine.dispose()
-    return tenant_id, membership_id, identity_id
-
-
 def _aware(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
-async def test_pending_action_has_forced_rls_and_app_grants(app_settings, database_urls):
+async def test_pending_action_has_forced_rls_and_app_grants(environment):
     """#37 AC1 (grant half): pending_actions gets the same tenant-table shape as every other
     tenant table -- forced RLS, a tenant-scoped USING/WITH CHECK policy -- and `app` is granted
     exactly SELECT, INSERT, UPDATE (UPDATE for resolving a pending action; no DELETE, matching
     `agent_credentials`)."""
-    engine = create_async_engine(database_urls["migrations"])
+    engine = create_async_engine(environment.owner_url)
     async with engine.connect() as conn:
         rls = (
             await conn.execute(
@@ -2836,7 +2705,7 @@ async def test_pending_action_has_forced_rls_and_app_grants(app_settings, databa
         )
     await engine.dispose()
 
-    app_engine = create_async_engine(database_urls["app"])
+    app_engine = create_async_engine(environment.app_url)
     async with app_engine.connect() as conn:
         privileges = (
             (
@@ -2855,7 +2724,7 @@ async def test_pending_action_has_forced_rls_and_app_grants(app_settings, databa
     assert set(privileges) == {"SELECT", "INSERT", "UPDATE"}
 
 
-async def test_pending_action_invisible_to_another_tenant(app_settings, database_urls):
+async def test_pending_action_invisible_to_another_tenant(environment):
     """#37 AC1 (isolation half): a pending action created for one tenant is invisible to a second
     tenant's session under the standard RLS policy -- mirrors
     test_conversation_and_messages_invisible_to_another_tenant."""
@@ -2863,11 +2732,25 @@ async def test_pending_action_invisible_to_another_tenant(app_settings, database
     from app.db.session import tenant_session
     from app.repositories.pending_actions import PendingActionRepository
 
-    tenant_a, membership_a, identity_a = await _seed_pending_action_fixture(
-        database_urls["superuser"]
+    _seeded = await seed_tenant(environment, roles=["member"], via_operator=False)
+
+    tenant_a, membership_a, identity_a = (
+        _seeded.tenant_id,
+        _seeded.memberships["member"],
+        _seeded.identities["member"],
     )
-    tenant_b, _, identity_b = await _seed_pending_action_fixture(
-        database_urls["superuser"], conversation_id="conv-b"
+
+    await seed_conversation(
+        environment, tenant_id=tenant_a, identity_id=identity_a, conversation_id="conv-1"
+    )
+    _seeded = await seed_tenant(environment, roles=["member"], via_operator=False)
+    tenant_b, _, identity_b = (
+        _seeded.tenant_id,
+        _seeded.memberships["member"],
+        _seeded.identities["member"],
+    )
+    await seed_conversation(
+        environment, tenant_id=tenant_b, identity_id=identity_b, conversation_id="conv-b"
     )
 
     ctx_a = RequestContext(tenant_id=tenant_a, identity_id=identity_a)
@@ -2889,7 +2772,7 @@ async def test_pending_action_invisible_to_another_tenant(app_settings, database
         found = await PendingActionRepository().get(session, ctx_b, pending_action_id=action_id)
     assert found is None
 
-    engine = create_async_engine(database_urls["superuser"])
+    engine = create_async_engine(environment.superuser_url)
     async with engine.connect() as conn:
         count = (
             await conn.execute(
@@ -2901,7 +2784,7 @@ async def test_pending_action_invisible_to_another_tenant(app_settings, database
     assert count == 0
 
 
-async def test_verify_refuses_when_recomputed_hash_does_not_match(app_settings, database_urls):
+async def test_verify_refuses_when_recomputed_hash_does_not_match(environment):
     """#37 AC2: verification recomputes the argument hash from a fresh call and refuses when it
     does not match the stored hash, even though the tool name, tenant, and conversation the
     caller passes all match the approved record."""
@@ -2909,8 +2792,16 @@ async def test_verify_refuses_when_recomputed_hash_does_not_match(app_settings, 
     from app.db.session import tenant_session
     from app.repositories.pending_actions import PendingActionRepository
 
-    tenant_id, membership_id, identity_id = await _seed_pending_action_fixture(
-        database_urls["superuser"]
+    _seeded = await seed_tenant(environment, roles=["member"], via_operator=False)
+
+    tenant_id, membership_id, identity_id = (
+        _seeded.tenant_id,
+        _seeded.memberships["member"],
+        _seeded.identities["member"],
+    )
+
+    await seed_conversation(
+        environment, tenant_id=tenant_id, identity_id=identity_id, conversation_id="conv-1"
     )
     ctx = RequestContext(tenant_id=tenant_id, identity_id=identity_id)
     repo = PendingActionRepository()
@@ -2955,7 +2846,7 @@ async def test_verify_refuses_when_recomputed_hash_does_not_match(app_settings, 
     assert result.ok is True
 
 
-async def test_verify_refuses_a_pending_action_past_its_expiry(app_settings, database_urls):
+async def test_verify_refuses_a_pending_action_past_its_expiry(environment):
     """#37 AC3: verification refuses a pending action past its expiry, exercised against the real
     wall clock (a negative `expires_in` puts the record in the past the instant it is created --
     no mocked time module involved)."""
@@ -2963,8 +2854,16 @@ async def test_verify_refuses_a_pending_action_past_its_expiry(app_settings, dat
     from app.db.session import tenant_session
     from app.repositories.pending_actions import PendingActionRepository
 
-    tenant_id, membership_id, identity_id = await _seed_pending_action_fixture(
-        database_urls["superuser"]
+    _seeded = await seed_tenant(environment, roles=["member"], via_operator=False)
+
+    tenant_id, membership_id, identity_id = (
+        _seeded.tenant_id,
+        _seeded.memberships["member"],
+        _seeded.identities["member"],
+    )
+
+    await seed_conversation(
+        environment, tenant_id=tenant_id, identity_id=identity_id, conversation_id="conv-1"
     )
     ctx = RequestContext(tenant_id=tenant_id, identity_id=identity_id)
     repo = PendingActionRepository()
@@ -2997,19 +2896,25 @@ async def test_verify_refuses_a_pending_action_past_its_expiry(app_settings, dat
     assert result.reason == "expired"
 
 
-async def test_resolving_one_pending_action_leaves_anothers_status_untouched(
-    app_settings, database_urls
-):
+async def test_resolving_one_pending_action_leaves_anothers_status_untouched(environment):
     """#37 AC4: two pending actions in two different conversations of the same tenant resolve
     independently -- answering one leaves the other's status untouched."""
     from app.context import RequestContext
     from app.db.session import tenant_session
     from app.repositories.pending_actions import PendingActionRepository
 
-    tenant_id, membership_id, identity_id = await _seed_pending_action_fixture(
-        database_urls["superuser"], conversation_id="conv-1"
+    _seeded = await seed_tenant(environment, roles=["member"], via_operator=False)
+
+    tenant_id, membership_id, identity_id = (
+        _seeded.tenant_id,
+        _seeded.memberships["member"],
+        _seeded.identities["member"],
     )
-    engine = create_async_engine(database_urls["superuser"])
+
+    await seed_conversation(
+        environment, tenant_id=tenant_id, identity_id=identity_id, conversation_id="conv-1"
+    )
+    engine = create_async_engine(environment.superuser_url)
     async with engine.begin() as conn:
         await conn.execute(
             text(
@@ -3058,7 +2963,7 @@ async def test_resolving_one_pending_action_leaves_anothers_status_untouched(
     assert reloaded_second.status == "pending"
 
 
-async def test_expiry_window_is_configuration_not_a_constant(app_settings, database_urls):
+async def test_expiry_window_is_configuration_not_a_constant(environment):
     """#37 AC5: two pending actions created under two different configured expiry windows expire
     at different offsets from their own creation time -- the window is the caller's own
     configuration, never a hard-coded duration inside the repository."""
@@ -3066,8 +2971,16 @@ async def test_expiry_window_is_configuration_not_a_constant(app_settings, datab
     from app.db.session import tenant_session
     from app.repositories.pending_actions import PendingActionRepository
 
-    tenant_id, membership_id, identity_id = await _seed_pending_action_fixture(
-        database_urls["superuser"]
+    _seeded = await seed_tenant(environment, roles=["member"], via_operator=False)
+
+    tenant_id, membership_id, identity_id = (
+        _seeded.tenant_id,
+        _seeded.memberships["member"],
+        _seeded.identities["member"],
+    )
+
+    await seed_conversation(
+        environment, tenant_id=tenant_id, identity_id=identity_id, conversation_id="conv-1"
     )
     ctx = RequestContext(tenant_id=tenant_id, identity_id=identity_id)
     repo = PendingActionRepository()
@@ -3104,7 +3017,7 @@ async def test_expiry_window_is_configuration_not_a_constant(app_settings, datab
 
 
 async def test_no_context_on_a_reused_connection_means_no_rows_not_an_error(
-    app_settings, database_urls, monkeypatch
+    environment, monkeypatch
 ):
     """Once a pooled connection has carried a tenant context, Postgres leaves `app.tenant_id`
     as '' (not NULL) after the transaction and after RESET ALL. Every policy must treat that as
@@ -3120,7 +3033,7 @@ async def test_no_context_on_a_reused_connection_means_no_rows_not_an_error(
     db_session._engine = None
     db_session._session_factory = None
 
-    tenant_a, _ = await _seed(database_urls["superuser"])
+    tenant_a = (await seed_tenant(environment, via_operator=False)).tenant_id
     async with db_session.tenant_session(
         RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
     ) as session:
