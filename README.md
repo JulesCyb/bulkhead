@@ -14,7 +14,7 @@ enforced by the database and refused at startup, never left to a code review.
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-22c55e?style=flat-square)](https://github.com/JulesCyb/bulkhead/issues)
 
 <p align="center">
-  <img src="docs/architecture.svg" alt="bulkhead architecture: web, mobile, and MCP clients enter through one front door that names the tenant and carries a signed token; inside one deployment the agents reach data only through tools; wall 2 — a human approves every change; wall 1 — each tenant's data is sealed by Postgres Row-Level Security; wall 3 — a residency gate keeps content in its jurisdiction before it reaches the model gateway or the trace sink" width="100%">
+  <img src="docs/architecture.svg" alt="bulkhead architecture: web, mobile, and MCP clients enter through one front door that names the tenant and carries a signed token; inside one deployment the agents reach data only through tools; wall 1 — each tenant's data is sealed by Postgres Row-Level Security; wall 2 — a human approves every change; wall 3 — a residency gate keeps content in its jurisdiction before it reaches the model gateway or the trace sink" width="100%">
 </p>
 
 <p align="center"><sub>The diagram is code: <code>uv run python scripts/render_architecture.py</code> regenerates it.</sub></p>
