@@ -159,7 +159,7 @@ async def test_suspending_between_two_requests_refuses_the_second_before_any_ten
     assert len(searched) == 1  # only the first request ever reached the tool
 
 
-# --- AUTH_MODE=jwt: the production path, with the membership read before the record ---
+# --- AUTH_MODE=jwt: the production path, the record read before the membership lookup ---
 
 
 @pytest.fixture
@@ -193,22 +193,21 @@ def _bearer(tenant: SeededTenant) -> dict[str, str]:
     return {"Authorization": f"Bearer {jwt.encode(claims, SECRET, algorithm='HS256')}"}
 
 
-async def test_a_bearer_request_reads_the_view_once_for_the_membership_and_once_for_the_record(
+async def test_a_bearer_request_reads_the_control_plane_view_exactly_once(
     environment, statements, searched, jwt_mode
 ):
-    """The bearer chain looks the membership up (spec #92: the record is read *after* it) through
-    a role-free, record-less context whose tenant session routes itself -- one view read -- and
-    then reads the record -- the second. Every session after that consumes the record. This test
-    pins today's exact count, 2, so a regression to 3 is caught; bringing it to 1 means reading
-    the record before the membership lookup and handing it to that lookup (reported on #104)."""
+    """AC on the production path: the record is read right after the token verifies (no database
+    needed for that) and handed to the membership lookup, whose session routes from it -- so the
+    membership lookup, the tool's session, and everything after share the one view read. A second
+    request reads it once again."""
     tenant = await seed_tenant(environment, residency="eu", roles=["member"], documents=1)
 
-    for _request_number in (1, 2):
+    for request_number in (1, 2):
         statements.clear()
         response = await _run(tenant, _bearer(tenant))
 
         assert response.status_code == 200, response.text
-        assert _view_reads(statements) == 2, statements
+        assert _view_reads(statements) == 1, (request_number, statements)
 
     assert [[hit.id for hit in hits] for _, hits in searched] == [tenant.document_ids] * 2
 
@@ -216,9 +215,9 @@ async def test_a_bearer_request_reads_the_view_once_for_the_membership_and_once_
 async def test_a_suspended_tenants_bearer_request_is_refused_with_the_generic_403(
     environment, statements, searched, jwt_mode
 ):
-    """Suspension under a bearer token: the membership lookup's own routing read already sees the
-    suspension, before any tenant table is touched -- and the answer is the generic 403, never
-    the unhandled-exception 500."""
+    """Suspension under a bearer token: the record read right after the token verifies refuses
+    it -- before the identity or membership lookup, before any tenant table -- with the generic
+    403, never the unhandled-exception 500."""
     tenant = await seed_tenant(environment, residency="eu", roles=["member"], documents=1)
     await _suspend(tenant)
 
@@ -228,4 +227,22 @@ async def test_a_suspended_tenants_bearer_request_is_refused_with_the_generic_40
     assert response.status_code == 403, response.text
     assert response.json() == {"detail": FORBIDDEN_DETAIL}
     assert [s for s in statements if _TENANT_TABLES.search(s)] == []
+    assert not any("identity_lookup" in s for s in statements)
+    assert _view_reads(statements) == 1
     assert searched == []
+
+
+async def test_a_token_for_another_tenant_never_reaches_the_database(
+    environment, statements, searched, jwt_mode
+):
+    """The record read comes after the audience check: a token whose audience is not the path's
+    tenant is refused without a single statement against the view (an unauthenticated caller
+    still cannot make the server read the control plane)."""
+    tenant = await seed_tenant(environment, residency="eu", roles=["member"], documents=1)
+    other = await seed_tenant(environment, residency="eu", roles=["member"])
+
+    statements.clear()
+    response = await _run(tenant, _bearer(other))
+
+    assert response.status_code == 403, response.text
+    assert _view_reads(statements) == 0, statements

@@ -17,15 +17,17 @@ Glossary (`CONTEXT.md`):
 What this module does, in order, for a bearer token (`resolve_bearer_context`):
 
 1. Parses the `Authorization` header (`Bearer <token>`) -- otherwise 401.
-2. Verifies the token and resolves identity and membership through
-   `app.token_verifier.verify_tenant_token`, with the verification key and algorithm pinned per
-   issuer (`key_source_for`/`algorithm_source_for`: a person's token against the identity
-   provider's settings, an agent token against this application's own) -- signature/issuer/expiry
-   failures are 401, audience/identity/membership failures are 403.
-3. Reads the tenant record (`ControlPlaneReads.get_tenant_record`, #104) -- one read of the
-   tenant's control-plane facts and settings for the whole request; a suspended record is a 403.
-   (A suspension the membership lookup's own session routing already saw is the same 403.)
-4. Assigns the means (`actor_context`) and builds the context with a fresh request id, carrying
+2. Verifies the token through `app.token_verifier.verify_tenant_token`, with the verification key
+   and algorithm pinned per issuer (`key_source_for`/`algorithm_source_for`: a person's token
+   against the identity provider's settings, an agent token against this application's own) --
+   signature/issuer/expiry failures are 401, an audience other than the path's tenant is 403.
+   None of that reads the control-plane view.
+3. Reads the tenant record (`ControlPlaneReads.get_tenant_record`, #104, asked for with
+   `read_tenant_record=True`) -- the one read of the tenant's control-plane facts and settings for
+   the whole request; a suspended record is a 403 before any identity or membership lookup.
+4. Resolves identity and membership -- unknown identity or no membership is 403. The membership
+   lookup routes its tenant session by the record, so it reads no control-plane row of its own.
+5. Assigns the means (`actor_context`) and builds the context with a fresh request id, carrying
    the record (`RequestContext.tenant_record`) for `tenant_session` to route by.
 
 `AUTH_MODE=dev-headers` (local development only) is its own function, `resolve_dev_headers_context`,
@@ -59,7 +61,6 @@ from uuid import UUID
 
 from app.config import Settings
 from app.context import MeansKind, RequestContext
-from app.db.session import TenantSuspendedError
 from app.jwt_verifier import KeySource, TokenVerificationError
 from app.tenant_record import TenantRecord
 from app.token_verifier import (
@@ -67,6 +68,7 @@ from app.token_verifier import (
     AlgorithmSource,
     ControlPlaneReads,
     ResolvedIdentity,
+    TenantSuspendedAtVerification,
     TenantTokenVerificationError,
     VerificationFailureReason,
     default_adapter,
@@ -251,7 +253,8 @@ def _forbidden(reason: RejectionReason, request_id: str, issuer: str | None) -> 
 async def _read_tenant_record(
     tenant_id: UUID, request_id: str, issuer: str | None, adapter: ControlPlaneReads | None
 ) -> TenantRecord | ContextRejection:
-    """The request's one tenant-record read (#104), and suspension decided on it inside the
+    """The dev-headers path's one tenant-record read (#104; the bearer path reads it inside
+    `verify_tenant_token`, before the membership lookup), and suspension decided on it inside the
     module, so no adapter can hand out a context for a suspended tenant (ADR-0010). A tenant with
     no control-plane row is the pooled, unsuspended default."""
     adapter = adapter if adapter is not None else default_adapter()
@@ -292,11 +295,10 @@ async def resolve_bearer_context(
             default_issuer=settings.default_identity_issuer,
             algorithm_source=algorithm_source or algorithm_source_for(settings),
             adapter=adapter,
+            read_tenant_record=True,
         )
-    except TenantSuspendedError:
-        # The membership lookup's own tenant session routes itself (it has no record yet) and so
-        # already enforces suspension: the same rejection as the record's, never a 500.
-        return _forbidden(RejectionReason.TENANT_SUSPENDED, request_id, None)
+    except TenantSuspendedAtVerification as exc:
+        return _forbidden(RejectionReason.TENANT_SUSPENDED, request_id, exc.issuer)
     except TenantTokenVerificationError as exc:
         reason = RejectionReason(exc.reason.value)
         if exc.reason is VerificationFailureReason.INVALID_OR_EXPIRED:
@@ -313,10 +315,9 @@ async def resolve_bearer_context(
             )
         return _forbidden(reason, request_id, exc.issuer)
 
-    record = await _read_tenant_record(tenant_id, request_id, resolved.issuer, adapter)
-    if isinstance(record, ContextRejection):
-        return record
-    return actor_context(tenant_id, resolved, request_id=request_id, tenant_record=record)
+    return actor_context(
+        tenant_id, resolved, request_id=request_id, tenant_record=resolved.tenant_record
+    )
 
 
 async def resolve_dev_headers_context(

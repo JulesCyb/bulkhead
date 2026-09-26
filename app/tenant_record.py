@@ -4,11 +4,12 @@
 One immutable value carrying the operator-owned facts a request needs about its tenant --
 isolation tier, database alias, residency, suspension, gateway credential alias -- together with
 the tenant's own validated, tenant-editable settings. `app.context_resolution` reads it through
-`app.token_verifier.ControlPlaneReads.get_tenant_record` right after the membership check,
-refuses a suspended one there, and attaches it to the `RequestContext` it returns
-(`RequestContext.tenant_record`); `app.db.session.tenant_session` then routes by it instead of
-reading the control plane again. It is never cached across requests: the next request reads it
-afresh, so an operator's suspend or re-route takes effect on that very next request.
+`app.token_verifier.ControlPlaneReads.get_tenant_record` -- for a bearer token right after the
+token and its audience verify and before the identity and membership lookups (the membership
+lookup routes by it) -- refuses a suspended one there, and attaches it to the `RequestContext` it
+returns (`RequestContext.tenant_record`); `app.db.session.tenant_session` then routes by it
+instead of reading the control plane again. It is never cached across requests: the next request
+reads it afresh, so an operator's suspend or re-route takes effect on that very next request.
 
 Why its own module rather than `app/context.py`: `app/context.py` is on `CLAUDE.md`'s "do not
 touch without checking first" list, and the record is a control-plane value, not part of "who is

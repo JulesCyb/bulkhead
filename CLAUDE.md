@@ -57,8 +57,9 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    typed `ContextRejection`; `app/deps.py` is only its HTTP adapter -- and passed through every
    request, agent run, tool call, and job. No global state. The chain reads the tenant's
    **tenant record** (`app/tenant_record.py`: tier, alias, residency, suspension, gateway
-   credential alias, settings) once, right after the membership check, refuses a suspended one,
-   and attaches it as `ctx.tenant_record` -- never cached across requests (#104).
+   credential alias, settings) once -- for a bearer token right after the token and its audience
+   verify, before the identity and membership lookups, which route by it -- refuses a suspended
+   one, and attaches it as `ctx.tenant_record`; never cached across requests (#104).
 1a. **Roles gate actions, never visibility** (ADR-0004): a role check is `ctx.require_role(role)`,
    called at the top of a tool (`app/tools/`) or a route (`app/api/`) — before any data access —
    never inside a repository's read path (`app/repositories/`), since RLS already handles the only

@@ -7,15 +7,24 @@ counted -- is `tests/test_tenant_record_integration.py`.
 from __future__ import annotations
 
 import dataclasses
+import time
 import uuid
 from datetime import UTC, datetime
 
 import httpx
+import jwt
 import pytest
 
 import app.deps as deps_module
 from app.agents import assistant as assistant_module
+from app.config import Settings
 from app.context import RequestContext
+from app.context_resolution import (
+    ContextRejection,
+    RejectionReason,
+    RejectionStatus,
+    resolve_bearer_context,
+)
 from app.db.session import TenantSuspendedError, tenant_session
 from app.main import app
 from app.tenant_record import TenantRecord
@@ -74,6 +83,54 @@ async def test_the_tool_receives_the_record_the_context_was_resolved_with(
 
     assert response.status_code == 200, response.text
     assert contexts[0].tenant_record == record
+
+
+async def test_a_bearer_request_for_a_suspended_record_is_refused_before_the_identity_lookup():
+    """The bearer chain reads the record right after the token verifies and refuses a suspended
+    one there: neither the identity nor the membership is ever looked up."""
+    tenant_id = uuid.uuid4()
+    secret = "tenant-record-unit-secret-at-least-32-bytes-long"
+    settings = Settings(
+        _env_file=None,
+        environment="test",
+        auth_mode="jwt",
+        embedding_provider="openai",
+        embedding_model="text-embedding-3-small",
+        default_identity_issuer="https://idp.example.com",
+        jwt_verification_key=secret,
+        jwt_algorithm="HS256",
+    )
+    now = int(time.time())
+    token = jwt.encode(
+        {
+            "iss": "https://idp.example.com",
+            "sub": "sub-1",
+            "aud": str(tenant_id),
+            "iat": now,
+            "exp": now + 300,
+        },
+        secret,
+        algorithm="HS256",
+    )
+    adapter = FakeControlPlaneReads(
+        records={tenant_id: TenantRecord(tenant_id=tenant_id, suspended_at=datetime.now(UTC))},
+        explode=frozenset({"find_identity_by_issuer_and_subject", "get_membership_role"}),
+    )
+
+    outcome = await resolve_bearer_context(
+        tenant_id=tenant_id,
+        authorization=f"Bearer {token}",
+        settings=settings,
+        adapter=adapter,
+    )
+
+    assert isinstance(outcome, ContextRejection)
+    assert (outcome.status, outcome.reason, outcome.detail) == (
+        RejectionStatus.FORBIDDEN,
+        RejectionReason.TENANT_SUSPENDED,
+        deps_module.FORBIDDEN_DETAIL,
+    )
+    assert outcome.issuer == "https://idp.example.com"
 
 
 def test_the_record_is_immutable():

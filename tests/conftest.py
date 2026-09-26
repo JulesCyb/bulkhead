@@ -112,7 +112,11 @@ class FakeControlPlaneReads:
         return TenantAuthSettings(issuer=issuer or default_issuer, suspended=suspended)
 
     async def get_membership_role(
-        self, *, tenant_id: uuid.UUID, identity_id: uuid.UUID
+        self,
+        *,
+        tenant_id: uuid.UUID,
+        identity_id: uuid.UUID,
+        tenant_record: TenantRecord | None = None,
     ) -> str | None:
         self._forbid("get_membership_role")
         return self.memberships.get((tenant_id, identity_id))
