@@ -156,14 +156,16 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    credential.
 6. **Models via `app/llm.py`**; the model name comes from configuration or `tenants.settings["model"]`.
    The per-tenant entry point, `resolve_tenant_chat_model()`, validates that name against the
-   allow-list for the tenant's own residency (`RESIDENCY_MODEL_ALLOW_LIST`) before building any
-   client (ADR-0009); a name outside the list is rejected with `ModelNotAllowedForResidency`,
-   never silently passed through to the gateway. More generally (ADR-0008): every content-bearing
-   path — model, embeddings, and tracing — resolves its route from the tenant's own
-   `control.tenants.residency` through `app.residency.resolve_residency_route` or the same
-   `RESIDENCY_ALLOW_LIST` it reads; an unset or unlisted residency fails closed
-   (`ResidencyUnresolved`), never a fallback to another jurisdiction's route. Both allow-lists are
-   loaded and validated once at startup by `app/config.py` from
+   allow-list for the tenant's own residency (`validate_model_for_residency`, a thin call to
+   `settings.residency_allow_list.alias_for`) before building any client (ADR-0009); a name
+   outside the list is rejected with `ModelNotAllowedForResidency` — a subclass of
+   `app.residency.ResidencyUnresolved`, not a second, unrelated exception type — never silently
+   passed through to the gateway. More generally (ADR-0008): every content-bearing path — model,
+   embeddings, and tracing — resolves its route from the tenant's own `control.tenants.residency`
+   through `app.residency.resolve_residency_route` or the same `settings.residency_allow_list`
+   (`app.residency.ResidencyAllowList`) it reads; an unset or unlisted residency fails closed
+   (`ResidencyUnresolved`), never a fallback to another jurisdiction's route. The one allow-list
+   object is loaded and validated once, at `Settings` construction, from
    [`config/residency.toml`](config/residency.toml) (path overridable with
    `RESIDENCY_CONFIG_PATH`) — data, not a Python literal, and each residency's
    `model_host_patterns`/`embedding_endpoint` must be that residency's own gateway host(s), never
@@ -172,7 +174,10 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    startup, `app.startup_checks.run_startup_checks` refuses to let the process accept a request or
    tool call if any configured endpoint (model/gateway host, embedding endpoint, trace sink) sits
    outside its residency's allow-list; there is no default embedding provider
-   (`EMBEDDING_PROVIDER`/`EMBEDDING_MODEL` must be set explicitly). See `docs/residency.md`.
+   (`EMBEDDING_PROVIDER`/`EMBEDDING_MODEL` must be set explicitly). Every caller (model,
+   embeddings, tracing, operator `create`, gateway provisioning) asks this one object's own
+   `route_for`/`alias_for`/`model_aliases`/`residencies` rather than re-implementing the lookup
+   (spec A4 / #111). See `docs/residency.md`.
 7. **Every agent run is traced** (Langfuse/OTel, a regular dependency, always installed) with
    `tenant_id`, `identity_id`, `request_id` set as flat, queryable span attributes on every span
    the run produces (`app.observability.tenant_span_attributes(ctx.trace_attributes())`,

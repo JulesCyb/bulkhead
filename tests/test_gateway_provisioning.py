@@ -3,6 +3,11 @@ error mapping, and the secret-file half, exercised without a real database or a 
 call -- `GatewayAdminClient` is built on `httpx.MockTransport`, so this is the "ASGI application
 plus Settings, gateway call faked" seam. The control-plane read/write half is covered by the
 embedded-Postgres tests in tests/test_gateway_provisioning_integration.py.
+
+Since #85 / spec A4 / #111: the minted credential's usable models come from
+`settings.residency_allow_list.model_aliases(residency)` (`app.residency.ResidencyAllowList`),
+never a second, hand-maintained Python literal -- the retired `GATEWAY_MODEL_ALIASES_BY_RESIDENCY`
+must never come back.
 """
 
 from __future__ import annotations
@@ -15,7 +20,6 @@ import pytest
 from app.config import Settings
 from app.gateway_credentials import GatewayCredentialUnavailable
 from app.gateway_provisioning import (
-    GATEWAY_MODEL_ALIASES_BY_RESIDENCY,
     GatewayAdminClient,
     GatewayCredentialLimits,
     GatewayProvisioningError,
@@ -25,6 +29,8 @@ from app.gateway_provisioning import (
     revoke_gateway_credential,
     write_gateway_credential_file,
 )
+from app.llm import validate_model_for_residency
+from app.residency import ResidencyAllowList
 
 
 @pytest.fixture
@@ -160,8 +166,9 @@ async def test_unknown_residency_is_rejected_before_any_gateway_call():
     assert called is False
 
 
-def test_eu_and_us_residencies_have_distinct_model_lists():
-    assert GATEWAY_MODEL_ALIASES_BY_RESIDENCY["eu"] != GATEWAY_MODEL_ALIASES_BY_RESIDENCY["us"]
+def test_eu_and_us_residencies_have_distinct_model_lists(settings):
+    allow_list = settings.residency_allow_list
+    assert allow_list.model_aliases("eu") != allow_list.model_aliases("us")
 
 
 # --- Secret-file helpers ----------------------------------------------------------------------
@@ -231,6 +238,61 @@ async def test_provision_writes_file_and_records_alias(settings, control_plane, 
     )
     assert (tmp_path / alias).read_text() == "sk-acme"
     assert control_plane.aliases[tenant_id] == alias
+
+
+async def test_model_added_to_the_allow_list_is_both_allowed_and_mintable_with_no_second_edit(
+    control_plane, tmp_path
+):
+    """#85 (spec A4 / #111): a model added to a residency's allow-list in the TOML/in-memory data
+    is both allowed by model resolution (`app.llm.validate_model_for_residency`) and included in
+    a freshly minted credential's usable models -- one edit to the allow-list data, never a
+    second, hand-maintained Python literal (the retired `GATEWAY_MODEL_ALIASES_BY_RESIDENCY`) to
+    keep in sync with it.
+    """
+    allow_list = ResidencyAllowList.from_data(
+        {
+            "residency": {
+                "eu": {
+                    "model_host_patterns": ["litellm.internal"],
+                    "embedding_endpoint": "https://litellm.internal/v1",
+                    "trace_sink_host": "eu.cloud.langfuse.com",
+                    "models": ["claude-eu", "embeddings", "claude-eu-mini"],
+                }
+            }
+        }
+    )
+    settings = Settings(
+        database_url="postgresql+asyncpg://app:app@localhost:5432/app",
+        gateway_credentials_dir=str(tmp_path),
+        litellm_base_url="http://litellm.internal:4000",
+        litellm_master_key="sk-master-test",
+        residency_allow_list=allow_list,
+    )
+
+    # Allowed: the freshly added model resolves for its residency with no second edit anywhere.
+    assert validate_model_for_residency("claude-eu-mini", "eu", settings=settings) == (
+        "claude-eu-mini"
+    )
+
+    captured: dict[str, list[str]] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        captured["models"] = json.loads(request.content)["models"]
+        return httpx.Response(200, json={"key": "sk-acme"})
+
+    await provision_gateway_credential(
+        uuid.uuid4(),
+        residency="eu",
+        limits=LIMITS,
+        settings=settings,
+        admin_client=_admin_client(handler),
+        owner_engine=object(),
+    )
+
+    # Mintable: the same freshly added model was actually sent to the gateway as a usable model.
+    assert "claude-eu-mini" in captured["models"]
 
 
 async def test_two_tenants_get_distinct_aliases_and_credentials(settings, control_plane, tmp_path):

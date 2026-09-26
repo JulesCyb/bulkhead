@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from pathlib import Path
 
 import httpx
 import pytest
@@ -14,6 +15,8 @@ from app.api.agents import _sse
 from app.config import Settings
 from app.main import check_auth_mode
 from app.residency import ResidencyAllowList
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 _VALID_KWARGS = {"embedding_provider": "openai", "embedding_model": "text-embedding-3-small"}
 
@@ -87,6 +90,50 @@ def test_settings_valid_configuration_constructs_cleanly():
         residency="us",
     )
     assert other.residency_route != settings.residency_route
+
+
+# --- Every caller resolves through the one object (spec A4 / #94, #111) ------------------------
+
+# The retired module-level globals a pre-#110 caller used to index directly (`RESIDENCY_ALLOW_LIST
+# [<residency>]`/`.get(<residency>)`, `RESIDENCY_MODEL_ALLOW_LIST.get(<residency>)`) -- every
+# caller now asks `Settings.residency_allow_list` (`app.residency.ResidencyAllowList`)'s own
+# `route_for`/`alias_for`/`model_aliases`/`residencies` instead of re-implementing the lookup.
+# Deliberately scoped to these exact retired names, not a blanket ban on any `.get(residency`
+# call in `app/` -- `app.observability`'s own `_residency_tracer_providers`/`_residency_exporters`
+# caches are a different, legitimate per-residency lookup (which residencies have tracing
+# *configured*, not the allow-list itself) that this ticket does not touch.
+_RETIRED_RESIDENCY_LOOKUP_IDIOMS = ("RESIDENCY_ALLOW_LIST", "RESIDENCY_MODEL_ALLOW_LIST")
+
+
+def test_residency_lookup_idiom_lives_only_in_the_residency_module() -> None:
+    residency_module = REPO_ROOT / "app" / "residency.py"
+    offenders = []
+    for path in sorted((REPO_ROOT / "app").rglob("*.py")):
+        if path == residency_module:
+            continue
+        text = path.read_text(encoding="utf-8")
+        for idiom in _RETIRED_RESIDENCY_LOOKUP_IDIOMS:
+            if idiom in text:
+                offenders.append(f"{path.relative_to(REPO_ROOT)}: {idiom!r}")
+    assert offenders == [], offenders
+
+
+def test_gateway_model_aliases_by_residency_literal_mapping_is_gone() -> None:
+    """#85 (closed by spec A4 / #111): the per-residency gateway model alias literal
+    (`GATEWAY_MODEL_ALIASES_BY_RESIDENCY`, a hand-maintained dict in `app/gateway_provisioning.py`
+    that could drift from `config/residency.toml`) must never come back as an actual mapping --
+    prose mentioning its retirement (this test's own docstring, `app/gateway_provisioning.py`'s
+    comment) is fine; a `NAME = {...}`/`NAME: dict` declaration is not.
+    """
+    offenders = []
+    for path in sorted((REPO_ROOT / "app").rglob("*.py")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("GATEWAY_MODEL_ALIASES_BY_RESIDENCY") and (
+                "=" in stripped or ":" in stripped
+            ):
+                offenders.append(f"{path.relative_to(REPO_ROOT)}: {stripped!r}")
+    assert offenders == [], offenders
 
 
 def test_importing_app_config_never_touches_the_filesystem(tmp_path):

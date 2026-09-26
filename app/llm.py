@@ -12,13 +12,17 @@ The one entry point that builds a chat client lives here:
 
 - `resolve_tenant_chat_model()` — the per-tenant entry point (Spec 7 / #54, ADR-0009): before a
   chat client is ever built, the tenant's chosen model name is validated against the allow-list
-  for its residency (`settings.residency_allow_list`, `app.residency.ResidencyAllowList`) and
-  rejected with
-  `ModelNotAllowedForResidency` if it is not on it — before any client is constructed and before
-  any network call is attempted. The client that is finally built is constructed from that
-  tenant's own gateway credential (`app.gateway_credentials`, #52) and cached per tenant id, so
-  two tenants never share a connection; every call it makes carries an explicit wall-clock
-  deadline (`model_settings.timeout`) instead of the client library's multi-minute default.
+  for its residency (`validate_model_for_residency`, a thin call to
+  `settings.residency_allow_list.alias_for` -- `app.residency.ResidencyAllowList`, spec A4 /
+  #111) and rejected with `ModelNotAllowedForResidency` if it is not on it — before any client is
+  constructed and before any network call is attempted. `ModelNotAllowedForResidency` is a
+  subclass of `app.residency.ResidencyUnresolved` (not a second, unrelated exception type): a
+  caller that only ever wants to fail closed on "this allow-list cannot answer that" catches the
+  one base type, while this name is kept because `CLAUDE.md` and the tests still name it. The
+  client that is finally built is constructed from that tenant's own gateway credential
+  (`app.gateway_credentials`, #52) and cached per tenant id, so two tenants never share a
+  connection; every call it makes carries an explicit wall-clock deadline
+  (`model_settings.timeout`) instead of the client library's multi-minute default.
 
 There used to be a second entry point here, `get_model()` — a deployment-wide resolver with its
 own, separate `LITELLM_BASE_URL` check that fell back to returning a bare `"<provider>:<model>"`
@@ -49,8 +53,16 @@ from app.repositories.control import ControlRepository
 from app.residency import ResidencyUnresolved
 
 
-class ModelNotAllowedForResidency(Exception):
+class ModelNotAllowedForResidency(ResidencyUnresolved):
     """A tenant's chosen model name is not on the allow-list for its residency (ADR-0009).
+
+    A subclass of `app.residency.ResidencyUnresolved` (spec A4 / #111) -- both are "this
+    allow-list cannot answer that", one from a specific model choice, the other from a residency
+    or route lookup -- rather than a second, unrelated exception type; a caller that only ever
+    wants to fail closed can catch the one base type. Kept as its own name (with typed
+    `model_name`/`residency` attributes) because `CLAUDE.md` and the tests still name it, not
+    because the lookup itself lives here -- that lookup is `alias_for`
+    (`app.residency.ResidencyAllowList`), which `validate_model_for_residency` below calls.
 
     Raised before any client is constructed and before any network call is attempted -- the
     application's own half of ADR-0009's two-layer defense; the gateway's own key-scoped models
@@ -66,25 +78,23 @@ class ModelNotAllowedForResidency(Exception):
         )
 
 
-def _bare_model_name(name: str) -> str:
-    """Strips a "<provider>:" prefix, if any -- the gateway's model_list only knows bare names."""
-    return name.split(":", 1)[1] if ":" in name else name
-
-
 def validate_model_for_residency(
     model_name: str, residency: str, *, settings: Settings | None = None
 ) -> str:
     """Returns the bare (gateway alias) model name if `model_name` is allow-listed for
-    `residency`; raises `ModelNotAllowedForResidency` otherwise. Synchronous and side-effect-free
-    beyond reading `settings.residency_allow_list` (`get_settings()` when not given) -- no client,
-    no network call, no database.
+    `residency`; raises `ModelNotAllowedForResidency` otherwise. A thin call to
+    `settings.residency_allow_list.alias_for` (`app.residency.ResidencyAllowList`, spec A4 /
+    #111) -- this module holds no lookup of its own, only the ADR-0009-specific exception name
+    and attributes. Synchronous and side-effect-free beyond reading `settings.residency_allow_list`
+    (`get_settings()` when not given) -- no client, no network call, no database.
     """
     s = settings or get_settings()
-    bare = _bare_model_name(model_name)
-    allowed = s.residency_allow_list.model_aliases(residency)  # type: ignore[union-attr]
-    if bare not in allowed:
-        raise ModelNotAllowedForResidency(model_name, residency)
-    return bare
+    allow_list = s.residency_allow_list
+    assert allow_list is not None  # set by Settings construction
+    try:
+        return allow_list.alias_for(residency, model_name)
+    except ResidencyUnresolved as exc:
+        raise ModelNotAllowedForResidency(model_name, residency) from exc
 
 
 # Cache of per-tenant chat model clients (ADR-0009: "any cache of them is keyed by tenant"), so

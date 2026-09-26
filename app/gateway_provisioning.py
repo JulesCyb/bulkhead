@@ -6,10 +6,9 @@ standalone (e.g. a future `rotate` command). The operator tool's `create` comman
 `app/operator/create.py`) does not call `provision_gateway_credential` itself -- it needs the
 control-plane write, the membership write, and the credential mint to share one database
 transaction, which an engine-per-call function cannot join -- but reuses this module's lower-level
-primitives (`GatewayAdminClient`, `GatewayCredentialLimits`, `GATEWAY_MODEL_ALIASES_BY_RESIDENCY`,
-`generate_gateway_credential_alias`, `write_gateway_credential_file`, `build_admin_client`)
-directly. `revoke_gateway_credential` remains the one call site for revocation (a future `erase`
-command's job, #9).
+primitives (`GatewayAdminClient`, `GatewayCredentialLimits`, `generate_gateway_credential_alias`,
+`write_gateway_credential_file`, `build_admin_client`) directly. `revoke_gateway_credential`
+remains the one call site for revocation (a future `erase` command's job, #9).
 
 Provisioning does three things, in order, for a given tenant id:
 
@@ -45,15 +44,14 @@ from app.config import Settings, get_settings
 from app.gateway_credentials import GatewayCredentialUnavailable, read_gateway_credential
 from app.migration_settings import get_migration_settings
 
-# Mirrors the `model_name` entries in docker/litellm/config.yaml. This is the narrower,
-# provisioning-time list a freshly minted key's usable models is restricted to -- distinct from
-# the process-wide, per-residency allow-list Spec 7 / #54 adds for validating a tenant's *own*
-# `tenants.settings["model"]` choice before a client is built. The two lists describe the same
-# gateway configuration from two different call sites and must stay consistent with it.
-GATEWAY_MODEL_ALIASES_BY_RESIDENCY: dict[str, tuple[str, ...]] = {
-    "eu": ("claude-eu", "embeddings"),
-    "us": ("claude", "embeddings"),
-}
+# There used to be a second, hand-maintained copy of the per-residency gateway model aliases
+# here (`GATEWAY_MODEL_ALIASES_BY_RESIDENCY`, a Python literal mirroring `config/residency.toml`'s
+# own `models` entries) -- a freshly minted key's usable models could drift from the allow-list a
+# tenant's own model choice is validated against (`app.llm.validate_model_for_residency`). Removed
+# (#85, spec A4 / #111): `provision_gateway_credential` below now takes the models straight from
+# `settings.residency_allow_list.model_aliases(residency)` (`app.residency.ResidencyAllowList`),
+# the exact same object and method `app.llm`/`app.operator.create` read -- one edit to
+# `config/residency.toml` changes what is both allowed and mintable, never two.
 
 
 class GatewayProvisioningError(Exception):
@@ -260,11 +258,13 @@ async def provision_gateway_credential(
     script and a future operator tool do.
     """
     settings = settings or get_settings()
-    models = GATEWAY_MODEL_ALIASES_BY_RESIDENCY.get(residency)
-    if models is None:
+    allow_list = settings.residency_allow_list
+    assert allow_list is not None  # set by Settings construction
+    models = allow_list.model_aliases(residency)
+    if not models:
         raise GatewayProvisioningError(
             f"no gateway model aliases configured for residency {residency!r} "
-            f"(known: {sorted(GATEWAY_MODEL_ALIASES_BY_RESIDENCY)})"
+            f"(see settings.residency_allow_list)"
         )
 
     owns_admin_client = admin_client is None

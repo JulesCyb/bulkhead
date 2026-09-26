@@ -22,9 +22,13 @@ an operator can fix it without reading this module's source.
 path at construction (never at import) -- this module's own `resolve_residency_route` (the
 per-tenant, per-request resolver, composed with a tenant's gateway credential) and
 `app.startup_checks.run_startup_checks` both read that instance rather than a module-level
-global. `app/llm.py`, `app/embeddings.py`, and `app/observability.py` also read it from
-`Settings`; unifying their own lookups to call `route_for`/`alias_for` directly is a later ticket
-(#111) -- this module is the seam, not yet the only call site.
+global. `app/llm.py` (`validate_model_for_residency`, via `alias_for`), `app/embeddings.py` (via
+`resolve_residency_route`), `app/observability.py` (`setup_observability`/
+`instrumentation_capabilities`, via `residencies`/`route_for`), and `app/operator/create.py`
+(`_validate_residency`/`_validate_model`, via `route_for`/`alias_for`) also read it from
+`Settings` -- every one of them calls this object's own methods rather than re-implementing the
+lookup (spec A4 / #111): this module is the only place "is this residency known, and what is its
+route/alias" is ever answered.
 
 Deferred imports inside functions below (`app.config.get_settings`, `app.gateway_credentials`)
 are deliberate, not an oversight: `app.config.Settings` holds a `ResidencyAllowList` field, so
