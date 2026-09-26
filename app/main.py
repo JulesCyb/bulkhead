@@ -20,6 +20,7 @@ from app.config import Settings, get_settings
 from app.context import RoleRequired
 from app.db.guard import run_role_rls_guard
 from app.mcp.server import build_streamable_http_app, check_mcp_mode
+from app.mcp.server import server as mcp_tool_server
 from app.observability import setup_observability
 from app.repositories.errors import NotFoundInTenant
 from app.startup_checks import run_startup_checks
@@ -73,7 +74,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # `app.main.run_role_rls_guard` and drive this lifespan directly to prove the guard runs
     # here independent of the readiness endpoint's own dependency.
     await run_role_rls_guard()
-    yield
+    # The MCP mount's own lifespan never runs (issue #116): Starlette's `Mount.matches` only
+    # forwards `http`/`websocket` scopes to a mounted sub-app, never `lifespan`
+    # (`app.mcp.server.build_streamable_http_app` -> `MCPServer.streamable_http_app` -> the SDK's
+    # own Starlette app, whose `lifespan=lambda app: session_manager.run()` therefore never fires
+    # once mounted below in `create_app`). The session manager -- the anyio task group every
+    # Streamable HTTP request needs -- is entered here instead, for as long as this outer
+    # application runs, exactly reproducing what the SDK's own (unmounted) app would have done
+    # for itself. Same guard as the mount itself in `create_app`, so this is only ever attempted
+    # when `check_mcp_mode` above has already let a `streamable-http` configuration through.
+    if settings.mcp_transport == "streamable-http":
+        async with mcp_tool_server.session_manager.run():
+            yield
+    else:
+        yield
 
 
 async def handle_permission_error(request: Request, exc: Exception) -> JSONResponse:
@@ -299,6 +313,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # reachable at all under the stdio (local-development) transport, which never touches this
     # FastAPI app in the first place. `check_mcp_mode` above has already refused to let this
     # branch be reached with `mcp_transport == "streamable-http"` and no verifier configured.
+    # Its own lifespan never runs once mounted this way (issue #116) -- `lifespan` above enters
+    # this same tool server's `session_manager` instead, for the outer application's lifetime.
     if settings.mcp_transport == "streamable-http":
         app.mount(
             "/v1/t/{tenant_id}/mcp", build_streamable_http_app(settings), name="mcp-streamable-http"

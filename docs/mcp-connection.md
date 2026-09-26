@@ -15,6 +15,17 @@ identity refuses to start outside `ENVIRONMENT=dev`/`test` (mirroring how `AUTH_
 is guarded), and `streamable-http` refuses to start at all unless `JWT_VERIFICATION_KEY` is
 configured. There is no way to run a networked, unauthenticated MCP endpoint.
 
+**`streamable-http` also requires `MCP_ALLOWED_HOSTS` (issue #116)** — this deployment's own
+public Host header(s), comma-separated, same shape as `CORS_ORIGINS`. Without it, the MCP SDK's
+own `streamable_http_app()` falls back to its default (`host="127.0.0.1"`), which auto-enables
+DNS-rebinding protection that only accepts a `127.0.0.1`/`localhost`/`::1` Host header — rejecting
+every real connection. `app.mcp.server.build_streamable_http_app` passes `MCP_ALLOWED_HOSTS`
+through as the SDK's `TransportSecuritySettings.allowed_hosts`; `check_mcp_mode` refuses to start
+`streamable-http` with it unset. The outer application's own ASGI lifespan (`app.main.lifespan`)
+also enters the mount's session manager for as long as the process runs — the mounted sub-app's
+own lifespan never fires on its own, since Starlette forwards only `http`/`websocket` scopes to a
+`Mount`, never `lifespan`.
+
 **Two independent algorithms, one per token population (review finding, Spec 6, ADR-0005,
 ADR-0003).** A person's token and an agent identity's token are never checked against the same
 algorithm or key, even though both flow through the one `verify_tenant_token` function:

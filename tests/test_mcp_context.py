@@ -285,6 +285,27 @@ def test_check_mcp_mode_does_not_raise_for_streamable_http_with_a_verifier_confi
                 auth_mode="jwt",
                 mcp_transport="streamable-http",
                 jwt_verification_key="a-verification-key",
+                mcp_allowed_hosts="mcp.example.com",
                 **_VALID_KWARGS,
             )
         )  # no raise
+
+
+def test_check_mcp_mode_raises_for_streamable_http_without_allowed_hosts():
+    """Issue #116: `build_streamable_http_app` would otherwise pass no `transport_security` to
+    the MCP SDK's own app, which auto-enables its localhost-only DNS-rebinding allow-list
+    (`host="127.0.0.1"`) -- rejecting every real deployment's Host header. `MCP_ALLOWED_HOSTS`
+    (comma-separated, same shape as `CORS_ORIGINS`) must be set before `streamable-http` starts,
+    even with a token verifier otherwise fully configured."""
+    with pytest.raises(RuntimeError, match="MCP_ALLOWED_HOSTS"):
+        mcp_server.check_mcp_mode(
+            Settings(
+                _env_file=None,
+                environment="prod",
+                auth_mode="jwt",
+                mcp_transport="streamable-http",
+                jwt_verification_key="a-verification-key",
+                mcp_allowed_hosts="",
+                **_VALID_KWARGS,
+            )
+        )

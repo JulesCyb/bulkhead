@@ -211,6 +211,8 @@ def _settings(environment: str) -> Settings:
         jwt_verification_key="prod-like-settings-test-verification-key"
         if environment == "prod"
         else None,
+        # streamable-http also requires this (issue #116) -- see check_mcp_mode.
+        mcp_allowed_hosts="mcp.example.com" if environment == "prod" else "",
     )
 
 

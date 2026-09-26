@@ -196,6 +196,16 @@ class Settings(BaseSettings):
     # `check_auth_mode` above).
     mcp_transport: str = Field(default="stdio", pattern="^(stdio|streamable-http)$")
 
+    # The deployment's own public Host header(s) for the streamable-http transport (issue #116),
+    # comma-separated, same shape as `cors_origins` above (see `mcp_allowed_hosts_list`). Passed
+    # to the MCP SDK's own `TransportSecuritySettings.allowed_hosts` by
+    # `app.mcp.server.build_streamable_http_app` so its DNS-rebinding protection allow-lists this
+    # deployment's real Host header, rather than silently falling back to the SDK's own default
+    # (host="127.0.0.1", which auto-enables an allow-list of only `127.0.0.1`/`localhost`/`::1`).
+    # No default: `app.mcp.server.check_mcp_mode` refuses to let `streamable-http` start without
+    # at least one entry here.
+    mcp_allowed_hosts: str = ""
+
     # The process-wide token issuer used for every tenant whose control-plane
     # `identity_issuer` column is unset (issue #22 / ADR-0003): the interim "one operator-run
     # identity provider" case, open until a tenant brings its own. Read by
@@ -455,6 +465,10 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    @property
+    def mcp_allowed_hosts_list(self) -> list[str]:
+        return [h.strip() for h in self.mcp_allowed_hosts.split(",") if h.strip()]
 
     @property
     def residency_route(self) -> ResidencyRoute:
