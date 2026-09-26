@@ -18,7 +18,14 @@ import pytest
 
 pgserver = pytest.importorskip("pgserver")
 
-from tests.support.cluster import ROLE_BOOTSTRAP_SQL, Cluster, cluster, environment  # noqa: E402
+from tests.support.cluster import (  # noqa: E402
+    ROLE_BOOTSTRAP_SQL,
+    Cluster,
+    cluster,
+    create_database,
+    environment,
+    migration_run_without_disrupting_logging,
+)
 from tests.support.seeding import (  # noqa: E402
     SeededTenant,
     UnknownNotNullColumnError,
@@ -35,7 +42,9 @@ __all__ = [
     "UnknownNotNullColumnError",
     "assert_known_not_null_columns",
     "cluster",
+    "create_database",
     "environment",
+    "migration_run_without_disrupting_logging",
     "seed_membership",
     "seed_tenant",
     "vector_literal",

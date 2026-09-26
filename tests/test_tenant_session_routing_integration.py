@@ -1,22 +1,16 @@
 """Embedded-Postgres integration tests for `tenant_session()` routing through the control plane
 and the engine registry (ADR-0002, Spec 10 / #75).
 
-Two ephemeral `pgserver` instances stand in for the pooled default database and a dedicated
-tenant's own database. Both get the full migration suite (so `control.tenants`, `tenants`, and
-RLS all exist for real). A dedicated tenant's control-plane bookkeeping row necessarily lives in
-the pooled database too (`control.tenants` FK-references `public.tenants`) -- what these tests
-prove absent from the pooled database is the tenant's own *data* (a row in `memberships`), not that
-bookkeeping stub.
+A pooled tenant and a dedicated tenant, both seeded through the shared test support package
+(`tests.support.seed_tenant`, issue #96/#97): a dedicated tenant's control-plane bookkeeping row
+necessarily lives in the pooled database too (`control.tenants` FK-references `public.tenants`)
+-- what these tests prove absent from the pooled database is the tenant's own *data* (a row in
+`memberships`), not that bookkeeping stub.
 """
 
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
-import tempfile
 import uuid
-from urllib.parse import parse_qs, urlparse
 
 import pytest
 from sqlalchemy import text
@@ -24,303 +18,138 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 pgserver = pytest.importorskip("pgserver")
 
+from app.context import RequestContext  # noqa: E402
+from app.db.session import TenantSuspendedError, get_engine, tenant_session  # noqa: E402
+from app.repositories.memberships import MembershipRepository  # noqa: E402
+from tests.support import cluster, environment, seed_membership, seed_tenant  # noqa: E402
 
-def _psql(server, command: str) -> None:
-    """`server.psql` without a shell: pgserver's own version breaks on paths with spaces."""
-    from pgserver.postgres_server import POSTGRES_BIN_PATH
-
-    subprocess.run(
-        [str(POSTGRES_BIN_PATH / "psql"), server.get_uri()],
-        input=command.encode(),
-        check=True,
-        capture_output=True,
-    )
-
-
-def _bootstrap_and_migrate(server) -> dict[str, str]:
-    """Mirrors docker/postgres/01-init.sh + `alembic upgrade head` (see test_rls_integration.py)
-    against one ephemeral instance, returning its owner/app connection strings."""
-    from app.config import ROLE_STATEMENT_TIMEOUT_MS
-
-    sockdir = parse_qs(urlparse(server.get_uri()).query)["host"][0]
-    _psql(
-        server,
-        "CREATE EXTENSION IF NOT EXISTS vector; "
-        "CREATE ROLE app_owner LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE; "
-        "ALTER SCHEMA public OWNER TO app_owner; "
-        "GRANT CREATE ON DATABASE postgres TO app_owner; "
-        "CREATE ROLE app LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE; "
-        "GRANT USAGE ON SCHEMA public TO app; "
-        f"ALTER ROLE app SET statement_timeout = '{ROLE_STATEMENT_TIMEOUT_MS}ms';",
-    )
-    urls = {
-        "migrations": f"postgresql+asyncpg://app_owner@/postgres?host={sockdir}",
-        "app": f"postgresql+asyncpg://app@/postgres?host={sockdir}",
-    }
-    env = {**os.environ, "DATABASE_URL_MIGRATIONS": urls["migrations"], "DATABASE_URL": urls["app"]}
-    subprocess.run(
-        [sys.executable, "-m", "alembic", "upgrade", "head"], check=True, env=env, timeout=120
-    )
-    return urls
-
-
-@pytest.fixture(scope="module")
-def two_databases():
-    """Index 0: the pooled default. Index 1: a dedicated tenant's own database. Both fully
-    migrated, both with the real `app_owner`/`app` roles."""
-    servers = []
-    urls = []
-    for _ in range(2):
-        pgdata = tempfile.mkdtemp(prefix="pgdata-tenant-session-routing-")
-        server = pgserver.get_server(pgdata, cleanup_mode="delete")
-        urls.append(_bootstrap_and_migrate(server))
-        servers.append(server)
-    yield urls
-    for server in servers:
-        server.cleanup()
-
-
-@pytest.fixture
-def routing_env(two_databases, tmp_path, monkeypatch):
-    from app import config
-    from app.db import engine_registry
-    from app.db import session as db_session
-
-    pooled_urls, dedicated_urls = two_databases
-
-    monkeypatch.setenv("DATABASE_URL", pooled_urls["app"])
-    monkeypatch.setenv("DATABASE_URL_MIGRATIONS", pooled_urls["migrations"])
-    config.get_settings.cache_clear()
-    db_session._engine = None
-    db_session._session_factory = None
-    engine_registry.reset_registry_for_tests()
-
-    secrets_dir = tmp_path / "tenant-db"
-    secrets_dir.mkdir()
-    monkeypatch.setenv("TENANT_DB_SECRETS_DIR", str(secrets_dir))
-    (secrets_dir / "tenant-dedicated").write_text(dedicated_urls["app"])
-
-    yield {"pooled": pooled_urls, "dedicated": dedicated_urls, "secrets_dir": secrets_dir}
-
-    config.get_settings.cache_clear()
-    db_session._engine = None
-    db_session._session_factory = None
-    engine_registry.reset_registry_for_tests()
-
-
-async def _seed_tenant(
-    migrations_url: str,
-    tenant_id: uuid.UUID,
-    name: str,
-    *,
-    control_row: tuple[str, str | None] | None,
-    suspended: bool = False,
-) -> None:
-    """Writes the tenant's `public.tenants` row and, if given, its `control.tenants` bookkeeping
-    row, as `app_owner`. `app_owner` is not a superuser and does not bypass RLS (FORCE ROW LEVEL
-    SECURITY applies to it too), so the tenant context must be set before either insert -- exactly
-    what a real owner-role operator action would do.
-    """
-    engine = create_async_engine(migrations_url)
-    async with engine.begin() as conn:
-        await conn.execute(
-            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": str(tenant_id)}
-        )
-        await conn.execute(
-            text("INSERT INTO tenants (id, name) VALUES (:id, :name)"),
-            {"id": tenant_id, "name": name},
-        )
-        if control_row is not None:
-            isolation_tier, database_alias = control_row
-            await conn.execute(
-                text(
-                    "INSERT INTO control.tenants (tenant_id, isolation_tier, database_alias) "
-                    "VALUES (:tid, :tier, :alias)"
-                ),
-                {"tid": tenant_id, "tier": isolation_tier, "alias": database_alias},
-            )
-        if suspended:
-            await conn.execute(
-                text(
-                    "INSERT INTO control.tenants (tenant_id, suspended_at) "
-                    "VALUES (:tid, now()) "
-                    "ON CONFLICT (tenant_id) DO UPDATE SET suspended_at = now()"
-                ),
-                {"tid": tenant_id},
-            )
-    await engine.dispose()
-
-
-async def _seed_user(migrations_url: str, tenant_id: uuid.UUID, email: str) -> None:
-    """A global identity (subject = email) plus its membership in `tenant_id` -- the tenant's own
-    row of data these tests look for."""
-    engine = create_async_engine(migrations_url)
-    identity_id = uuid.uuid4()
-    async with engine.begin() as conn:
-        await conn.execute(
-            text("INSERT INTO control.identities (id, issuer, subject) VALUES (:id, :iss, :sub)"),
-            # A fresh issuer per call: the databases are module-scoped, the emails repeat.
-            {"id": identity_id, "iss": f"test-{identity_id}", "sub": email},
-        )
-        await conn.execute(
-            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": str(tenant_id)}
-        )
-        await conn.execute(
-            text(
-                "INSERT INTO memberships (tenant_id, identity_id, role) "
-                "VALUES (:tid, :iid, 'member')"
-            ),
-            {"tid": tenant_id, "iid": identity_id},
-        )
-    await engine.dispose()
-
-
-_MEMBER_EMAILS = (
-    "SELECT l.subject FROM memberships m JOIN control.identity_lookup l ON l.id = m.identity_id"
-)
+# `cluster`/`environment` are imported only so pytest can discover them as fixtures from this
+# module's namespace -- referenced only by parameter name in the tests below, never called
+# directly.
+_ = (cluster, environment)
 
 
 async def test_pooled_tenant_is_served_from_the_default_instance_and_sees_only_its_own_rows(
-    routing_env,
+    environment,
 ):
-    from app.context import RequestContext
-    from app.db.session import get_engine, tenant_session
+    tenant = await seed_tenant(environment, name="Pooled", roles=["member"])
+    other = await seed_tenant(environment, name="Other", roles=["member"])
 
-    pooled_urls = routing_env["pooled"]
-    tenant = uuid.uuid4()
-    other = uuid.uuid4()
-    await _seed_tenant(pooled_urls["migrations"], tenant, "Pooled", control_row=("pooled", None))
-    await _seed_tenant(pooled_urls["migrations"], other, "Other", control_row=("pooled", None))
-    await _seed_user(pooled_urls["migrations"], tenant, "pooled@example.com")
-    await _seed_user(pooled_urls["migrations"], other, "other@example.com")
-
-    ctx = RequestContext(tenant_id=tenant, identity_id=uuid.uuid4())
-    async with tenant_session(ctx) as session:
+    async with tenant_session(tenant.ctx("member")) as session:
         assert session.get_bind() is get_engine().sync_engine
-        emails = (await session.execute(text(_MEMBER_EMAILS))).scalars().all()
-        assert emails == ["pooled@example.com"]
+        memberships = await MembershipRepository().list_for_tenant(session, tenant.ctx("member"))
+
+    assert {m.identity_id for m in memberships} == set(tenant.identities.values())
+    assert not (set(tenant.identities.values()) & set(other.identities.values()))
 
 
 async def test_dedicated_tenant_is_served_from_its_own_instance_and_sees_only_its_own_rows(
-    routing_env,
+    environment,
 ):
-    from app.context import RequestContext
-    from app.db.session import get_engine, tenant_session
-
-    pooled_urls, dedicated_urls = routing_env["pooled"], routing_env["dedicated"]
-    tenant = uuid.uuid4()
-    # Control-plane bookkeeping: only ever in the pooled database.
-    await _seed_tenant(
-        pooled_urls["migrations"],
-        tenant,
-        "Dedicated",
-        control_row=("dedicated", "tenant-dedicated"),
+    tenant = await seed_tenant(
+        environment, name="Dedicated", roles=["member"], isolation_tier="dedicated"
     )
-    # The tenant's actual data lives on its own dedicated instance.
-    await _seed_tenant(dedicated_urls["migrations"], tenant, "Dedicated", control_row=None)
-    await _seed_user(dedicated_urls["migrations"], tenant, "dedicated@example.com")
+    assert tenant.database is not None
 
-    ctx = RequestContext(tenant_id=tenant, identity_id=uuid.uuid4())
-    async with tenant_session(ctx) as session:
+    async with tenant_session(tenant.ctx("member")) as session:
         assert session.get_bind() is not get_engine().sync_engine
-        emails = (await session.execute(text(_MEMBER_EMAILS))).scalars().all()
-        assert emails == ["dedicated@example.com"]
+        memberships = await MembershipRepository().list_for_tenant(session, tenant.ctx("member"))
+
+    assert {m.identity_id for m in memberships} == set(tenant.identities.values())
 
 
-async def test_dedicated_tenants_data_is_physically_absent_from_the_pooled_database(routing_env):
+async def test_dedicated_tenants_data_is_physically_absent_from_the_pooled_database(environment):
     """Not merely policy-hidden: forcing the tenant's own context directly against the pooled
     engine (bypassing routing entirely) still returns zero rows, because the tenant's data was
     never written to the pooled database -- only its control-plane bookkeeping stub was."""
-    from app.context import RequestContext
-    from app.db.session import get_engine, tenant_session
-
-    pooled_urls, dedicated_urls = routing_env["pooled"], routing_env["dedicated"]
-    tenant = uuid.uuid4()
-    await _seed_tenant(
-        pooled_urls["migrations"],
-        tenant,
-        "Dedicated",
-        control_row=("dedicated", "tenant-dedicated"),
+    tenant = await seed_tenant(
+        environment, name="Dedicated", roles=["member"], isolation_tier="dedicated"
     )
-    await _seed_tenant(dedicated_urls["migrations"], tenant, "Dedicated", control_row=None)
-    await _seed_user(dedicated_urls["migrations"], tenant, "dedicated@example.com")
 
-    ctx = RequestContext(tenant_id=tenant, identity_id=uuid.uuid4())
-    async with tenant_session(ctx):
+    async with tenant_session(tenant.ctx("member")):
         pass  # exercises routing once; asserted directly against tenant_session() above
 
     pooled_engine = get_engine()
     async with pooled_engine.connect() as conn:
         async with conn.begin():
             await conn.execute(
-                text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": str(tenant)}
+                text("SELECT set_config('app.tenant_id', :tid, true)"),
+                {"tid": str(tenant.tenant_id)},
             )
-            emails = (await conn.execute(text(_MEMBER_EMAILS))).scalars().all()
-    assert emails == []
+            memberships = (await conn.execute(text("SELECT id FROM memberships"))).scalars().all()
+    assert memberships == []
 
 
 async def test_tenant_session_rejects_a_suspended_tenant_and_unsuspending_restores_it(
-    routing_env,
+    environment,
 ):
     """Spec 9 / #69, ADR-0010, seam 1: the exact same control-plane read `tenant_session()` makes
     to route a session (this file's other tests) also rejects it, before any session against the
     tenant's data is ever opened, and un-suspending (the operator's `unsuspend` command, stood in
-    for here by a direct write, mirroring `_seed_tenant`) restores it -- with nothing
-    re-provisioned, exactly the same routing as before suspension.
+    for here by a direct write) restores it -- with nothing re-provisioned, exactly the same
+    routing as before suspension.
     """
-    from app.context import RequestContext
-    from app.db.session import TenantSuspendedError, get_engine, tenant_session
+    tenant = await seed_tenant(environment, name="Suspended", roles=["member"])
 
-    pooled_urls = routing_env["pooled"]
-    tenant = uuid.uuid4()
-    await _seed_tenant(
-        pooled_urls["migrations"],
-        tenant,
-        "Suspended",
-        control_row=("pooled", None),
-        suspended=True,
-    )
-    await _seed_user(pooled_urls["migrations"], tenant, "suspended@example.com")
+    async with tenant.owner_connection() as conn:
+        async with conn.begin():
+            await conn.execute(
+                text("SELECT set_config('app.tenant_id', :tid, true)"),
+                {"tid": str(tenant.tenant_id)},
+            )
+            await conn.execute(
+                text("UPDATE control.tenants SET suspended_at = now() WHERE tenant_id = :tid"),
+                {"tid": tenant.tenant_id},
+            )
 
-    ctx = RequestContext(tenant_id=tenant, identity_id=uuid.uuid4())
     with pytest.raises(TenantSuspendedError) as exc_info:
-        async with tenant_session(ctx):
+        async with tenant_session(tenant.ctx("member")):
             pass
-    assert exc_info.value.tenant_id == tenant
+    assert exc_info.value.tenant_id == tenant.tenant_id
 
     # Un-suspend (direct write, standing in for the operator's `unsuspend` command) and the exact
     # same session-building call now succeeds, routed exactly as it would have been all along.
-    engine = create_async_engine(pooled_urls["migrations"])
-    async with engine.begin() as conn:
-        await conn.execute(
-            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": str(tenant)}
-        )
-        await conn.execute(
-            text("UPDATE control.tenants SET suspended_at = NULL WHERE tenant_id = :tid"),
-            {"tid": str(tenant)},
-        )
-    await engine.dispose()
+    async with tenant.owner_connection() as conn:
+        async with conn.begin():
+            await conn.execute(
+                text("SELECT set_config('app.tenant_id', :tid, true)"),
+                {"tid": str(tenant.tenant_id)},
+            )
+            await conn.execute(
+                text("UPDATE control.tenants SET suspended_at = NULL WHERE tenant_id = :tid"),
+                {"tid": tenant.tenant_id},
+            )
 
-    async with tenant_session(ctx) as session:
+    async with tenant_session(tenant.ctx("member")) as session:
         assert session.get_bind() is get_engine().sync_engine
-        emails = (await session.execute(text(_MEMBER_EMAILS))).scalars().all()
-        assert emails == ["suspended@example.com"]
+        memberships = await MembershipRepository().list_for_tenant(session, tenant.ctx("member"))
+    assert {m.identity_id for m in memberships} == set(tenant.identities.values())
 
 
-async def test_tenant_with_no_control_plane_row_defaults_to_pooled(routing_env):
+async def test_tenant_with_no_control_plane_row_defaults_to_pooled(environment):
     """Existing callers (test_rls_integration.py, test_db_limits_integration.py) seed tenants
     only in `public.tenants`, never in `control.tenants` -- ADR-0002 defaults every tenant to
-    pooled, so this must keep working unmodified."""
-    from app.context import RequestContext
-    from app.db.session import get_engine, tenant_session
+    pooled, so this must keep working unmodified. `seed_tenant` itself always writes a
+    `control.tenants` row (however minimal), so this one scenario -- no control-plane row at
+    all -- is seeded directly, the one case the package's `seed_tenant` does not cover by
+    design; `seed_membership` (the package's own seam for "a membership `seed_tenant`'s own
+    `roles=` doesn't cover") supplies the identity and membership."""
+    tenant_id = uuid.uuid4()
+    engine = create_async_engine(environment.superuser_url)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("INSERT INTO tenants (id, name) VALUES (:id, :name)"),
+                {"id": tenant_id, "name": "NoControlRow"},
+            )
+    finally:
+        await engine.dispose()
+    identity_id, _membership_id = await seed_membership(
+        environment, tenant_id=tenant_id, role="member"
+    )
 
-    pooled_urls = routing_env["pooled"]
-    tenant = uuid.uuid4()
-    await _seed_tenant(pooled_urls["migrations"], tenant, "NoControlRow", control_row=None)
-    await _seed_user(pooled_urls["migrations"], tenant, "no-control-row@example.com")
-
-    ctx = RequestContext(tenant_id=tenant, identity_id=uuid.uuid4())
+    ctx = RequestContext(tenant_id=tenant_id, identity_id=identity_id)
     async with tenant_session(ctx) as session:
         assert session.get_bind() is get_engine().sync_engine
-        emails = (await session.execute(text(_MEMBER_EMAILS))).scalars().all()
-        assert emails == ["no-control-row@example.com"]
+        memberships = await MembershipRepository().list_for_tenant(session, ctx)
+    assert {m.identity_id for m in memberships} == {identity_id}
