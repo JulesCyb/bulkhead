@@ -18,20 +18,16 @@ from __future__ import annotations
 
 import asyncio
 
-from sqlalchemy.ext.asyncio import create_async_engine
-
+from app.db.lifecycle import owner_engine
 from app.migration_settings import get_migration_settings
 from app.retention import run_retention_job
 
 
 async def _main() -> None:
     dsn = get_migration_settings().database_url_migrations.get_secret_value()
-    engine = create_async_engine(dsn)
-    try:
+    async with owner_engine(dsn) as engine:
         async with engine.begin() as conn:
             outcomes = await run_retention_job(conn)
-    finally:
-        await engine.dispose()
 
     for outcome in outcomes:
         if outcome.deleted:

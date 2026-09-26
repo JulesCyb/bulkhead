@@ -1,29 +1,53 @@
-"""Control-plane data access: the two narrow, cross-tenant reads the `app` role is granted
-(ADR-0003 / ADR-0011 / issue #22). Both take a session from `control_session()` (app/db/session.py)
--- never `tenant_session(ctx)`, and never any other query against `control.*`.
+"""Control-plane data access -- the only module that issues SQL against the `control` schema
+(spec A5 / #113; the operator package, `app/operator/`, and `app/gateway_provisioning.py` still
+carry their own copies of that SQL until #114 rewires them onto this repository -- see those
+modules).
+
+Two sides, two session kinds:
+
+- **The `app`-role read side** (ADR-0003 / ADR-0011 / issue #22): the narrow, cross-tenant reads
+  the `app` role is granted, on a session from `control_session()` (app/db/session.py) -- never
+  `tenant_session(ctx)`, and never any other query against `control.*`. `find_by_issuer_and_subject`
+  and `get` below are read-only by construction: they issue a single SELECT each and return None on
+  no match rather than raising. `get_tenant_record` (Spec 7 / #52, #104) is the one tenant-scoped
+  read: the caller's own row through `control.tenants_view` (RLS-filtered to that one tenant) plus
+  the tenant's own settings, on a session from `tenant_record_session(tenant_id)` (pooled database,
+  `app.tenant_id` set for that one transaction) -- see `app.tenant_record`. It is the only reader of
+  residency and the gateway credential alias (#105): model, embedding, and tracing resolution are
+  functions of the record it returns, and read nothing themselves. `enumerate_referenced_aliases`
+  is also reachable from this side (the fail-closed guard, `app/db/guard.py`, calls it on an
+  app-role `control_session()` -- `app` is granted `EXECUTE` on the underlying function by
+  migration 0017) as well as from the owner-role side below (the migration runner,
+  `scripts/migrate.py`), hence its `AsyncConnection | AsyncSession` parameter.
+- **The owner-role write side** (spec A5 / #113, ADR-0010, ADR-0011): every function below takes
+  an already-open owner-role `AsyncConnection` (the operator CLI's own transaction) and writes or
+  reads `control.tenants` directly rather than through a `SECURITY DEFINER` escape hatch, except
+  `set_suspended`, which already has one (`control.set_tenant_suspended()`, migration 0024).
+  `control.tenants` carries `FORCE ROW LEVEL SECURITY` (migration 0002), which binds the owner
+  role exactly as it binds `app` -- every one of those direct reads/writes must first set
+  `app.tenant_id` to the tenant it is about to touch, even to read or write that tenant's own row.
+  `_set_owner_tenant_context` below is the one private helper that idiom lives in; nothing else in
+  the codebase may contain it after #114 (the operator package and `app/gateway_provisioning.py`
+  are exempt until then).
 
 The application never creates, changes, or removes an identity; only the owner-role seed/admin
-path does that. `find_by_issuer_and_subject` and `get` below are read-only by construction: they
-issue a single SELECT each and return None on no match rather than raising.
-
-`ControlRepository` (Spec 7 / #52) is the one tenant-scoped read: `get_tenant_record` (#104)
-reads the caller's own row through `control.tenants_view` (RLS-filtered to that one tenant) plus
-the tenant's own settings, on a session from `tenant_record_session(tenant_id)` (pooled database,
-`app.tenant_id` set for that one transaction) -- see `app.tenant_record`. It is the only reader of
-residency and the gateway credential alias (#105): model, embedding, and tracing resolution are
-functions of the record it returns, and read nothing themselves.
+path does that.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import datetime
 from uuid import UUID
 
 from pydantic import BaseModel
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
 from app.repositories.tenant_settings import TenantSettingsRepository
 from app.tenant_record import TenantRecord
+from app.tenant_settings import TenantSettings
 
 
 class Identity(BaseModel):
@@ -106,25 +130,73 @@ class TenantAuthSettingsRepository:
         )
 
 
-class DatabaseAliasRepository:
-    """Enumerates the database aliases the control plane currently references (Spec 10 / #77):
-    the pooled default plus every dedicated alias at least one tenant is assigned to. Backs the
-    fail-closed runtime guard's extension to every open engine (`app/db/guard.py`) -- the guard
-    always checks the pooled alias itself, and adds whatever this repository reports on top of
-    it, so an empty control plane (zero tenants) still guards the one engine every deployment
-    actually opens.
+_TENANT_RECORD_QUERY = (
+    "SELECT isolation_tier, database_alias, residency, suspended_at, gateway_credential_alias "
+    "FROM control.tenants_view WHERE tenant_id = :tid"
+)
 
-    Calls `control.enumerate_database_aliases()` (migrations 0016/0017), a SECURITY DEFINER
-    function that returns alias strings only -- `app` never gains a cross-tenant view of
-    `control.tenants` itself. Enumerating aliases is a startup/readiness concern, never something
-    a tenant's own request needs.
-    """
 
-    async def list_referenced_aliases(self, session: AsyncSession) -> list[str]:
-        rows = await session.execute(
-            text("SELECT database_alias FROM control.enumerate_database_aliases()")
-        )
-        return [row[0] for row in rows]
+def _record_from_row(
+    tenant_id: UUID, row: Mapping[str, object] | None, settings: TenantSettings
+) -> TenantRecord:
+    """Shared by `get_tenant_record` (app-role) and `get_record` (owner-role) below -- same
+    columns, same mapping to a `TenantRecord`, read on two different session kinds."""
+    if row is None:
+        return TenantRecord(tenant_id=tenant_id, settings=settings)
+    pooled = row["isolation_tier"] == "pooled"
+    return TenantRecord(
+        tenant_id=tenant_id,
+        isolation_tier="pooled" if pooled else "dedicated",
+        database_alias=None if pooled else row["database_alias"],
+        residency=row["residency"],
+        suspended_at=row["suspended_at"],
+        gateway_credential_alias=row["gateway_credential_alias"],
+        settings=settings,
+    )
+
+
+async def _set_owner_tenant_context(conn: AsyncConnection, tenant_id: UUID) -> None:
+    """The forced-RLS workaround (spec A5 / #113): `control.tenants` carries `FORCE ROW LEVEL
+    SECURITY` (migration 0002), which binds the owner role exactly as it binds `app` -- an
+    owner-role connection must set `app.tenant_id` to the tenant it is about to read or write
+    before every direct call against `control.tenants`, even to touch that tenant's own row. The
+    one place this idiom exists in the codebase; nothing else may set `app.tenant_id` against
+    `control.tenants` directly (the operator package and `app/gateway_provisioning.py` still carry
+    their own copies until #114 rewires them onto this repository). Never used by `set_suspended`
+    below, which goes through `control.set_tenant_suspended()` instead -- a `SECURITY DEFINER`
+    function that manages its own escape-hatch flag internally and needs no `app.tenant_id` at
+    all."""
+    await conn.execute(
+        text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": str(tenant_id)}
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class RoutingState:
+    """Exactly the three facts `tenant_session()`'s routing read (`_resolve_tenant_alias`,
+    ADR-0002, Spec 10 / #75, Spec 9 / #69) needs to pick which database serves a tenant with no
+    already-resolved `TenantRecord` -- deliberately narrower than `TenantRecord`/
+    `get_tenant_record`: no settings read, so a caller that only needs to route (a job, a test,
+    the stdio MCP fallback) pays for exactly the one query it always did, never a second one
+    against `tenants.settings` it does not need. `isolation_tier`/`database_alias`/
+    `suspended_at` are all `None` when the control plane has no row for the tenant at all --
+    ADR-0002's pooled default."""
+
+    isolation_tier: str | None
+    database_alias: str | None
+    suspended_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class SuspensionOutcome:
+    """What `set_suspended` reports: whether the state actually changed (re-suspending an
+    already-suspended tenant, or unsuspending an already-active one, is a no-op) and the
+    resulting `suspended_at` (`None` once unsuspended)."""
+
+    tenant_id: UUID
+    suspended: bool
+    changed: bool
+    suspended_at: datetime | None
 
 
 class ControlRepository:
@@ -138,11 +210,25 @@ class ControlRepository:
         has); a pooled row's `database_alias` is reported as `None` whatever the column holds, so
         no consumer can route a pooled tenant by an alias."""
         row = (
+            (await session.execute(text(_TENANT_RECORD_QUERY), {"tid": str(tenant_id)}))
+            .mappings()
+            .one_or_none()
+        )
+        settings = await TenantSettingsRepository().get_for_tenant(session, tenant_id=tenant_id)
+        return _record_from_row(tenant_id, row, settings)
+
+    async def get_routing_state(self, session: AsyncSession, *, tenant_id: UUID) -> RoutingState:
+        """The app-role routing read `tenant_session()` falls back to when its context carries no
+        already-resolved `TenantRecord` (#104) -- see `RoutingState`'s own docstring. The session
+        must already have `app.tenant_id` set to `tenant_id` (that `set_config` call stays in
+        `app/db/session.py`'s `_resolve_tenant_alias`: it is the session's own per-request tenant
+        scoping, not the owner-role forced-RLS workaround `_set_owner_tenant_context` exists
+        for)."""
+        row = (
             (
                 await session.execute(
                     text(
-                        "SELECT isolation_tier, database_alias, residency, suspended_at, "
-                        "gateway_credential_alias "
+                        "SELECT isolation_tier, database_alias, suspended_at "
                         "FROM control.tenants_view WHERE tenant_id = :tid"
                     ),
                     {"tid": str(tenant_id)},
@@ -151,16 +237,155 @@ class ControlRepository:
             .mappings()
             .one_or_none()
         )
-        settings = await TenantSettingsRepository().get_for_tenant(session, tenant_id=tenant_id)
         if row is None:
-            return TenantRecord(tenant_id=tenant_id, settings=settings)
-        pooled = row["isolation_tier"] == "pooled"
-        return TenantRecord(
-            tenant_id=tenant_id,
-            isolation_tier="pooled" if pooled else "dedicated",
-            database_alias=None if pooled else row["database_alias"],
-            residency=row["residency"],
+            return RoutingState(isolation_tier=None, database_alias=None, suspended_at=None)
+        return RoutingState(
+            isolation_tier=row["isolation_tier"],
+            database_alias=row["database_alias"],
             suspended_at=row["suspended_at"],
-            gateway_credential_alias=row["gateway_credential_alias"],
-            settings=settings,
         )
+
+    async def enumerate_referenced_aliases(self, conn: AsyncConnection | AsyncSession) -> list[str]:
+        """Every database alias the control plane currently references (Spec 10 / #77): the
+        pooled default plus every dedicated alias at least one tenant is assigned to. Backs the
+        fail-closed runtime guard's extension to every open engine (`app/db/guard.py`) -- the
+        guard always checks the pooled alias itself, and adds whatever this reports on top of it,
+        so an empty control plane (zero tenants) still guards the one engine every deployment
+        actually opens. Also backs the migration runner's alias enumeration
+        (`scripts/migrate.py`), on a raw owner-role connection instead of a session -- hence the
+        `AsyncConnection | AsyncSession` parameter: both expose the `execute()` this needs and
+        nothing here keys off which one it got.
+
+        Calls `control.enumerate_database_aliases()` (migrations 0016/0017), a `SECURITY DEFINER`
+        function that returns alias strings only -- `app` never gains a cross-tenant view of
+        `control.tenants` itself. Enumerating aliases is a startup/readiness/migration concern,
+        never something a tenant's own request needs, and needs no `app.tenant_id` at all: the
+        function manages its own escape-hatch flag internally, exactly like
+        `set_tenant_suspended`."""
+        rows = await conn.execute(
+            text("SELECT database_alias FROM control.enumerate_database_aliases()")
+        )
+        return [row[0] for row in rows]
+
+    async def create_tenant_record(
+        self,
+        conn: AsyncConnection,
+        tenant_id: UUID,
+        *,
+        name: str,
+        residency: str,
+        isolation_tier: str,
+        database_alias: str | None,
+        settings_json: str = "{}",
+    ) -> None:
+        """Writes a brand-new tenant's `tenants` row and its `control.tenants` row, atomically on
+        the caller's own owner-role transaction -- the same two `INSERT`s
+        `app.operator.create.create_tenant` performs today for a fresh tenant (#70/#71), now
+        behind this repository's one forced-RLS helper instead of that function's own inline
+        `set_config` call. `create_tenant` itself is not yet rewired onto this function -- #114
+        does that; this ticket adds it and tests it directly, with two tenants."""
+        await _set_owner_tenant_context(conn, tenant_id)
+        await conn.execute(
+            text(
+                "INSERT INTO tenants (id, name, settings) "
+                "VALUES (:id, :name, CAST(:settings AS jsonb))"
+            ),
+            {"id": tenant_id, "name": name, "settings": settings_json},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO control.tenants (tenant_id, residency, isolation_tier, "
+                "database_alias) VALUES (:tid, :residency, :tier, :alias)"
+            ),
+            {
+                "tid": tenant_id,
+                "residency": residency,
+                "tier": isolation_tier,
+                "alias": database_alias,
+            },
+        )
+
+    async def set_suspended(
+        self, conn: AsyncConnection, tenant_id: UUID, suspended: bool
+    ) -> SuspensionOutcome:
+        """Flips `tenant_id`'s suspension state through `control.set_tenant_suspended()`
+        (migration 0024) -- the one `SECURITY DEFINER` write path the owner role is granted onto
+        `control.tenants`. That function manages its own escape-hatch flag internally, so this is
+        the one owner-role method here that never calls `_set_owner_tenant_context`. Idempotent:
+        re-suspending an already-suspended tenant, or unsuspending an already-active one, reports
+        `changed=False`, never an error."""
+        row = (
+            await conn.execute(
+                text(
+                    "SELECT changed, suspended_at "
+                    "FROM control.set_tenant_suspended(:tid, :suspended)"
+                ),
+                {"tid": str(tenant_id), "suspended": suspended},
+            )
+        ).one()
+        return SuspensionOutcome(
+            tenant_id=tenant_id,
+            suspended=suspended,
+            changed=row.changed,
+            suspended_at=row.suspended_at,
+        )
+
+    async def read_gateway_credential_alias(
+        self, conn: AsyncConnection, tenant_id: UUID
+    ) -> str | None:
+        """The gateway-credential alias currently recorded for `tenant_id`, or `None` if no
+        `control.tenants` row exists for it yet (never provisioned) or its alias column is unset
+        (provisioned but revoked) -- the owner-role counterpart of
+        `app.gateway_provisioning._read_alias_from_control_plane`, on the caller's own already-open
+        connection instead of a fresh engine per call.
+
+        Deliberately not named `get_gateway_credential_alias`: that name was `ControlRepository`'s
+        own app-role method before #105 retired it in favour of reading the alias off the already-
+        resolved `TenantRecord` -- `tests/test_residency.py`'s
+        `test_residency_and_settings_are_read_from_the_record_only` guards against that exact name
+        reappearing anywhere in `app/`, and this is a different method (owner-role, for the
+        operator commands' own writes) that only happens to serve a similar fact."""
+        await _set_owner_tenant_context(conn, tenant_id)
+        row = (
+            await conn.execute(
+                text("SELECT gateway_credential_alias FROM control.tenants WHERE tenant_id = :tid"),
+                {"tid": tenant_id},
+            )
+        ).first()
+        return row[0] if row and row[0] else None
+
+    async def write_gateway_credential_alias(
+        self, conn: AsyncConnection, tenant_id: UUID, alias: str | None
+    ) -> None:
+        """Writes (or clears, `alias=None`) `tenant_id`'s own
+        `control.tenants.gateway_credential_alias` -- the owner-role counterpart of
+        `app.gateway_provisioning._record_alias_in_control_plane`. `ON CONFLICT` covers both a
+        tenant provisioned for the first time (no `control.tenants` row yet) and
+        re-provisioning/rotation of one that already has a row. (Named to match
+        `read_gateway_credential_alias` above, not `set_gateway_credential_alias`, for the same
+        reason that one avoids `get_gateway_credential_alias`.)"""
+        await _set_owner_tenant_context(conn, tenant_id)
+        await conn.execute(
+            text(
+                "INSERT INTO control.tenants (tenant_id, gateway_credential_alias) "
+                "VALUES (:tid, :alias) "
+                "ON CONFLICT (tenant_id) DO UPDATE "
+                "SET gateway_credential_alias = EXCLUDED.gateway_credential_alias"
+            ),
+            {"tid": tenant_id, "alias": alias},
+        )
+
+    async def get_record(self, conn: AsyncConnection, tenant_id: UUID) -> TenantRecord:
+        """The owner-role counterpart of `get_tenant_record` (#104): the same full `TenantRecord`
+        -- control-plane facts plus tenant-editable settings -- read on the caller's own
+        already-open owner-role connection (the operator CLI's transaction) instead of a fresh
+        `tenant_record_session(tenant_id)`. `create`/`erase`'s own reconciliation reads are exactly
+        this shape today, written inline; #114 rewires them onto this function."""
+        await _set_owner_tenant_context(conn, tenant_id)
+        row = (
+            (await conn.execute(text(_TENANT_RECORD_QUERY), {"tid": str(tenant_id)}))
+            .mappings()
+            .one_or_none()
+        )
+        settings = await TenantSettingsRepository().get_for_tenant(conn, tenant_id=tenant_id)
+        return _record_from_row(tenant_id, row, settings)

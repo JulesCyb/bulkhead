@@ -134,6 +134,7 @@ async def _resolve_tenant_alias(ctx: RequestContext) -> str:
     actual data.
     """
     from app.db.engine_registry import POOLED_ALIAS  # local import: avoids a circular import
+    from app.repositories.control import ControlRepository  # local import: avoids a cycle too
 
     async with get_session_factory()() as session:
         async with session.begin():
@@ -141,26 +142,14 @@ async def _resolve_tenant_alias(ctx: RequestContext) -> str:
                 text("SELECT set_config('app.tenant_id', :tid, true)"),
                 {"tid": str(ctx.tenant_id)},
             )
-            row = (
-                (
-                    await session.execute(
-                        text(
-                            "SELECT isolation_tier, database_alias, suspended_at "
-                            "FROM control.tenants_view WHERE tenant_id = :tid"
-                        ),
-                        {"tid": str(ctx.tenant_id)},
-                    )
-                )
-                .mappings()
-                .one_or_none()
-            )
+            state = await ControlRepository().get_routing_state(session, tenant_id=ctx.tenant_id)
 
-    if row is not None and row["suspended_at"] is not None:
+    if state.suspended_at is not None:
         raise TenantSuspendedError(ctx.tenant_id)
 
-    if row is None or row["isolation_tier"] == "pooled":
+    if state.isolation_tier is None or state.isolation_tier == "pooled":
         return POOLED_ALIAS
-    return row["database_alias"]
+    return state.database_alias
 
 
 @asynccontextmanager
