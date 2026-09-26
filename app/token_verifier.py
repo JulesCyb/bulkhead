@@ -1,12 +1,12 @@
 """Shared tenant-token verification (#44, ADR-0003, ADR-0012, ADR-0005): the signature/issuer/
 expiry check (`app/jwt_verifier.py`), the tenant-audience check, and the identity/membership
 resolution factored out of `app/deps.py`'s `AUTH_MODE=jwt` branch into one module any caller can
-reuse. Today that caller is the HTTP request-context dependency; Spec 6's MCP transport is meant
-to call this same function instead of writing a second copy of the check.
+reuse. Its caller is `app/context_resolution.py` (#101), the one chain every adapter (HTTP, and the
+MCP transport) resolves a request's context through.
 
-Deliberately excluded: tenant suspension. That is not one of the checks this module owns -- each
-caller enforces it itself, wherever it resolves a context (issue #69), rather than having it baked
-into the one shared verification step.
+Deliberately excluded: tenant suspension. That is not one of the checks this module owns --
+`app/context_resolution.py` checks it right after this module's verification succeeds (issue #69,
+#101), so no adapter can obtain a context for a suspended tenant.
 
 **Gap fix (Spec 6, closing the loop between #46/#47 and this module).** An agent identity's token
 (minted by `app/agent_credential_exchange.py`) is *not* governed by a tenant's own human-IdP
@@ -56,11 +56,12 @@ from app.repositories.memberships import MembershipRepository
 
 # (issuer) -> the algorithm(s) a token claiming that issuer may be verified with -- the algorithm
 # half of the same per-issuer pinning `KeySource` does for the verification key (see
-# `app.deps.get_key_source` / `get_algorithm_source`, the two real implementations both the HTTP
-# API and the MCP transport use). Never trusts the token's own header for this: `verify_token`
-# always passes whatever this resolves to as an explicit allow-list to `jwt.decode`, so a token
-# cannot pick its own algorithm, and a token minted under one issuer's algorithm/key can never be
-# checked against another issuer's (the algorithm-confusion guard, review finding Spec 6).
+# `app.context_resolution.key_source_for` / `algorithm_source_for`, the two real implementations
+# both the HTTP API and the MCP transport use). Never trusts the token's own header for this:
+# `verify_token` always passes whatever this resolves to as an explicit allow-list to
+# `jwt.decode`, so a token cannot pick its own algorithm, and a token minted under one issuer's
+# algorithm/key can never be checked against another issuer's (the algorithm-confusion guard,
+# review finding Spec 6).
 AlgorithmSource = Callable[[str], tuple[str, ...]]
 
 # The fixed issuer `control.create_agent_identity` (migration 0032) synthesizes for every agent

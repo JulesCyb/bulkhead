@@ -240,28 +240,42 @@ async def test_nonexistent_tenant_gets_the_identical_forbidden_response_as_a_non
 async def test_a_change_fed_only_into_the_shared_module_is_observed_at_the_http_layer(
     jwt_client, monkeypatch, caplog
 ):
-    """Proves delegation (#44 acceptance criterion 3): `app/deps.py` no longer contains its own
-    copy of the audience check. Patching `verify_tenant_token` itself -- the shared module's only
-    entry point -- to always report a wrong-audience failure, with no other part of the control
-    plane faked, is enough to make the HTTP layer reject the request. If `app/deps.py` still ran
-    its own audience check, this patch alone could not produce a 403 here."""
-    import app.token_verifier as token_verifier_module
+    """Proves delegation (#44, #101): `app/deps.py` keeps no copy of the chain. A valid token for
+    a real member, yet substituting `app.context_resolution.resolve_request_context` -- the one
+    function the HTTP adapter calls -- with one that reports a wrong-audience rejection is enough
+    to make the HTTP layer answer 403 with the generic body and the one security-event line. If
+    `app/deps.py` still resolved the context itself, this substitution could not produce a 403."""
+    import app.context_resolution as context_resolution_module
 
     tenant_id = uuid.uuid4()
+    identity_id = uuid.uuid4()
+    _install_fake_control_plane(
+        auth_settings={tenant_id: (ISSUER, False)},
+        identities={(ISSUER, "sub-1"): identity_id},
+        memberships={(tenant_id, identity_id): "member"},
+    )
 
-    async def _always_audience_mismatch(*args, **kwargs):
-        raise token_verifier_module.TenantTokenVerificationError(
-            token_verifier_module.VerificationFailureReason.AUDIENCE_MISMATCH, issuer=ISSUER
+    async def _always_audience_mismatch(**kwargs):
+        return context_resolution_module.ContextRejection(
+            status=context_resolution_module.RejectionStatus.FORBIDDEN,
+            reason=context_resolution_module.RejectionReason.AUDIENCE_MISMATCH,
+            detail=context_resolution_module.FORBIDDEN_DETAIL,
+            request_id="req-substituted",
+            issuer=ISSUER,
         )
 
-    monkeypatch.setattr(deps_module, "verify_tenant_token", _always_audience_mismatch)
+    monkeypatch.setattr(
+        context_resolution_module, "resolve_request_context", _always_audience_mismatch
+    )
     token = _make_token(audience=str(tenant_id))
     with caplog.at_level("WARNING"):
         response = await _post_run(tenant_id, token)
     assert response.status_code == 403
     assert response.json()["detail"] == deps_module.FORBIDDEN_DETAIL
-    reasons = [r.reason for r in caplog.records if hasattr(r, "reason")]
-    assert "audience_mismatch" in reasons
+    events = [r for r in caplog.records if getattr(r, "event", None) == "jwt_auth_forbidden"]
+    assert [(e.reason, e.tenant_id, e.issuer, e.request_id) for e in events] == [
+        ("audience_mismatch", str(tenant_id), ISSUER, "req-substituted")
+    ]
 
 
 async def test_valid_token_succeeds_and_roles_come_from_the_membership_row(

@@ -1,8 +1,8 @@
 """The suspension check shared by every place a request's tenant context is resolved, other than
-`tenant_session()` itself (Spec 9 / #69, ADR-0010): `app/deps.py`'s AUTH_MODE=dev-headers branch
-*and* its AUTH_MODE=jwt branch (the latter checks after `app/token_verifier.py::verify_tenant_token`
-succeeds but before a membership is looked up, since suspension isn't part of that shared token
-check -- issue #44), the MCP server's context provider (`app/mcp/server.py`), and the agent-run
+`tenant_session()` itself (Spec 9 / #69, ADR-0010): `app/context_resolution.py` under both
+AUTH_MODE values (#101 -- under AUTH_MODE=jwt right after `app/token_verifier.py::
+verify_tenant_token` succeeds, since suspension isn't part of that shared token check -- issue
+#44), the MCP server's context provider (`app/mcp/server.py`), and the agent-run
 entry points (`app/agents/assistant.py`, `app/api/chat.py`) -- each calls
 `ensure_tenant_not_suspended(tenant_id)` once, right after `tenant_id` is known and before running
 any tool or touching any tenant data, independently of whatever `tenant_session()` will separately

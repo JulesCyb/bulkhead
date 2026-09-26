@@ -70,11 +70,11 @@ from starlette.responses import JSONResponse
 
 from app.config import Settings, get_settings
 from app.context import RequestContext
+from app.context_resolution import actor_context
 from app.deps import get_algorithm_source, get_key_source
 from app.startup_checks import run_startup_checks
 from app.tenant_suspension import TenantSuspendedError, ensure_tenant_not_suspended
 from app.token_verifier import (
-    AGENT_IDENTITY_ISSUER,
     TenantTokenVerificationError,
     VerificationFailureReason,
     verify_tenant_token,
@@ -212,17 +212,9 @@ async def list_memberships() -> list[dict]:
 _MCP_FORBIDDEN_DETAIL = "Not authorized for this tenant."
 
 
-def _actor_context(tenant_id: UUID, resolved) -> RequestContext:  # noqa: ANN001
-    """Builds the per-connection `RequestContext` from a verified token, naming the means
-    (ADR-0005, issue #43): a person's token resolves to delegation (means = the assistant's
-    tools); an agent identity's token resolves to autonomous use (means = the credential that
-    authenticated it, from the token's own `cred` claim -- see `app/token_verifier.py`)."""
-    base_ctx = RequestContext(
-        tenant_id=tenant_id, identity_id=resolved.identity_id, roles=frozenset({resolved.role})
-    )
-    if resolved.issuer == AGENT_IDENTITY_ISSUER:
-        return base_ctx.acting_through("credential", resolved.credential_public_id or "unknown")
-    return base_ctx.acting_through("agent", "assistant")
+# Builds the per-connection context from a verified token, naming the means (ADR-0005): shared
+# with the HTTP adapter, owned by `app.context_resolution` (#101) -- not a second copy here.
+_actor_context = actor_context
 
 
 class MCPTenantAuthMiddleware:
