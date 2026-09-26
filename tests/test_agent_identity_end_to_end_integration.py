@@ -36,8 +36,9 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.agent_credential_exchange import exchange_agent_credential
-from app.config import ROLE_STATEMENT_TIMEOUT_MS, Settings
+from app.config import Settings
 from app.context import RequestContext
+from app.db.guard import ROLE_STATEMENT_TIMEOUT_MS
 from app.db.session import tenant_session
 from app.deps import get_algorithm_source, get_key_source
 from app.jwt_verifier import mint_token

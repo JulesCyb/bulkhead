@@ -29,7 +29,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 pgserver = pytest.importorskip("pgserver")
 
-from app.config import ROLE_STATEMENT_TIMEOUT_MS  # noqa: E402
+from app.db.guard import ROLE_STATEMENT_TIMEOUT_MS  # noqa: E402
 from app.gateway_provisioning import (  # noqa: E402
     GatewayAdminClient,
     GatewayCredentialLimits,

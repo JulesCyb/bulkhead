@@ -29,7 +29,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.api import chat as chat_module
-from app.config import ROLE_STATEMENT_TIMEOUT_MS
+from app.db.guard import ROLE_STATEMENT_TIMEOUT_MS
 from app.main import app
 from tests.conftest import resolve_to_model
 

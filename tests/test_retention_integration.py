@@ -25,7 +25,7 @@ import pytest
 from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from app.config import ROLE_STATEMENT_TIMEOUT_MS  # noqa: E402
+from app.db.guard import ROLE_STATEMENT_TIMEOUT_MS  # noqa: E402
 from app.tenant_settings import DEFAULT_RETENTION_DAYS  # noqa: E402
 
 pgserver = pytest.importorskip("pgserver")

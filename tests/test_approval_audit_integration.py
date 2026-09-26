@@ -24,8 +24,8 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from app.config import ROLE_STATEMENT_TIMEOUT_MS  # noqa: E402
 from app.context import RequestContext  # noqa: E402
+from app.db.guard import ROLE_STATEMENT_TIMEOUT_MS  # noqa: E402
 from app.db.session import tenant_session  # noqa: E402
 from app.repositories.approval_audit import (  # noqa: E402
     APPROVED,
