@@ -262,16 +262,16 @@ async def test_create_dedicated_is_recorded_in_the_operator_action_log(
 ):
     """Acceptance (#71): the create invocation for a dedicated tenant is recorded in the
     operator-action log the same way a pooled create is, with the admin URL redacted. The gateway
-    admin client is injected straight into `main()` (spec A5 / #115), not monkeypatched onto
-    `app.operator.create.build_admin_client`."""
+    admin client is injected straight into `run_operator()` (spec A5 / #115), not monkeypatched
+    onto `app.operator.create.build_admin_client`."""
     from app import config
-    from app.operator.cli import main
+    from app.operator.cli import run_operator
 
     monkeypatch.setenv("GATEWAY_CREDENTIALS_DIR", str(tmp_path))
     config.get_settings.cache_clear()
 
     engine = create_async_engine(environment.owner_url)
-    exit_code = main(
+    exit_code = await run_operator(
         [
             "create",
             "CLI Dedicated Co",
@@ -287,6 +287,7 @@ async def test_create_dedicated_is_recorded_in_the_operator_action_log(
         engine=engine,
         admin_client=fake_gateway_admin_client(key="sk-cli-dedicated"),
     )
+    await engine.dispose()
     config.get_settings.cache_clear()
     assert exit_code == 0
 

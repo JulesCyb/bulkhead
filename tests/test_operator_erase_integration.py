@@ -348,7 +348,7 @@ async def test_erase_pooled_tenant_removes_every_registered_table_and_records_er
     key to the tenant plus (via the real CLI entry point) an operator-action-log entry."""
     import app.operator.erase as erase_module
     from app import config
-    from app.operator.cli import main
+    from app.operator.cli import run_operator
 
     settings = Settings(gateway_credentials_dir=str(tmp_path))
     admin_client = fake_gateway_admin_client(key="sk-pooled-erase")
@@ -393,19 +393,20 @@ async def test_erase_pooled_tenant_removes_every_registered_table_and_records_er
     assert secret_path.exists()
 
     # Erase through the real CLI entry point, so this also proves the operator-action-log entry
-    # (app.operator.cli.main writes it via `_run`'s own `finally`, same as every other command).
-    # The gateway admin client is injected straight into `main()` (spec A5 / #115); Spec 8's
-    # tracing deletion has no such seam yet, so it stays monkeypatched at its own module-level
-    # name, exactly where `app.operator.erase.erase_tenant`'s default resolves it.
+    # (app.operator.cli.run_operator writes it via `_run`'s own `finally`, same as every other
+    # command). The gateway admin client is injected straight into `run_operator()` (spec A5 /
+    # #115); Spec 8's tracing deletion has no such seam yet, so it stays monkeypatched at its own
+    # module-level name, exactly where `app.operator.erase.erase_tenant`'s default resolves it.
     monkeypatch.setenv("GATEWAY_CREDENTIALS_DIR", str(tmp_path))
     config.get_settings.cache_clear()
     trace_deleter = _fake_trace_deleter()
     monkeypatch.setattr(erase_module, "delete_tenant_traces", trace_deleter)
 
     erase_engine = create_async_engine(environment.owner_url)
-    exit_code = main(
+    exit_code = await run_operator(
         ["erase", str(created.tenant_id)], engine=erase_engine, admin_client=admin_client
     )
+    await erase_engine.dispose()
     config.get_settings.cache_clear()
 
     assert exit_code == 0

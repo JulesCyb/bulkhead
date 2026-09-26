@@ -185,12 +185,13 @@ async def _operator_actions(superuser_url: str, action: str) -> list:
 
 
 async def test_cli_list_records_the_invocation_in_the_operator_action_log(environment, capsys):
-    from app.operator.cli import main
+    from app.operator.cli import run_operator
 
     tenant = await seed_tenant(environment, name="Umbrella", residency="eu", via_operator=False)
 
     engine = create_async_engine(environment.owner_url)
-    exit_code = main(["list"], engine=engine)
+    exit_code = await run_operator(["list"], engine=engine)
+    await engine.dispose()
     assert exit_code == 0
 
     # Golden output (spec A5 / #115, acceptance criterion 2): byte-identical to what the retired
@@ -220,11 +221,12 @@ async def test_cli_records_a_failed_invocation_too(environment):
     """Even a failed command is recorded, with its error, not silently dropped -- driven through
     a real failure (an unknown tenant), not a monkeypatched private dispatch entry (spec A5 /
     #115: no test reaches `_COMMANDS`)."""
-    from app.operator.cli import main
+    from app.operator.cli import run_operator
 
     unknown_id = str(uuid.uuid4())
     engine = create_async_engine(environment.owner_url)
-    exit_code = main(["suspend", unknown_id], engine=engine)
+    exit_code = await run_operator(["suspend", unknown_id], engine=engine)
+    await engine.dispose()
     assert exit_code == 1
 
     rows = await _operator_actions(environment.superuser_url, "suspend")
@@ -344,14 +346,19 @@ async def test_app_cannot_widen_its_control_plane_write_with_the_operator_write_
 async def test_cli_suspend_is_idempotent_and_records_both_invocations_in_the_audit_log(
     environment, capsys
 ):
-    from app.operator.cli import main
+    from app.operator.cli import run_operator
 
     tenant = await seed_tenant(environment, name="Audited Suspend Co", via_operator=False)
 
     argv = ["suspend", str(tenant.tenant_id)]
-    assert main(argv, engine=create_async_engine(environment.owner_url)) == 0
+    first_engine = create_async_engine(environment.owner_url)
+    assert await run_operator(argv, engine=first_engine) == 0
+    await first_engine.dispose()
     first_printed = capsys.readouterr().out
-    assert main(argv, engine=create_async_engine(environment.owner_url)) == 0
+
+    second_engine = create_async_engine(environment.owner_url)
+    assert await run_operator(argv, engine=second_engine) == 0
+    await second_engine.dispose()
     second_printed = capsys.readouterr().out
 
     # Golden output (spec A5 / #115): byte-identical to what the retired
@@ -372,13 +379,14 @@ async def test_cli_suspend_is_idempotent_and_records_both_invocations_in_the_aud
 
 
 async def test_cli_unsuspend_records_the_invocation_by_tenant_name(environment, capsys):
-    from app.operator.cli import main
+    from app.operator.cli import run_operator
 
     tenant = await seed_tenant(environment, name="Named Unsuspend Co", via_operator=False)
     await tenant.suspend()
 
     engine = create_async_engine(environment.owner_url)
-    exit_code = main(["unsuspend", "Named Unsuspend Co"], engine=engine)
+    exit_code = await run_operator(["unsuspend", "Named Unsuspend Co"], engine=engine)
+    await engine.dispose()
     assert exit_code == 0
     assert (
         capsys.readouterr().out == f"ok: {tenant.name!r} ({tenant.tenant_id}) is now unsuspended\n"
@@ -408,9 +416,11 @@ _RETIRED_PRIVATE_DISPATCH_PATTERN = re.compile(
 
 
 def test_no_test_imports_the_operator_clis_private_dispatch_function():
-    """Acceptance (spec A5 / #115): `main(argv, *, engine=None, admin_client=None)` is the one
-    entry point every operator test drives -- dispatch (`_run`, `_COMMANDS`) stays private, so no
-    test file may import or monkeypatch either. Mirrors
+    """Acceptance (spec A5 / #115): `run_operator(argv, *, engine=None, admin_client=None)` is
+    the one entry point every operator test drives -- dispatch (`_run`, `_COMMANDS`) stays
+    private, so no test file may import or monkeypatch either. `main(argv=None)` is the
+    synchronous script wrapper `scripts/operator.py` calls (`asyncio.run(run_operator(argv))`,
+    nothing else) -- not itself a seam a test needs. Mirrors
     `grep -rn 'from app.operator.cli import _run\\|cli_module\\._run\\|_COMMANDS' tests/` finding
     nothing, in pure Python rather than depending on the `grep` binary. This file itself (naming
     the retired pattern above, in prose, for exactly this test) is the one file the scan skips --
@@ -636,20 +646,21 @@ async def test_cli_create_records_the_invocation_in_the_operator_action_log(
     """Acceptance (#70): a `create` invocation through the real CLI dispatch is recorded in the
     operator-action log, with secrets redacted from the logged arguments (none of `create`'s own
     arguments are secret-shaped, so this also proves ordinary arguments still show up plainly).
-    The gateway admin client is injected straight into `main()` (spec A5 / #115), not
+    The gateway admin client is injected straight into `run_operator()` (spec A5 / #115), not
     monkeypatched onto `app.operator.create.build_admin_client`."""
     from app import config
-    from app.operator.cli import main
+    from app.operator.cli import run_operator
 
     monkeypatch.setenv("GATEWAY_CREDENTIALS_DIR", str(tmp_path))
     config.get_settings.cache_clear()
 
     engine = create_async_engine(environment.owner_url)
-    exit_code = main(
+    exit_code = await run_operator(
         ["create", "CLI Co", "--residency", "eu", "--admin-email", "admin@cli.test"],
         engine=engine,
         admin_client=fake_gateway_admin_client(key="sk-cli"),
     )
+    await engine.dispose()
     config.get_settings.cache_clear()
     assert exit_code == 0
 

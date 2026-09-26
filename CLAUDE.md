@@ -131,10 +131,12 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    session router, the guard, the migration runner, the operator commands
    (`app/operator/create.py`/`erase.py`/`suspend.py`/`listing.py`/`lookup.py`), and
    `app/gateway_provisioning.py` all read and write through now (spec A5 / #114) — no other module
-   issues SQL against `control.*` directly. The operator tool's own public entry point is
-   `app.operator.cli.main(argv, *, engine=None, admin_client=None)` (spec A5 / #115): it parses,
-   dispatches to the matching command, audits, and prints — dispatch itself stays private, so a
-   test drives a command only through `main()`, never a private function.
+   issues SQL against `control.*` directly. The operator tool's own public, test-drivable entry
+   point is `app.operator.cli.run_operator(argv, *, engine=None, admin_client=None)` (spec A5 /
+   #115), an async function: it parses, dispatches to the matching command, audits, and prints —
+   dispatch itself stays private, so a test `await`s `run_operator()` directly, never a private
+   function. `main(argv=None)` is the synchronous script wrapper — exactly
+   `asyncio.run(run_operator(argv))` — that `scripts/operator.py` calls.
 4. **Agents access data only through tools** (`app/tools/`) that check the context and return only
    what is needed. Never a DB connection or credentials to the model. **Every writing tool
    requires approval** (ADR-0007, Spec 5): mark it with `args_validator=require_approval`
@@ -265,7 +267,7 @@ tests/                pytest; RLS integration test with pgserver
 docker/               Postgres init (app role), LiteLLM config
 config/               residency.toml -- the residency allow-list (ADR-0008), loaded by app/config.py
 docs/                 adr/, agents/ (skill config), frontend.md, mobile.md, deployment.md, residency.md, mcp-connection.md
-app/operator/          operator tool: `cli.py`'s `main()` is the one public entry point (scripts/operator.py's own entry point; replaces scripts/seed.py); tenant lookup, tenant listing, `create`, `suspend`/`unsuspend`, `erase` are compositions over `app/repositories/control.py`'s `ControlRepository`, the one path for `control` schema SQL
+app/operator/          operator tool: `cli.py`'s `run_operator()` is the one public, test-drivable entry point; `main()` is its synchronous script wrapper (scripts/operator.py's own entry point; replaces scripts/seed.py); tenant lookup, tenant listing, `create`, `suspend`/`unsuspend`, `erase` are compositions over `app/repositories/control.py`'s `ControlRepository`, the one path for `control` schema SQL
 ```
 
 ## Do not touch without checking first

@@ -2,23 +2,23 @@
 command-line entry point (`scripts/operator.py` is the thin wrapper) connecting only as the owner
 database role.
 
-`main(argv, *, engine=None, admin_client=None)` is the one public function here -- it parses
-`argv`, dispatches to the matching command, records the operator-action audit row, prints the
-result, and returns the process exit code. Dispatch (`_COMMANDS`, `_run`) stays private: a test
-drives a command end to end through `main()` alone, with an injected `engine` and (for `create`/
-`erase`) an injected `admin_client`, never by importing `_run`/`build_parser`/`_COMMANDS`
-directly. `scripts/operator.py` calls `main()` unchanged.
+`run_operator(argv, *, engine=None, admin_client=None)` is the one public, test-drivable entry
+point -- an async function: it parses `argv`, dispatches to the matching command, records the
+operator-action audit row, prints the result, and returns the process exit code. Dispatch
+(`_COMMANDS`, `_run`) stays private: a test drives a command end to end by `await`ing
+`run_operator()` directly, with an injected `engine` and (for `create`/`erase`) an injected
+`admin_client`, never by importing `_run`/`build_parser`/`_COMMANDS` directly. `main(argv=None)`
+is the synchronous script wrapper -- exactly `asyncio.run(run_operator(argv))`, nothing else --
+and is what `scripts/operator.py` calls, unchanged.
 
-`main()` always owns whichever engine it ends up using -- one it builds itself from the owner DSN
-(`app.db.lifecycle.owner_engine`) when none is given, or one a caller injects -- and disposes it
-before returning, on whichever event loop actually used it (see below): a caller that injects an
-engine hands over its lifecycle for exactly the one call, the same way `owner_engine` already
-does for the DSN case, rather than the two cases leaving disposal split across two different
-owners. `main()` is also callable from inside a running event loop (an async test driving it
-directly, most commonly): `asyncio.run()` cannot itself be called there, so in that case the
-whole call runs to completion on a fresh loop of its own, in one worker thread, rather than
-raising -- this is also why an injected engine's connections must never be opened before this
-call (they would be bound to the wrong loop): build it and hand it straight to `main()`.
+With no `engine`, `run_operator` builds one from the owner DSN
+(`app.migration_settings.get_migration_settings`) via `app.db.lifecycle.owner_engine` and
+disposes it before returning, same as always; an injected `engine` is used as-is and stays the
+caller's to dispose -- only the caller (typically a test's own verification queries afterwards)
+knows whether it is reused. `run_operator` does not itself decide how it is invoked: it is a
+plain coroutine, `await`ed by an async caller (a test already running under its own event loop)
+or driven by `main()`'s `asyncio.run()` (a plain script, with no loop of its own) -- never
+anything that inspects or reacts to a running loop itself.
 
 Every invocation reads its connection string from `app.migration_settings.get_migration_settings`
 -- the same owner DSN Alembic's migrations use -- and nothing else, unless a caller injects an
@@ -36,15 +36,14 @@ describing that failure must still commit.
 One formatter per command, not five: every command's result type (`app.operator.listing.
 TenantListing`, `app.operator.suspend.SuspendResult`, `app.operator.create.CreateTenantResult`,
 `app.operator.erase.EraseResult`) implements the same small protocol -- `render()` for the text
-`main()` prints, `audit_outcome` for the free-text summary `main()` writes to the operator-action
-log -- so this module never hand-writes a `print` call of its own per command.
+`run_operator` prints, `audit_outcome` for the free-text summary `run_operator` writes to the
+operator-action log -- so this module never hand-writes a `print` call of its own per command.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import concurrent.futures
 import os
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -313,56 +312,38 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-async def _main_async(
-    args: argparse.Namespace,
-    *,
-    engine: AsyncEngine | None,
-    admin_client: GatewayAdminClient | None,
-) -> int:
-    if engine is not None:
-        try:
-            return await _run(args.command, args, engine, admin_client)
-        finally:
-            await engine.dispose()
-    dsn = get_migration_settings().database_url_migrations.get_secret_value()
-    async with owner_engine(dsn) as owned_engine:
-        return await _run(args.command, args, owned_engine, admin_client)
-
-
-def main(
+async def run_operator(
     argv: list[str] | None = None,
     *,
     engine: AsyncEngine | None = None,
     admin_client: GatewayAdminClient | None = None,
 ) -> int:
-    """The one public entry point (spec A5 / #115): parses `argv`, dispatches to the matching
-    command, records the operator-action audit row, prints the result, and returns the process
-    exit code. Dispatch (`_COMMANDS`, `_run`) stays private.
+    """The one public, test-drivable entry point (spec A5 / #115): parses `argv`, dispatches to
+    the matching command, records the operator-action audit row, prints the result, and returns
+    the process exit code. Dispatch (`_COMMANDS`, `_run`) stays private -- a test `await`s this
+    directly, never a private function.
 
     With no `engine`, this builds one from the owner DSN
-    (`app.migration_settings.get_migration_settings`) via `app.db.lifecycle.owner_engine`; either
-    way -- built here or injected -- this call disposes it before returning (see the module
-    docstring for why disposal never splits across two owners). `admin_client` is forwarded
-    verbatim to whichever of `create`/`erase` the command names -- the only two that ever touch
-    the gateway; `list`/`suspend`/`unsuspend` ignore it.
-
-    Callable from a plain script (`scripts/operator.py`) or from inside an already-running event
-    loop alike (an async test driving this function directly): with no loop running, this runs
-    the command via a plain `asyncio.run()`; with one already running, `asyncio.run()` cannot be
-    called here, so the whole call instead runs to completion on a fresh loop of its own, in one
-    worker thread, and this blocks until it finishes.
+    (`app.migration_settings.get_migration_settings`) via `app.db.lifecycle.owner_engine` and
+    disposes it before returning; an injected `engine` is used as-is and left for its caller to
+    dispose -- only the caller knows whether it is reused afterwards (a test's own verification
+    queries, most commonly). `admin_client` is forwarded verbatim to whichever of `create`/
+    `erase` the command names -- the only two that ever touch the gateway; `list`/`suspend`/
+    `unsuspend` ignore it.
     """
     args = build_parser().parse_args(argv)
+    if engine is not None:
+        return await _run(args.command, args, engine, admin_client)
+    dsn = get_migration_settings().database_url_migrations.get_secret_value()
+    async with owner_engine(dsn) as owned_engine:
+        return await _run(args.command, args, owned_engine, admin_client)
 
-    def _invoke() -> int:
-        return asyncio.run(_main_async(args, engine=engine, admin_client=admin_client))
 
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return _invoke()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(_invoke).result()
+def main(argv: list[str] | None = None) -> int:
+    """The synchronous script wrapper `scripts/operator.py` calls -- nothing more than
+    `asyncio.run(run_operator(argv))`, with no engine or admin client to inject, since a real
+    invocation always needs the owner DSN's own engine and the real gateway."""
+    return asyncio.run(run_operator(argv))
 
 
 if __name__ == "__main__":
