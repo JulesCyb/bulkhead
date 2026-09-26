@@ -18,7 +18,6 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.db.engine_registry import POOLED_ALIAS
-from app.db.guard import ROLE_STATEMENT_TIMEOUT_MS
 
 pgserver = pytest.importorskip("pgserver")
 
