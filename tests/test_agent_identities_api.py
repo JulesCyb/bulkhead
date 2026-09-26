@@ -132,7 +132,11 @@ def _install_fakes(monkeypatch, world: _World):
                     return True
             return False
 
-    class FakeMembershipRepository:
+    class _FakeMembershipListingRepository:
+        """Fakes `app.tools.memberships.MembershipRepository.list_for_tenant` -- unrelated to (and
+        not migrated by) #100's control-plane-reads adapter, which only covers the narrower
+        `get_role` read `app.token_verifier` uses."""
+
         async def list_for_tenant(self, session, ctx: RequestContext):
             return world.memberships.get(ctx.tenant_id, [])
 
@@ -146,7 +150,9 @@ def _install_fakes(monkeypatch, world: _World):
         agent_identities_tools_module, "AgentCredentialRepository", FakeAgentCredentialRepository
     )
     monkeypatch.setattr(memberships_tools_module, "tenant_session", lambda ctx: _fake_session())
-    monkeypatch.setattr(memberships_tools_module, "MembershipRepository", FakeMembershipRepository)
+    monkeypatch.setattr(
+        memberships_tools_module, "MembershipRepository", _FakeMembershipListingRepository
+    )
 
 
 def _headers(identity_id: uuid.UUID, roles: str) -> dict[str, str]:

@@ -37,12 +37,18 @@ async def _fake_session():
 
 
 def _install_fake_memberships(monkeypatch, records: list[MembershipRecord]):
-    class FakeMembershipRepository:
+    """Fakes `app.tools.memberships.MembershipRepository.list_for_tenant` -- unrelated to (and not
+    migrated by) #100's control-plane-reads adapter, which only covers the narrower `get_role`
+    read `app.token_verifier` uses; this is the tenant-scoped listing route's own repository."""
+
+    class _FakeMembershipListingRepository:
         async def list_for_tenant(self, session, ctx: RequestContext):
             return records
 
     monkeypatch.setattr(membership_tools_module, "tenant_session", lambda ctx: _fake_session())
-    monkeypatch.setattr(membership_tools_module, "MembershipRepository", FakeMembershipRepository)
+    monkeypatch.setattr(
+        membership_tools_module, "MembershipRepository", _FakeMembershipListingRepository
+    )
 
 
 def _context_with_role(role: str) -> RequestContext:

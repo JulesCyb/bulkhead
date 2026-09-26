@@ -19,6 +19,18 @@ by construction), and anything else falls back to the tenant's own configured is
 before. The peek is never trusted on its own: `verify_token` re-checks the real `iss` claim against
 whichever issuer this picks, under signature, so a forged `iss` that does not match its own
 signature still fails closed the same way it always did.
+
+**One injectable adapter for every control-plane/membership read (#100, prefactor for Spec A1).**
+`verify_tenant_token` needs three reads -- a tenant's auth settings, an identity by (issuer,
+subject), and a membership's role -- each previously reached by importing a repository class and
+a session function (`control_session`/`tenant_session`) at module level and calling it directly.
+Those five names are now reached through one object, `ControlPlaneReads`, that `verify_tenant_token`
+accepts as an optional `adapter=` keyword and that `app.tenant_suspension.ensure_tenant_not_
+suspended` (a sixth caller of the same auth-settings read) shares via `default_adapter()` below.
+`RepositoryControlPlaneReads` is the only place in this module that still imports the real
+repositories and session functions; nothing else here does, and no caller needs to know that.
+Tests install one fake of `ControlPlaneReads` (`tests.conftest.FakeControlPlaneReads`) instead of
+monkeypatching a repository or a session function on this module.
 """
 
 from __future__ import annotations
@@ -26,7 +38,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Final
+from typing import Final, Protocol
 from uuid import UUID
 
 import jwt as _pyjwt
@@ -34,7 +46,12 @@ import jwt as _pyjwt
 from app.context import RequestContext
 from app.db.session import control_session, tenant_session
 from app.jwt_verifier import KeySource, TokenVerificationError, verify_token
-from app.repositories.control import IdentityRepository, TenantAuthSettingsRepository
+from app.repositories.control import (
+    Identity,
+    IdentityRepository,
+    TenantAuthSettings,
+    TenantAuthSettingsRepository,
+)
 from app.repositories.memberships import MembershipRepository
 
 # (issuer) -> the algorithm(s) a token claiming that issuer may be verified with -- the algorithm
@@ -116,6 +133,85 @@ class ResolvedIdentity:
     credential_public_id: str | None = None
 
 
+class ControlPlaneReads(Protocol):
+    """The one seam through which `verify_tenant_token` (and `app.tenant_suspension.
+    ensure_tenant_not_suspended`) reach a tenant's auth settings, an identity, and a membership
+    role (#100) -- never a repository class or a session function imported directly. Every method
+    takes plain ids/strings and returns a plain value, never a session: an implementation owns its
+    own session/transaction, whatever that means for it (a real database, an in-memory dict for a
+    test)."""
+
+    async def find_identity_by_issuer_and_subject(
+        self, *, issuer: str, subject: str
+    ) -> Identity | None: ...
+
+    async def get_tenant_auth_settings(
+        self, *, tenant_id: UUID, default_issuer: str | None = None
+    ) -> TenantAuthSettings | None: ...
+
+    async def get_membership_role(self, *, tenant_id: UUID, identity_id: UUID) -> str | None: ...
+
+
+class RepositoryControlPlaneReads:
+    """The real, production `ControlPlaneReads` (#100): the only place this module still imports
+    `control_session`/`tenant_session` and the three repositories, and calls them directly. What
+    was `verify_tenant_token`'s own preliminary-context construction (to look up a membership
+    role, ADR-0003 -- issue #91 story 23) is now this class's own internal detail, in
+    `get_membership_role` below, rather than the calling function's."""
+
+    async def find_identity_by_issuer_and_subject(
+        self, *, issuer: str, subject: str
+    ) -> Identity | None:
+        async with control_session() as session:
+            return await IdentityRepository().find_by_issuer_and_subject(
+                session, issuer=issuer, subject=subject
+            )
+
+    async def get_tenant_auth_settings(
+        self, *, tenant_id: UUID, default_issuer: str | None = None
+    ) -> TenantAuthSettings | None:
+        async with control_session() as session:
+            return await TenantAuthSettingsRepository().get(
+                session, tenant_id=tenant_id, default_issuer=default_issuer
+            )
+
+    async def get_membership_role(self, *, tenant_id: UUID, identity_id: UUID) -> str | None:
+        # A minimal, role-free context exists only to open the tenant-bound session -- never
+        # returned or exposed to a caller (issue #91 story 23: an internal detail of this module).
+        preliminary_ctx = RequestContext(
+            tenant_id=tenant_id, identity_id=identity_id, roles=frozenset()
+        )
+        async with tenant_session(preliminary_ctx) as session:
+            return await MembershipRepository().get_role(
+                session, preliminary_ctx, identity_id=identity_id
+            )
+
+
+# Test-only override installed via `set_default_adapter_for_tests` below -- `None` means "use the
+# real, repository-backed adapter." Never read or set anywhere but `default_adapter`/
+# `set_default_adapter_for_tests` themselves; production code never touches this name.
+_test_default_adapter: ControlPlaneReads | None = None
+
+
+def set_default_adapter_for_tests(adapter: ControlPlaneReads | None) -> None:
+    """Test-only hook (#100): installs `adapter` as what `default_adapter()` below returns, for
+    every call to `verify_tenant_token`/`ensure_tenant_not_suspended` that doesn't pass its own
+    `adapter=` explicitly -- the one seam `tests/conftest.py`'s autouse `not_suspended` fixture
+    uses instead of monkeypatching a repository or a session function on this module. Call with
+    `None` to restore the real, repository-backed adapter."""
+    global _test_default_adapter
+    _test_default_adapter = adapter
+
+
+def default_adapter() -> ControlPlaneReads:
+    """The adapter `verify_tenant_token`/`ensure_tenant_not_suspended` use when no explicit
+    `adapter=` is passed: the test override installed via `set_default_adapter_for_tests` above,
+    if any, else a fresh `RepositoryControlPlaneReads`."""
+    if _test_default_adapter is not None:
+        return _test_default_adapter
+    return RepositoryControlPlaneReads()
+
+
 async def verify_tenant_token(
     token: str,
     *,
@@ -123,6 +219,7 @@ async def verify_tenant_token(
     key_source: KeySource,
     default_issuer: str | None,
     algorithm_source: AlgorithmSource,
+    adapter: ControlPlaneReads | None = None,
 ) -> ResolvedIdentity:
     """Verify `token` against `tenant_id` and resolve it to an identity and its membership.
 
@@ -138,19 +235,25 @@ async def verify_tenant_token(
     review finding Spec 6): a human issuer never gets checked against the agent algorithm/key, or
     vice versa, and neither ever accepts an algorithm the token's own header names.
 
+    `adapter` (#100) is the one seam through which the tenant auth-settings, identity, and
+    membership reads below happen; it defaults to `default_adapter()` (the real repositories,
+    unless a test has installed an override via `set_default_adapter_for_tests`). A caller never
+    needs to pass it explicitly outside a test.
+
     Raises `TenantTokenVerificationError` with a single categorized reason on the first check
     that fails; returns the resolved identity and role on success. Never checks suspension --
     see module docstring.
     """
+    adapter = adapter if adapter is not None else default_adapter()
+
     if _peek_unverified_issuer(token) == AGENT_IDENTITY_ISSUER:
         # An agent identity's token: tenant-independent issuer (see module docstring) -- skip the
         # tenant auth-settings lookup entirely, since it has nothing to say about this issuer.
         expected_issuer = AGENT_IDENTITY_ISSUER
     else:
-        async with control_session() as session:
-            auth_settings = await TenantAuthSettingsRepository().get(
-                session, tenant_id=tenant_id, default_issuer=default_issuer
-            )
+        auth_settings = await adapter.get_tenant_auth_settings(
+            tenant_id=tenant_id, default_issuer=default_issuer
+        )
         expected_issuer = auth_settings.issuer if auth_settings else default_issuer
         if not expected_issuer:
             raise TenantTokenVerificationError(VerificationFailureReason.INVALID_OR_EXPIRED)
@@ -170,22 +273,15 @@ async def verify_tenant_token(
             VerificationFailureReason.AUDIENCE_MISMATCH, issuer=expected_issuer
         )
 
-    async with control_session() as session:
-        identity = await IdentityRepository().find_by_issuer_and_subject(
-            session, issuer=expected_issuer, subject=claims.subject
-        )
+    identity = await adapter.find_identity_by_issuer_and_subject(
+        issuer=expected_issuer, subject=claims.subject
+    )
     if identity is None:
         raise TenantTokenVerificationError(
             VerificationFailureReason.UNKNOWN_IDENTITY, issuer=expected_issuer
         )
 
-    preliminary_ctx = RequestContext(
-        tenant_id=tenant_id, identity_id=identity.id, roles=frozenset()
-    )
-    async with tenant_session(preliminary_ctx) as session:
-        role = await MembershipRepository().get_role(
-            session, preliminary_ctx, identity_id=identity.id
-        )
+    role = await adapter.get_membership_role(tenant_id=tenant_id, identity_id=identity.id)
     if role is None:
         raise TenantTokenVerificationError(
             VerificationFailureReason.MISSING_MEMBERSHIP, issuer=expected_issuer
