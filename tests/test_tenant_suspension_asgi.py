@@ -2,17 +2,18 @@
 `tests/test_jwt_auth.py` doesn't cover (that file already exercises AUTH_MODE=jwt's own path
 through `app.context_resolution.resolve_bearer_context`).
 
-Proves the first of suspension's two enforcement points project-wide (`app/db/session.py`'s module
-docstring): context resolution (`app.context_resolution.resolve_dev_headers_context`) reads the
-tenant record, refuses a suspended one with the generic 403 body, and does this *before* the route
-itself ever runs -- proven here by the injected tool (`fake_search`, via the `calls` fixture) never
-being invoked at all, standing in for "zero tenant-table statements" in this no-real-Postgres
-corner of the suite (the literal statement count, against a real engine, is
+Proves the first of suspension's three refusal points project-wide (`app/db/session.py`'s
+module docstring): context resolution (`app.context_resolution.resolve_dev_headers_context`)
+reads the tenant record, refuses a suspended one with the generic 403 body, and does this
+*before* the route itself ever runs -- proven here by the injected tool (`fake_search`, via the
+`calls` fixture) never being invoked at all, standing in for "zero tenant-table statements" in
+this no-real-Postgres corner of the suite (the literal statement count, against a real engine, is
 `tests/test_tenant_record_integration.py`'s and `tests/test_tenant_session_routing_integration.py`'s
-job). The second enforcement point -- `tenant_session()`'s own routing read, for a context that
-carries no record at all -- is proven by `tests/test_assistant_suspension.py` (the agent-run entry
-points) and `tests/test_mcp_context.py` (the MCP `stdio` fallback), and, against a real database,
-by `tests/test_tenant_session_routing_integration.py`.
+job). The second -- `tenant_session()`'s own routing read, for a context that carries no record
+at all -- is proven by `tests/test_mcp_context.py` (the MCP `stdio` fallback) and, against a real
+database, by `tests/test_tenant_session_routing_integration.py`; the third -- `tenant_session()`
+refusing a context whose record says suspended -- by `tests/test_assistant_suspension.py` (the
+agent-run entry points).
 """
 
 from __future__ import annotations

@@ -14,6 +14,7 @@ import pytest
 from app.jwt_verifier import mint_token
 from app.token_verifier import (
     AGENT_IDENTITY_ISSUER,
+    TenantSuspendedAtVerification,
     TenantTokenVerificationError,
     VerificationFailureReason,
     verify_tenant_token,
@@ -259,13 +260,37 @@ async def test_agent_issued_token_still_fails_closed_on_a_bad_signature():
     assert exc_info.value.reason is VerificationFailureReason.INVALID_OR_EXPIRED
 
 
-async def test_success_is_not_affected_by_tenant_suspension():
-    """The shared module does not check suspension at all (issue #69 owns that check, in each
-    caller) -- a suspended tenant's otherwise-valid token still resolves here."""
+async def test_a_suspended_tenant_is_refused_before_any_identity_or_membership_lookup():
+    """Code review 2026-09-26 retired the `read_tenant_record` opt-out: the verifier always reads
+    the tenant record after the audience check and refuses a suspended tenant there -- an
+    otherwise-valid token never reaches the identity or membership lookup."""
     tenant_id = uuid.uuid4()
     identity_id = uuid.uuid4()
     adapter = FakeControlPlaneReads(
         auth_settings={tenant_id: (ISSUER, True)},
+        identities={(ISSUER, "sub-1"): identity_id},
+        memberships={(tenant_id, identity_id): "member"},
+        explode=frozenset({"find_identity_by_issuer_and_subject", "get_membership_role"}),
+    )
+    token = _make_token(audience=str(tenant_id))
+    with pytest.raises(TenantSuspendedAtVerification) as exc_info:
+        await verify_tenant_token(
+            token,
+            tenant_id=tenant_id,
+            key_source=_key_source,
+            default_issuer=None,
+            algorithm_source=lambda issuer: ("HS256",),
+            adapter=adapter,
+        )
+    assert exc_info.value.tenant_id == tenant_id
+    assert exc_info.value.issuer == ISSUER
+
+
+async def test_an_unsuspended_tenant_record_is_returned_on_the_resolved_identity():
+    tenant_id = uuid.uuid4()
+    identity_id = uuid.uuid4()
+    adapter = FakeControlPlaneReads(
+        auth_settings={tenant_id: (ISSUER, False)},
         identities={(ISSUER, "sub-1"): identity_id},
         memberships={(tenant_id, identity_id): "member"},
     )
@@ -279,3 +304,5 @@ async def test_success_is_not_affected_by_tenant_suspension():
         adapter=adapter,
     )
     assert resolved.identity_id == identity_id
+    assert resolved.tenant_record is not None
+    assert resolved.tenant_record.tenant_id == tenant_id

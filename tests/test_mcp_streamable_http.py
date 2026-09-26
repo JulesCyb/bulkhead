@@ -206,7 +206,7 @@ def mcp_app(monkeypatch):
 @asynccontextmanager
 async def _running_app(app):
     """Drives the ASGI application's own lifespan around the enclosed block (issue #116): this is
-    what now actually starts `MCPServer.session_manager` -- via `app.main.lifespan`, entered for
+    what now actually starts the mount's own session manager -- via `app.main.lifespan`, entered for
     real, not a test-side substitute for it. `httpx.ASGITransport` never sends `lifespan` scope
     messages on its own, so tests drive it explicitly through `app.router.lifespan_context`, the
     same pattern `tests/test_hardening.py` already uses for the auth/RLS guards.
@@ -564,3 +564,67 @@ def test_mcp_rejection_matches_the_http_adapters_for_the_same_reason():
 
     assert http_exc.status_code == mcp_response.status_code
     assert json.loads(mcp_response.body)["detail"] == http_exc.detail
+
+
+# --- #116 follow-up (code review 2026-09-26): each app runs its own mount's session manager -----
+
+
+async def test_two_apps_in_one_process_each_run_their_own_mounts_session_manager(mcp_app):
+    """`MCPServer.session_manager` names whichever `streamable_http_app()` ran last, so a second
+    `create_app()` in the same process used to rebind the one the first app's lifespan entered --
+    leaving the first app's own mount with a session manager nothing ever started. Each app now
+    keeps the mount it built on `app.state.mcp_app` and its lifespan enters that mount's own
+    manager: the first app still completes a real handshake after a second one was created."""
+    from app import main as main_module
+
+    first, _ = mcp_app
+    second = main_module.create_app()  # same settings (the fixture's monkeypatch), new mount
+    assert first.state.mcp_app.session_manager is not second.state.mcp_app.session_manager
+
+    tenant_id = uuid.uuid4()
+    identity_id = uuid.uuid4()
+    _install_fake_control_plane(
+        auth_settings={tenant_id: (HUMAN_ISSUER, False)},
+        identities={(HUMAN_ISSUER, "sub-1"): identity_id},
+        memberships={(tenant_id, identity_id): "member"},
+    )
+    token = _make_token(secret=HUMAN_SECRET, issuer=HUMAN_ISSUER, audience=str(tenant_id))
+    path = f"/v1/t/{tenant_id}/mcp/"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": _MCP_ACCEPT,
+        **_ALLOWED_HOST_HEADER,
+    }
+
+    for app in (first, second):
+        transport = httpx.ASGITransport(app=app)
+        async with (
+            _running_app(app),
+            httpx.AsyncClient(transport=transport, base_url="http://localhost") as client,
+        ):
+            session_headers = await _initialize_session(client, path, headers)
+            assert session_headers["Mcp-Session-Id"]
+
+
+async def test_lifespan_enters_the_session_manager_of_the_mount_on_app_state(mcp_app):
+    """Proof by substitution: the lifespan reads the session manager from `app.state.mcp_app`,
+    never from the process-wide `MCPServer` -- a recording stand-in swapped in is what it
+    enters."""
+    app, _ = mcp_app
+    entered: list[str] = []
+
+    class _RecordingManager:
+        @asynccontextmanager
+        async def run(self):
+            entered.append("enter")
+            yield
+            entered.append("exit")
+
+    class _StandInMount:
+        session_manager = _RecordingManager()
+
+    app.state.mcp_app = _StandInMount()
+    async with _running_app(app):
+        assert entered == ["enter"]
+    assert entered == ["enter", "exit"]

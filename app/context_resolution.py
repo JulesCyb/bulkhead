@@ -8,7 +8,7 @@ Glossary (`CONTEXT.md`):
 - **Identity** -- a person or agent known by (issuer, subject); a token names one.
 - **Membership** -- the identity's relation to this tenant; its **Role** is the only role the
   resulting context carries (never a client-supplied one, except under `dev-headers`).
-- **Suspension** -- a suspended tenant gets no context at all, from any adapter.
+- **Suspension** -- a suspended tenant gets no context at all, from any adapter (below).
 - **Delegation** -- a person's request runs with the person's membership; the means is the agent
   that handles it (`("agent", "assistant")`).
 - **Agent identity** -- an agent's own identity acting with no person present; the means is the
@@ -22,13 +22,29 @@ What this module does, in order, for a bearer token (`resolve_bearer_context`):
    against the identity provider's settings, an agent token against this application's own) --
    signature/issuer/expiry failures are 401, an audience other than the path's tenant is 403.
    None of that reads the control-plane view.
-3. Reads the tenant record (`ControlPlaneReads.get_tenant_record`, #104, asked for with
-   `read_tenant_record=True`) -- the one read of the tenant's control-plane facts and settings for
-   the whole request; a suspended record is a 403 before any identity or membership lookup.
+3. Reads the tenant record (`ControlPlaneReads.get_tenant_record`, #104, inside
+   `verify_tenant_token`) -- the one read of the tenant's control-plane facts and settings for the
+   whole request. The verifier decides suspension on it (`TenantSuspendedAtVerification`); this
+   module only maps that to a `TENANT_SUSPENDED` 403, before any identity or membership lookup.
 4. Resolves identity and membership -- unknown identity or no membership is 403. The membership
    lookup routes its tenant session by the record, so it reads no control-plane row of its own.
 5. Assigns the means (`actor_context`) and builds the context with a fresh request id, carrying
    the record (`RequestContext.tenant_record`) for `tenant_session` to route by.
+
+**Suspension (ADR-0010) is refused at three points, one per kind of caller** -- the same list
+`app/db/session.py`'s module docstring and CLAUDE.md rule 2 give:
+
+1. A request is refused at context resolution, on the tenant record it reads -- here: the bearer
+   path maps the verifier's `TenantSuspendedAtVerification` to `TENANT_SUSPENDED`, the
+   dev-headers path decides it on the record it reads itself (`_read_tenant_record`). No context
+   is ever built for a suspended tenant.
+2. A caller without a record (the stdio MCP fallback, `resolve_stdio_env_context` below; a test)
+   is refused by `tenant_session()`'s own routing read.
+3. A context that carries a suspended record is refused by `tenant_session()` itself.
+
+The retention job skips a suspended tenant on its record, because CONTEXT.md defines suspension
+as "nothing is deleted" (ADR-0010) -- the one deliberate exception to CLAUDE.md rule 2's "with no
+exception" for retention.
 
 `AUTH_MODE=dev-headers` (local development only) is its own function, `resolve_dev_headers_context`,
 returning the same value type: the identity and roles come from `X-Identity-Id`/`X-Roles`, the
@@ -156,9 +172,13 @@ def key_source_for(settings: Settings) -> KeySource:
     (`iss == AGENT_IDENTITY_ISSUER`, minted by `app/agent_credential_exchange.py`) only ever
     against this application's own agent-token key; every other issuer only ever against the
     identity provider's `jwt_verification_key`. A single process-wide key (ADR-0003's
-    operator-run identity provider), never a network JWKS fetch; a customer-owned identity
-    provider needs a JWKS-backed `KeySource` -- override `app.deps.get_key_source`, never make
-    `app/jwt_verifier.py` reach the network itself."""
+    operator-run identity provider), never a network JWKS fetch. A customer-owned identity
+    provider needs a JWKS-backed `KeySource`: change this function (and `algorithm_source_for`
+    below, if its algorithm differs) -- the one place both adapters read, the HTTP one through
+    `app.deps.get_key_source`/`get_algorithm_source` and the MCP one through
+    `resolve_bearer_context`'s own defaults. Overriding `app.deps.get_key_source` alone would
+    reach only the HTTP adapter, never the MCP transport. Never make `app/jwt_verifier.py` reach
+    the network itself."""
 
     def _source(issuer: str, kid: str | None) -> str:
         if issuer == AGENT_IDENTITY_ISSUER:
@@ -299,7 +319,6 @@ async def resolve_bearer_context(
             default_issuer=settings.default_identity_issuer,
             algorithm_source=algorithm_source or algorithm_source_for(settings),
             adapter=adapter,
-            read_tenant_record=True,
         )
     except TenantSuspendedAtVerification as exc:
         return _forbidden(RejectionReason.TENANT_SUSPENDED, request_id, exc.issuer)
@@ -367,9 +386,10 @@ def resolve_stdio_env_context(settings: Settings) -> RequestContext:
     process-wide `RequestContext` built from `MCP_TENANT_ID`/`MCP_IDENTITY_ID`, never per
     connection -- `stdio` is a single local development client, unlike `streamable-http`'s one
     context per connection (`resolve_bearer_context` above, via `actor_context`). No suspension
-    check and no means here: `app.mcp.server.resolve_context` (the MCP connection handler's own
-    entry point, #89) runs the suspension check itself for *both* the per-connection and this
-    stdio-fallback context, and a local developer's own tool calls carry no means to report.
+    check and no means here, and none in `app.mcp.server.resolve_context` either (#106): this
+    context carries no tenant record, so the first `tenant_session()` a tool call opens refuses a
+    suspended tenant through its own routing read (`app/db/session.py`'s module docstring); a
+    local developer's own tool calls carry no means to report.
 
     `app.mcp.server`'s `_context_from_env` is a thin wrapper of this function -- kept under that
     name for #89's own semantics (per-connection contextvar first, this fallback only under

@@ -144,8 +144,8 @@ def default_control_plane_reads():
     `app.context_resolution`'s tenant-record read and `app.token_verifier.verify_tenant_token`
     both fall back to (`app/deps.py`'s dev-headers branch and every bearer-token path share it).
 
-    Suspension itself has exactly two enforcement points project-wide (`app/db/session.py`'s
-    module docstring), neither of which lives in this fixture (#106 retired the old
+    Suspension itself is refused at three points project-wide (`app/db/session.py`'s module
+    docstring), none of which lives in this fixture (#106 retired the old
     `not_suspended` fixture that used to be about suspension specifically): a test that wants a
     suspended tenant installs its own `FakeControlPlaneReads(auth_settings=...)` or
     `FakeControlPlaneReads(records=...)` the same way, after this fixture runs, or -- for a real

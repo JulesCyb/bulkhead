@@ -32,7 +32,10 @@ Two sides, two session kinds:
   SECURITY` (migration 0002), which binds the owner role exactly as it binds `app` -- every one of
   those direct reads/writes must first set `app.tenant_id` to the tenant it is about to touch,
   even to read or write that tenant's own row. `_set_owner_tenant_context` below is the one
-  private helper that idiom lives in; nothing else in the codebase may contain it (#114). Not
+  private helper that idiom lives in for the pooled database (#114); the pooled-path membership
+  write (`app.repositories.memberships.ensure_membership`) relies on the context it leaves on the
+  caller's transaction, and the only other owner-role `set_config` is
+  `app.operator.dedicated_db`'s, against a dedicated database this repository never reaches. Not
   every owner-role write needs it: `control.identities` (`IdentityRepository.upsert`) and the two
   append-only audit tables (`record_operator_action`, `record_erasure`) carry no `tenant_id`/RLS
   at all (0003, 0004), so those three write with no forced-RLS context.
@@ -204,9 +207,14 @@ async def _set_owner_tenant_context(conn: AsyncConnection, tenant_id: UUID) -> N
     SECURITY` (migration 0002), which binds the owner role exactly as it binds `app` -- an
     owner-role connection must set `app.tenant_id` to the tenant it is about to read or write
     before every direct call against `control.tenants`, even to touch that tenant's own row. The
-    one place this idiom exists in the codebase (#114); nothing else may set `app.tenant_id`
-    against `control.tenants` directly -- the operator package and `app/gateway_provisioning.py`
-    call this repository's own functions instead of setting it themselves. Never used by
+    one place the operator package and `app/gateway_provisioning.py` get that context from on the
+    pooled database (#114): they call this repository's own functions instead of setting it
+    themselves. The setting lasts for the caller's whole transaction, so the pooled path's
+    membership write (`app.repositories.memberships.ensure_membership`, called by
+    `app.operator.create` after `create_tenant_record`/`get_record`) relies on it too -- that
+    table is forced-RLS as well (code review 2026-09-26). The one owner-role `set_config` outside
+    this helper is `app.operator.dedicated_db.ensure_dedicated_admin_membership`'s, against a
+    tenant's *dedicated* database, which this repository never reaches. Never used by
     `set_suspended` below, which goes through `control.set_tenant_suspended()` instead -- a
     `SECURITY DEFINER` function that manages its own escape-hatch flag internally and needs no
     `app.tenant_id` at all."""

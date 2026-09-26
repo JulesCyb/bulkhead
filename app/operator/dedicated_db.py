@@ -39,9 +39,10 @@ dedicated database's own (otherwise unused) `control.identities` table, through
 `memberships.identity_id` foreign-keys to it in every database migrations create it in, even
 though identity resolution at request time always reads the pooled database's copy
 (`app/repositories/control.py`) -- the dedicated database's copy exists only to satisfy that
-per-database foreign key. The `tenants`/`memberships` rows themselves stay this module's own raw
-SQL: they are not the control schema, and the repository has no owner-side membership function
-for them (see `ensure_dedicated_admin_membership`'s own docstring).
+per-database foreign key. The `tenants` stub row stays this module's own raw SQL (it is not the
+control schema); the membership is written through
+`app.repositories.memberships.ensure_membership` (see `ensure_dedicated_admin_membership`'s own
+docstring).
 """
 
 from __future__ import annotations
@@ -60,6 +61,7 @@ import scripts.migrate as migrate_module
 import scripts.provision_roles as provision_roles_module
 from app.db.lifecycle import owner_engine
 from app.repositories.control import IdentityRepository
+from app.repositories.memberships import ensure_membership
 
 # Mirrors app/db/engine_registry.py's own default exactly -- this is the first code path that
 # *writes* to that directory rather than only reading it.
@@ -287,12 +289,16 @@ async def ensure_dedicated_admin_membership(
     `create_tenant`'s own pooled-path vocabulary.
 
     The `tenants`/`memberships` rows below are this dedicated database's *own* copies, not the
-    control schema (`app.repositories.control.ControlRepository` has no owner-side membership
-    function, and this insert is against a different physical database than the control plane
-    lives in besides) -- #114 leaves them as this module's own raw SQL, per spec #95's own
-    decision. Only the `control.identities` mirror row goes through
-    `IdentityRepository.upsert`."""
+    control schema. The `tenants` stub stays this module's own raw SQL (#114, spec #95's own
+    decision); the membership goes through the membership repository's owner-side
+    `ensure_membership` (code review 2026-09-26, CLAUDE.md rule 3), and the `control.identities`
+    mirror row through `IdentityRepository.upsert`. The tenant context both need is set here, on
+    this dedicated-database connection (see the comment below)."""
     async with owner_engine(owner_dsn) as engine, engine.begin() as conn:
+        # The one tenant-context `set_config` outside the control repository, kept here on
+        # purpose: this connection is to the tenant's *dedicated* database, which the control
+        # repository's forced-RLS helper never reaches, and both the `tenants` stub row below and
+        # `ensure_membership` need it (forced RLS binds the owner role too).
         await conn.execute(
             text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": str(tenant_id)}
         )
@@ -310,21 +316,6 @@ async def ensure_dedicated_admin_membership(
         await IdentityRepository().upsert(
             conn, id=identity_id, issuer=issuer, subject=subject, email=admin_email
         )
-        existing_membership = (
-            await conn.execute(
-                text("SELECT id FROM memberships WHERE tenant_id = :tid AND identity_id = :iid"),
-                {"tid": tenant_id, "iid": identity_id},
-            )
-        ).first()
-        if existing_membership is None:
-            await conn.execute(
-                text(
-                    "INSERT INTO memberships (tenant_id, identity_id, role) "
-                    "VALUES (:tid, :iid, 'admin')"
-                ),
-                {"tid": tenant_id, "iid": identity_id},
-            )
-            outcome = "created"
-        else:
-            outcome = "already exists"
-    return outcome
+        return await ensure_membership(
+            conn, tenant_id=tenant_id, identity_id=identity_id, role="admin"
+        )

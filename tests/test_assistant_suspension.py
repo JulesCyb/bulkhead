@@ -1,9 +1,10 @@
 """Unit tests proving a prepared run (`app.agents.run`: preparation, `answer`, `stream_text`)
-carries no suspension check of its own (#106, ADR-0010): suspension has exactly two enforcement
-points project-wide (`app/db/session.py`'s module docstring) -- context resolution, which refuses a
-suspended tenant's record before a `RequestContext` for it is ever built, and `tenant_session()`
-itself, which refuses a record that says suspended (or, for a record-less context, its own routing
-read). This file exercises the second one directly: a context whose record says suspended, whose
+carries no suspension check of its own (#106, ADR-0010): suspension is refused at three points
+project-wide (`app/db/session.py`'s module docstring) -- context resolution, which refuses a
+suspended tenant's record before a `RequestContext` for it is ever built; `tenant_session()`'s
+routing read, for a record-less context; and `tenant_session()` itself, which refuses a record
+that says suspended. This file exercises the third one directly: a context whose record says
+suspended, whose
 tool opens a real `tenant_session()` -- no real database, no ASGI request, unlike
 `tests/test_api.py`'s HTTP-level coverage of the same two endpoints and
 `tests/test_tenant_suspension_asgi.py`'s coverage of the first enforcement point. A record-less
@@ -48,8 +49,9 @@ def suspended_ctx(run_ctx):
 async def test_the_run_has_no_suspension_check_of_its_own_and_the_session_layer_raises(
     suspended_ctx, execute
 ):
-    """Suspension has exactly two enforcement points (`app/db/session.py`'s module docstring):
-    context resolution, and `tenant_session()` itself. Preparation and execution add none -- a
+    """Suspension is refused at three points (`app/db/session.py`'s module docstring): context
+    resolution, `tenant_session()`'s routing read, and `tenant_session()` itself. Preparation and
+    execution add none -- a
     record that says suspended is prepared without complaint, and the `TenantSuspendedError` a
     tool's own `tenant_session()` raises propagates out of the execution untouched."""
     prepared = await prepare_run(

@@ -34,23 +34,28 @@ served from its own engine, built and cached by the registry from its alias's te
 file. Every caller keeps the exact same signature and transaction behaviour either way -- no
 repository, tool, or agent run needs to know or change anything.
 
-That same read is also where suspension is enforced (Spec 9 / #69, ADR-0010): `control.tenants_
-view` (migration 0024) now exposes `suspended_at` alongside isolation tier and database alias, and
-`_resolve_tenant_alias` raises `TenantSuspendedError` the moment it sees one set, before ever
-opening the tenant's session -- the same query every live request already makes to route the
-session, so this is the one seam every caller of `tenant_session()` shares (the HTTP API, the MCP
-server's tools, and an agent run alike), with no separate check for any of them to forget. A
-tenant with no control-plane row at all is not suspended (ADR-0002's pooled default).
+A request does not pay for that read (#104, spec #92): `app.context_resolution` reads the
+tenant's whole control-plane record once and attaches it to the `RequestContext`
+(`ctx.tenant_record`, `app.tenant_record`). `tenant_session()` routes by that record when it is
+present and skips `_resolve_tenant_alias` entirely, so every session a request opens is routed
+from the same one read. `tenant_record_session()` below is the session mode of that one record
+read. A tenant with no control-plane row at all is not suspended (ADR-0002's pooled default).
 
-A request no longer pays for that read (#104, spec #92): `app.context_resolution` reads the
-tenant's whole control-plane record once, refuses a suspended tenant right there, and attaches the
-record to the `RequestContext` (`ctx.tenant_record`, `app.tenant_record`). `tenant_session()`
-routes by that record when it is present and skips `_resolve_tenant_alias` entirely, so every
-session a request opens is routed from the same one read. A context without a record -- a job
-(`app/retention.py`), a test, the stdio MCP fallback, the role-free preliminary context of the
-membership lookup -- is routed and suspension-checked by `_resolve_tenant_alias` exactly as
-before: suspension has one enforcement per path. `tenant_record_session()` below is the session
-mode of that one record read.
+**Suspension (ADR-0010) is refused at three points, one per kind of caller:**
+
+1. A request is refused at context resolution, on the tenant record it reads
+   (`app/context_resolution.py`) -- no context is ever built for a suspended tenant.
+2. A caller without a record (the stdio MCP fallback, a test) is refused by `tenant_session()`'s
+   own routing read (`_resolve_tenant_alias`, reading `suspended_at` from `control.tenants_view`,
+   migration 0024), before any session against the tenant's data is opened.
+3. A context that carries a suspended record is refused by `tenant_session()` itself, before it
+   routes by that record.
+
+The retention job (`app/retention.py`) skips a suspended tenant on its record and opens no
+`tenant_session()` for it, because CONTEXT.md defines suspension as a state in which "nothing is
+deleted" (ADR-0010) -- the one deliberate exception to CLAUDE.md rule 2's "with no exception" for
+retention. Every point raises (or, at context resolution, rejects with) the same
+`TenantSuspendedError` meaning; nothing else checks suspension.
 """
 
 from __future__ import annotations
@@ -76,9 +81,11 @@ _session_factory: async_sessionmaker[AsyncSession] | None = None
 
 
 class TenantSuspendedError(RuntimeError):
-    """Raised when `tenant_id` is currently suspended, by whichever of the two enforcement points
-    (module docstring) actually sees it: `_resolve_tenant_alias` (below, for a record-less
-    context) or `tenant_session()` itself (for a context whose `tenant_record` says so). Callers
+    """Raised when `tenant_id` is currently suspended, by whichever of the session layer's two
+    refusal points (points 2 and 3 of the module docstring) sees it: `_resolve_tenant_alias`
+    (below, for a record-less context) or `tenant_session()` itself (for a context whose
+    `tenant_record` says so); `app.token_verifier.TenantSuspendedAtVerification` is the same type
+    raised at context resolution (point 1). Callers
     map this to their own transport's documented rejection status -- 403 for the HTTP API, a tool
     error for the MCP server -- never to a raw 500."""
 

@@ -481,3 +481,32 @@ def test_no_retired_integration_test_bootstrap_or_seed_helpers_remain() -> None:
             if name in _RETIRED_EXACT_NAMES or name.startswith(_RETIRED_NAME_PREFIXES):
                 offenders.append(f"{path.relative_to(REPO_ROOT)}:{node.lineno}: {name!r}")
     assert offenders == [], offenders
+
+
+# --- Code review 2026-09-26: the process-wide test hooks fail closed outside development --------
+
+
+def test_set_default_adapter_for_tests_refuses_outside_development(monkeypatch):
+    """`set_default_adapter_for_tests` overrides every auth read process-wide: under production
+    settings it raises and installs nothing."""
+    import app.token_verifier as token_verifier
+
+    prod_settings = Settings(environment="prod", auth_mode="jwt", **_VALID_KWARGS)
+    monkeypatch.setattr(token_verifier, "get_settings", lambda: prod_settings, raising=False)
+    before = token_verifier.default_adapter()
+
+    with pytest.raises(RuntimeError, match="dev"):
+        token_verifier.set_default_adapter_for_tests(None)
+    assert token_verifier.default_adapter() is before
+
+
+def test_set_run_collaborators_for_tests_refuses_outside_development(monkeypatch):
+    """`set_run_collaborators_for_tests` overrides model resolution process-wide: under
+    production settings it raises and installs nothing."""
+    import app.agents.run as run_module
+
+    prod_settings = Settings(environment="prod", auth_mode="jwt", **_VALID_KWARGS)
+    monkeypatch.setattr(run_module, "get_settings", lambda: prod_settings, raising=False)
+
+    with pytest.raises(RuntimeError, match="dev"):
+        run_module.set_run_collaborators_for_tests(run_module.RunCollaborators())

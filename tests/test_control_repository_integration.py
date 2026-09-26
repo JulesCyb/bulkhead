@@ -1,8 +1,10 @@
 """Embedded-Postgres integration tests for the owner-role side of `ControlRepository` (spec A5 /
 #113): `create_tenant_record`, `set_suspended`, `read_gateway_credential_alias`/
-`write_gateway_credential_alias`, `enumerate_referenced_aliases`, and `get_record` -- one two-tenant
-test per function, the repository convention (`tests/test_rls_integration.py`'s control-plane
-sections, `tests/test_tenant_table_registry_integration.py`).
+`write_gateway_credential_alias`, `enumerate_referenced_aliases`, and `get_record`, plus (code
+review 2026-09-26) `get_routing_state`, `enumerate_tenants`, `record_operator_action`, and
+`IdentityRepository.upsert` -- one two-tenant test per function, the repository convention
+(`tests/test_rls_integration.py`'s control-plane sections,
+`tests/test_tenant_table_registry_integration.py`).
 
 Every owner-role function here takes an already-open `AsyncConnection`, exactly as
 `app/operator/create.py`/`erase.py`/`suspend.py` open one today -- these tests open that
@@ -20,8 +22,8 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 pgserver = pytest.importorskip("pgserver")
 
-from app.db.session import control_session  # noqa: E402
-from app.repositories.control import ControlRepository  # noqa: E402
+from app.db.session import control_session, tenant_record_session  # noqa: E402
+from app.repositories.control import ControlRepository, IdentityRepository  # noqa: E402
 from tests.support import (  # noqa: E402
     cluster,
     environment,
@@ -257,3 +259,144 @@ async def test_enumerate_referenced_aliases_also_works_from_an_app_role_session(
         aliases = await ControlRepository().enumerate_referenced_aliases(session)
 
     assert "tenant-app-role-alias" in aliases
+
+
+# --- Code review 2026-09-26: second-tenant tests for the remaining repository functions ---------
+
+
+async def _suspend(environment, tenant_id: uuid.UUID) -> None:
+    engine = create_async_engine(environment.owner_url)
+    try:
+        async with engine.begin() as conn:
+            await ControlRepository().set_suspended(conn, tenant_id, True)
+    finally:
+        await engine.dispose()
+
+
+async def test_get_routing_state_sees_only_the_session_tenants_row(environment):
+    tenant_a = await seed_tenant(environment, name="Routing A", via_operator=False)
+    tenant_b_id = await seed_dedicated_control_row(environment, alias="tenant-routing-b")
+    await _suspend(environment, tenant_b_id)
+
+    async with tenant_record_session(tenant_a.tenant_id) as session:
+        state_a = await ControlRepository().get_routing_state(session, tenant_id=tenant_a.tenant_id)
+        # Same session, tenant A's context: tenant B's dedicated, suspended row is invisible, so
+        # it reads as the pooled default rather than leaking B's alias or suspension.
+        b_from_a = await ControlRepository().get_routing_state(session, tenant_id=tenant_b_id)
+    async with tenant_record_session(tenant_b_id) as session:
+        state_b = await ControlRepository().get_routing_state(session, tenant_id=tenant_b_id)
+
+    assert (state_a.isolation_tier, state_a.suspended_at) == ("pooled", None)
+    assert (b_from_a.isolation_tier, b_from_a.database_alias, b_from_a.suspended_at) == (
+        None,
+        None,
+        None,
+    )
+    assert (state_b.isolation_tier, state_b.database_alias) == ("dedicated", "tenant-routing-b")
+    assert state_b.suspended_at is not None
+
+
+async def test_enumerate_tenants_reports_each_tenants_own_facts_once(environment):
+    tenant_a = await seed_tenant(
+        environment, name="Enumerate A", residency="eu", via_operator=False
+    )
+    tenant_b = await seed_tenant(
+        environment, name="Enumerate B", residency="us", via_operator=False
+    )
+    await _suspend(environment, tenant_b.tenant_id)
+
+    engine = create_async_engine(environment.owner_url)
+    try:
+        async with engine.connect() as conn:
+            summaries = await ControlRepository().enumerate_tenants(conn)
+    finally:
+        await engine.dispose()
+
+    ours = [s for s in summaries if s.tenant_id in (tenant_a.tenant_id, tenant_b.tenant_id)]
+    assert len(ours) == 2  # each tenant exactly once
+    by_id = {s.tenant_id: s for s in ours}
+    a, b = by_id[tenant_a.tenant_id], by_id[tenant_b.tenant_id]
+    assert (a.name, a.residency, a.suspended, a.suspended_at) == ("Enumerate A", "eu", False, None)
+    assert (b.name, b.residency, b.suspended) == ("Enumerate B", "us", True)
+    assert b.suspended_at is not None
+
+
+async def test_record_operator_action_writes_one_row_for_the_named_tenant_only(environment):
+    tenant_a = await seed_tenant(environment, name="Audit A", via_operator=False)
+    tenant_b = await seed_tenant(environment, name="Audit B", via_operator=False)
+
+    engine = create_async_engine(environment.owner_url)
+    try:
+        async with engine.begin() as conn:
+            await ControlRepository().record_operator_action(
+                conn,
+                tenant_id=tenant_a.tenant_id,
+                action="review-test",
+                details_json='{"outcome": "ok"}',
+            )
+    finally:
+        await engine.dispose()
+
+    engine = create_async_engine(environment.superuser_url)
+    try:
+        async with engine.connect() as conn:
+            rows = (
+                await conn.execute(
+                    text(
+                        "SELECT tenant_id, action, details FROM control.operator_actions "
+                        "WHERE tenant_id IN (:a, :b)"
+                    ),
+                    {"a": tenant_a.tenant_id, "b": tenant_b.tenant_id},
+                )
+            ).all()
+    finally:
+        await engine.dispose()
+
+    assert [(r.tenant_id, r.action, r.details) for r in rows] == [
+        (tenant_a.tenant_id, "review-test", {"outcome": "ok"})
+    ]
+
+
+async def test_identity_upsert_is_idempotent_and_leaves_other_identities_untouched(environment):
+    other = await seed_tenant(
+        environment, name="Upsert Other", roles=("member",), via_operator=False
+    )
+    other_identity_id = other.identities["member"]
+
+    async def _identity_rows(where: str, params: dict) -> list[tuple]:
+        engine = create_async_engine(environment.superuser_url)
+        try:
+            async with engine.connect() as conn:
+                result = await conn.execute(
+                    text(
+                        f"SELECT id, issuer, subject, email FROM control.identities WHERE {where}"
+                    ),
+                    params,
+                )
+                return [tuple(row) for row in result]
+        finally:
+            await engine.dispose()
+
+    other_before = await _identity_rows("id = :id", {"id": other_identity_id})
+    subject = f"review-{uuid.uuid4()}"
+
+    engine = create_async_engine(environment.owner_url)
+    try:
+        async with engine.begin() as conn:
+            first = await IdentityRepository().upsert(
+                conn, id=uuid.uuid4(), issuer="review", subject=subject, email="a@example.test"
+            )
+        async with engine.begin() as conn:
+            # A different candidate id for the same (issuer, subject): the existing row wins.
+            second = await IdentityRepository().upsert(
+                conn, id=uuid.uuid4(), issuer="review", subject=subject, email="a@example.test"
+            )
+    finally:
+        await engine.dispose()
+
+    assert second == first
+    assert await _identity_rows(
+        "issuer = :issuer AND subject = :subject", {"issuer": "review", "subject": subject}
+    ) == [(first, "review", subject, "a@example.test")]
+    # The other tenant's member identity is exactly as it was.
+    assert await _identity_rows("id = :id", {"id": other_identity_id}) == other_before

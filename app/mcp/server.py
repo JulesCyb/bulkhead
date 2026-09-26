@@ -20,8 +20,8 @@ guarded at startup by `check_mcp_mode` below the same way `AUTH_MODE=dev-headers
 Every tool resolves its context through `resolve_context()`, never `_connection_context` or
 `_context_from_env` directly (ADR-0010, issue #89): it builds the context (per connection first,
 env fallback only under `stdio`) and returns it -- no suspension check of its own (#106).
-Suspension has exactly two enforcement points project-wide (`app/db/session.py`'s module
-docstring): a per-connection context already carries the record `MCPTenantAuthMiddleware`'s call
+Suspension is refused at three points project-wide (`app/db/session.py`'s module docstring):
+a per-connection context already carries the record `MCPTenantAuthMiddleware`'s call
 to `app.context_resolution.resolve_bearer_context` read and refused a suspended tenant on, before
 `_connection_context` was ever set; the `stdio` fallback's env-based context carries no record at
 all, so the first tool call that opens a `tenant_session()` -- `document_tools.search_documents`,
@@ -42,7 +42,9 @@ parsing, verification-error mapping, or context construction.
 
 Two more conditions of the mount, closed by issue #116: the mounted sub-app's own lifespan never
 runs (Starlette forwards only `http`/`websocket` scopes to a `Mount`, never `lifespan`) --
-`app.main.lifespan` enters `server.session_manager` itself instead, for as long as the outer
+`app.main.lifespan` enters the mount's own session manager itself instead
+(`app.state.mcp_app.session_manager`, the one `build_streamable_http_app` bound it to -- never
+`server.session_manager`, which only names the latest build), for as long as the outer
 application runs; and `build_streamable_http_app` no longer leaves `transport_security`
 unconfigured -- `MCP_ALLOWED_HOSTS` (`Settings.mcp_allowed_hosts_list`) names this deployment's
 own public Host header(s), checked by `check_mcp_mode` below before `streamable-http` ever starts.
@@ -50,7 +52,7 @@ own public Host header(s), checked by `check_mcp_mode` below before `streamable-
 Freshness note: MCP Python SDK 2.x -> `from mcp.server.mcpserver import MCPServer`
 (previously `from mcp.server.fastmcp import FastMCP`). Check on SDK updates.
 
-The residency boundary (ADR-0008, docs/residency.md): a connecting MCP client brings its own
+Residency (ADR-0008, docs/residency.md): a connecting MCP client brings its own
 model. That model sits entirely outside this application's processor chain and outside
 residency enforcement -- `Settings.residency_allow_list`, the gateway, and the per-residency
 trace sink (`app/config.py`, `app/residency.py`, `app/observability.py`) govern the model *this
@@ -73,6 +75,7 @@ from typing import Any
 from uuid import UUID
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
@@ -252,9 +255,19 @@ class MCPTenantAuthMiddleware:
     `resolve_bearer_context` itself (ADR-0012's three-way check, reused rather than reinvented).
     """
 
-    def __init__(self, app: ASGIApp, *, settings: Settings) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        settings: Settings,
+        session_manager: StreamableHTTPSessionManager | None = None,
+    ) -> None:
         self.app = app
         self.settings = settings
+        # The session manager the wrapped Streamable HTTP app's own route is bound to (#116
+        # follow-up, code review 2026-09-26) -- what `app.main.lifespan` enters for this mount.
+        # `None` only for a middleware wrapping something other than that app (a test).
+        self.session_manager = session_manager
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -285,7 +298,7 @@ class MCPTenantAuthMiddleware:
             _connection_context.reset(reset_token)
 
 
-def build_streamable_http_app(settings: Settings) -> ASGIApp:
+def build_streamable_http_app(settings: Settings) -> MCPTenantAuthMiddleware:
     """The networked transport's ASGI app (issue #49): the MCP SDK's own Streamable HTTP app,
     wrapped with `MCPTenantAuthMiddleware` above. `app.main.create_app` mounts this under
     `/v1/t/{tenant_id}/mcp` only when `settings.mcp_transport == "streamable-http"` -- the stdio
@@ -297,6 +310,12 @@ def build_streamable_http_app(settings: Settings) -> ASGIApp:
     auto-enables DNS-rebinding protection that only accepts a `127.0.0.1`/`localhost`/`::1` Host
     header, rejecting a real deployment's own. `check_mcp_mode` below has already refused to let
     this function be reached with an empty `mcp_allowed_hosts_list`.
+
+    The returned app carries, as `.session_manager`, the session manager this call's inner app is
+    bound to (#116 follow-up, code review 2026-09-26). Every call builds a fresh one and
+    `server.session_manager` then names only the latest, so a caller that mounts the result
+    enters *this* attribute's manager (`app.main.lifespan` does, via `app.state.mcp_app`) -- never
+    `server.session_manager`, which a second build in the same process would have rebound.
     """
     inner = server.streamable_http_app(
         streamable_http_path="/",
@@ -305,7 +324,7 @@ def build_streamable_http_app(settings: Settings) -> ASGIApp:
             allowed_hosts=settings.mcp_allowed_hosts_list,
         ),
     )
-    return MCPTenantAuthMiddleware(inner, settings=settings)
+    return MCPTenantAuthMiddleware(inner, settings=settings, session_manager=server.session_manager)
 
 
 def check_mcp_mode(settings: Settings) -> None:
