@@ -101,21 +101,25 @@ def cluster() -> Iterator[Cluster]:
 
 @pytest.fixture
 def environment(cluster: Cluster, monkeypatch: pytest.MonkeyPatch) -> Iterator[Cluster]:
-    """Points `Settings`, the session layer, the engine registry, and the per-tenant client
+    """Points `Settings`, `MigrationSettings` (`app.migration_settings` -- read by the operator
+    CLI, `app/operator/cli.py`), the session layer, the engine registry, and the per-tenant client
     caches at `cluster`'s pooled database for the duration of one test, and undoes all of it
     afterwards -- the cache-clear/engine-reset dance every integration file used to repeat.
     Yields `cluster` itself: a test that only needs the environment pointed at the cluster (the
     common case) requests just this fixture.
 
-    Also points `TENANT_DB_SECRETS_DIR` (read by `app/db/engine_registry.py`, app-role DSNs) and
-    `TENANT_DB_MIGRATIONS_SECRETS_DIR` (read by `scripts/migrate.py`, owner-role DSNs) at fresh
-    temporary directories, removed on teardown -- so `seed_tenant(..., isolation_tier=
+    Also points `TENANT_DB_SECRETS_DIR` (read by `app/db/engine_registry.py`, app-role DSNs),
+    `TENANT_DB_MIGRATIONS_SECRETS_DIR` (read by `scripts/migrate.py`, owner-role DSNs), and
+    `GATEWAY_CREDENTIALS_DIR` (read by `app/gateway_credentials.py`/`app/gateway_provisioning.py`)
+    at fresh temporary directories, removed on teardown -- so `seed_tenant(..., isolation_tier=
     "dedicated")` (`tests.support.seeding`) has somewhere real to write a dedicated alias's
-    secret files, and so no test -- dedicated or not -- ever reads or writes either directory's
-    production default (`/run/secrets/tenant-db(-migrations)`)."""
+    secret files, `seed_tenant`'s own operator-`create` path (issue #98 / "A6-T3") has somewhere
+    real to write a seeded tenant's minted gateway-credential file, and so no test -- dedicated or
+    not -- ever reads or writes any of those three directories' production defaults
+    (`/run/secrets/tenant-db(-migrations)`, `/run/secrets`)."""
     import shutil
 
-    from app import config
+    from app import config, migration_settings
     from app.db import engine_registry
     from app.db import session as db_session
     from app.embeddings import reset_tenant_embedding_client_cache
@@ -123,6 +127,7 @@ def environment(cluster: Cluster, monkeypatch: pytest.MonkeyPatch) -> Iterator[C
 
     def _point_at_cluster() -> None:
         config.get_settings.cache_clear()
+        migration_settings.get_migration_settings.cache_clear()
         db_session._engine = None
         db_session._session_factory = None
         engine_registry.reset_registry_for_tests()
@@ -131,11 +136,13 @@ def environment(cluster: Cluster, monkeypatch: pytest.MonkeyPatch) -> Iterator[C
 
     secrets_dir = tempfile.mkdtemp(prefix="tenant-db-secrets-")
     migrations_secrets_dir = tempfile.mkdtemp(prefix="tenant-db-migrations-secrets-")
+    gateway_credentials_dir = tempfile.mkdtemp(prefix="gateway-credentials-")
 
     monkeypatch.setenv("DATABASE_URL", cluster.app_url)
     monkeypatch.setenv("DATABASE_URL_MIGRATIONS", cluster.owner_url)
     monkeypatch.setenv("TENANT_DB_SECRETS_DIR", secrets_dir)
     monkeypatch.setenv("TENANT_DB_MIGRATIONS_SECRETS_DIR", migrations_secrets_dir)
+    monkeypatch.setenv("GATEWAY_CREDENTIALS_DIR", gateway_credentials_dir)
     _point_at_cluster()
     try:
         yield cluster
@@ -143,6 +150,7 @@ def environment(cluster: Cluster, monkeypatch: pytest.MonkeyPatch) -> Iterator[C
         _point_at_cluster()
         shutil.rmtree(secrets_dir, ignore_errors=True)
         shutil.rmtree(migrations_secrets_dir, ignore_errors=True)
+        shutil.rmtree(gateway_credentials_dir, ignore_errors=True)
 
 
 def _with_database(url: str, database: str) -> str:

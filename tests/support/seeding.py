@@ -1,14 +1,44 @@
-"""Seeding a tenant, pooled or dedicated: `tenants`, `control.tenants`, `control.identities`,
-`memberships`, and `documents` -- the raw statements every one of the (formerly thirty-three)
-hand-written seed helpers duplicated (issue #96 / spec #90, "A6"; dedicated-tier seeding is
-issue #97 / "A6-T2").
+"""Seeding a tenant, pooled or dedicated (issue #96 / spec #90, "A6"; dedicated-tier seeding is
+issue #97 / "A6-T2"; seeding through the operator commands and the shared gateway fake is issue
+#98 / "A6-T3").
+
+`seed_tenant(via_operator=True)` (the default) provisions the tenant through the same
+`app.operator.create.create_tenant` the operator tool and its own tests use, with the shared
+gateway admin fake (`tests.support.gateway.fake_gateway_admin_client`) injected as `admin_client`
+-- so a seeded tenant gets a real `gateway_credential_alias` and a real secret file on disk under
+`GATEWAY_CREDENTIALS_DIR` (pointed at a temporary directory by the `environment` fixture,
+`tests.support.cluster`), readable through `app.gateway_credentials.read_gateway_credential`
+exactly as a real request would read it. `create_tenant` always creates exactly one admin
+identity and membership for a fresh tenant -- so does `seed_tenant(via_operator=True)`,
+regardless of whether `"admin"` appears in `roles`; `SeededTenant.identities`/`.memberships`
+always carry an `"admin"` entry as a result. Any *other* role in `roles` is added on top of it
+directly (the same raw statements `via_operator=False` uses for every role), since no operator
+command creates a non-admin membership. Documents are always seeded directly too -- no operator
+command touches them.
+
+`via_operator=False` is the original, lighter seeding path from #96/#97: every row (including the
+tenant's own `tenants`/`control.tenants` pair) written directly, as the cluster's own superuser,
+with no gateway credential and no forced admin membership -- for a test that wants exactly the
+roles it asked for and does not care about the gateway. `seed_tenant`'s `name` defaults to a
+fresh value each call (`f"Seed Co {uuid4().hex[:8]}"`), not a fixed string like the retired
+per-file helpers used: `via_operator=True` resolves an existing tenant by exact name
+(`app.operator.lookup.resolve_tenant`, `create_tenant`'s own idempotency key) as its very first
+step, so two calls sharing one literal default name across two different tests in the same
+session-scoped cluster (`tests.support.cluster.cluster`) would silently reconcile onto the same
+row instead of seeding two independent tenants.
 
 A pooled tenant's rows all live in the one pooled database `cluster` (the argument every
 `seed_tenant` call takes) already points at. A dedicated tenant's own rows (`tenants`,
 `memberships`, `documents`) live in its own, separate database instead -- created on the same
 embedded cluster, migrated to head with the real runner, exactly as ADR-0002 describes -- while
 its control-plane bookkeeping (`control.tenants`: residency, isolation tier, database alias)
-stays in the pooled database, the one place the control plane ever lives.
+stays in the pooled database, the one place the control plane ever lives. `via_operator=True`'s
+dedicated path reuses `app.operator.create.create_tenant`'s own dedicated provisioning
+(`app.operator.dedicated_db.ensure_dedicated_database`) rather than a second, seeding-only copy of
+it -- passing `cluster.superuser_url` itself as `--dedicated-db-admin-url`: the embedded cluster's
+own bootstrap superuser already has `CREATEDB`-equivalent privilege on its own server, so no
+second `pgserver` instance is needed just to prove a dedicated tenant's database is provisioned
+for real.
 """
 
 from __future__ import annotations
@@ -27,12 +57,17 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_en
 
 import scripts.migrate as migrate_module
 from app.context import MeansKind, RequestContext, Role
+from app.gateway_provisioning import GatewayAdminClient
+from app.operator.create import create_tenant
 from app.operator.dedicated_db import generate_database_alias
+from app.operator.suspend import SuspendResult, set_tenant_suspended
 from tests.support.cluster import (
     Cluster,
+    _with_database,
     create_database,
     migration_run_without_disrupting_logging,
 )
+from tests.support.gateway import fake_gateway_admin_client
 
 DIM = 1536
 
@@ -117,7 +152,9 @@ async def assert_known_not_null_columns(
 class SeededTenant:
     """Everything a test needs about one seeded tenant, pooled or dedicated: real
     `tenants`/`control.tenants` rows, one real `control.identities` + `memberships` row per role
-    `seed_tenant` was asked for, and any seeded `documents`.
+    `seed_tenant` was asked for (plus, for `via_operator=True`, the admin identity/membership
+    `create_tenant` always creates), any seeded `documents`, and (for `via_operator=True`) the
+    gateway credential alias `create_tenant` provisioned and the fake admin client that minted it.
 
     `cluster` is always the pooled cluster -- the control plane's own home, regardless of tier.
     `database` is `None` for a pooled tenant (its data lives in `cluster` too) or the tenant's
@@ -136,6 +173,8 @@ class SeededTenant:
     cluster: Cluster
     database_alias: str | None = None
     database: Cluster | None = None
+    gateway_credential_alias: str | None = None
+    gateway_admin_client: GatewayAdminClient | None = None
 
     @property
     def owner_url(self) -> str:
@@ -174,6 +213,28 @@ class SeededTenant:
         async with _connection((self.database or self.cluster).superuser_url) as conn:
             yield conn
 
+    async def suspend(self) -> SuspendResult:
+        """Suspends this tenant through `app.operator.suspend.set_tenant_suspended` -- the same
+        function `scripts/operator.py suspend` calls -- against the pooled cluster's owner
+        connection: suspension state (`control.tenants.suspended_at`) always lives in the control
+        plane, never in a dedicated tenant's own database. A test observes the effect through the
+        real session layer (`app.db.session.tenant_session(self.ctx(role))` refusing), not by
+        reading this method's return value."""
+        return await self._set_suspended(True)
+
+    async def unsuspend(self) -> SuspendResult:
+        """The reverse of `suspend()` -- through `app.operator.suspend.set_tenant_suspended`
+        with `suspended=False`, exactly as `scripts/operator.py unsuspend` does."""
+        return await self._set_suspended(False)
+
+    async def _set_suspended(self, suspended: bool) -> SuspendResult:
+        engine = create_async_engine(self.cluster.owner_url)
+        try:
+            async with engine.begin() as conn:
+                return await set_tenant_suspended(conn, str(self.tenant_id), suspended=suspended)
+        finally:
+            await engine.dispose()
+
 
 @asynccontextmanager
 async def _connection(url: str) -> AsyncIterator[AsyncConnection]:
@@ -192,7 +253,8 @@ async def seed_membership(
     Returns `(identity_id, membership_id)`. The seam a test reaches for when it needs a
     membership `seed_tenant`'s own `roles=` argument does not cover -- a second membership of a
     role already requested, for example. Writes as the cluster's own superuser -- same reason as
-    `seed_tenant` above."""
+    `seed_tenant` above. Pass the tenant's own dedicated `Cluster` (`SeededTenant.database`), not
+    the pooled one, to add a membership to a dedicated tenant -- its memberships live there."""
     engine = create_async_engine(cluster.superuser_url)
     identity_id = uuid.uuid4()
     try:
@@ -221,53 +283,106 @@ async def seed_membership(
 def _require_secrets_dir(env_var: str) -> Path:
     """The temporary directory `env_var` currently points at -- raises instead of falling back
     to that variable's production default (`app/db/engine_registry.py`'s
-    `/run/secrets/tenant-db`, `scripts/migrate.py`'s `/run/secrets/tenant-db-migrations`) when
-    it is unset. Dedicated-tier seeding requires the `environment` fixture (`tests.support.
-    cluster`), which sets both -- this is the fail-closed guard against a test that used the
-    bare `cluster` fixture instead and would otherwise silently read or write a real secrets
-    path."""
+    `/run/secrets/tenant-db(-migrations)`, `app/config.py`'s `gateway_credentials_dir`'s
+    `/run/secrets`) when it is unset. Dedicated-tier seeding and `via_operator=True` seeding (of
+    either tier) both require the `environment` fixture (`tests.support.cluster`), which sets all
+    three -- this is the fail-closed guard against a test that used the bare `cluster` fixture
+    instead and would otherwise silently read or write a real secrets path."""
     value = os.environ.get(env_var)
     if not value:
         raise RuntimeError(
-            f"seed_tenant(isolation_tier='dedicated') requires {env_var} to already point at a "
-            "temporary directory -- use the `environment` fixture (tests.support.cluster), not "
-            "the bare `cluster` fixture, so this never falls back to reading or writing that "
-            "variable's production secrets path."
+            f"seed_tenant() requires {env_var} to already point at a temporary directory -- use "
+            "the `environment` fixture (tests.support.cluster), not the bare `cluster` fixture, "
+            "so this never falls back to reading or writing that variable's production secrets "
+            "path."
         )
     return Path(value)
 
 
-async def _provision_dedicated_tenant_database(cluster: Cluster, alias: str) -> Cluster:
-    """Creates `alias`'s own database on `cluster`'s server (`tests.support.cluster.
-    create_database`), migrates it to head with the real runner -- `scripts.migrate.
-    migrate_alias`, the exact code path production uses for a dedicated alias -- and writes both
-    its owner-role and app-role tenant-secret files where `scripts/migrate.py` and
-    `app/db/engine_registry.py` read them respectively, so a test that later routes through
-    `tenant_session(ctx)` or runs `scripts/migrate.py` against this alias needs no seam of its
-    own."""
-    # Both directories checked upfront, before any database is created: a missing one must fail
-    # before any side effect, not after `CREATE DATABASE` has already run.
-    migrations_dir = _require_secrets_dir("TENANT_DB_MIGRATIONS_SECRETS_DIR")
-    app_dir = _require_secrets_dir("TENANT_DB_SECRETS_DIR")
+async def _admin_membership_id(
+    conn: AsyncConnection, *, tenant_id: uuid.UUID, identity_id: uuid.UUID
+) -> uuid.UUID:
+    """The membership id `create_tenant` created for its admin identity -- not itself part of
+    `CreateTenantResult`, so seeding reads it back once, against whichever connection/database
+    that membership actually lives in (the pooled one for a pooled tenant, the dedicated database
+    for a dedicated one -- see `seed_tenant`'s own docstring)."""
+    return (
+        await conn.execute(
+            text("SELECT id FROM memberships WHERE tenant_id = :tid AND identity_id = :iid"),
+            {"tid": tenant_id, "iid": identity_id},
+        )
+    ).scalar_one()
 
-    dedicated = await create_database(cluster, alias)
 
-    migrations_secret = migrations_dir / alias
-    migrations_secret.parent.mkdir(parents=True, exist_ok=True)
-    migrations_secret.write_text(dedicated.owner_url)
+async def _insert_extra_roles_and_documents(
+    conn: AsyncConnection,
+    *,
+    tenant_id: uuid.UUID,
+    admin_identity_id: uuid.UUID,
+    admin_membership_id: uuid.UUID,
+    requested_roles: list[Role],
+    extra_roles: list[Role],
+    documents: int,
+) -> tuple[dict[Role, uuid.UUID], dict[Role, uuid.UUID], list[uuid.UUID]]:
+    """The rows no operator command creates, for the `via_operator=True` path: one
+    `control.identities` + `memberships` row per role in `extra_roles` (every role in
+    `requested_roles` other than `"admin"`, which `create_tenant` already wrote), and
+    `documents` documents with a 1536-dim embedding. `identities`/`memberships` always carry an
+    `"admin"` entry, seeded or not -- see `seed_tenant`'s own docstring. Document attribution
+    (`app.identity_id`, matching `documents.created_by`/`updated_by`, migration 0010) prefers the
+    *first* role actually requested in `requested_roles` (matching `via_operator=False`'s own
+    convention below), falling back to the admin identity only when no extra role was requested.
+    """
+    identities: dict[Role, uuid.UUID] = {"admin": admin_identity_id}
+    memberships: dict[Role, uuid.UUID] = {"admin": admin_membership_id}
+    document_ids: list[uuid.UUID] = []
 
-    # scripts.migrate.migrate_alias calls alembic's command.upgrade(), which (migrations/env.py)
-    # itself calls asyncio.run() -- fatal if invoked directly from a coroutine already running
-    # inside an event loop (this one), so it runs in a worker thread instead, exactly like
-    # app.operator.dedicated_db.ensure_dedicated_database does for the same reason.
-    with migration_run_without_disrupting_logging():
-        await asyncio.to_thread(migrate_module.migrate_alias, alias)
+    for role in extra_roles:
+        identity_id = uuid.uuid4()
+        await conn.execute(
+            text("INSERT INTO control.identities (id, issuer, subject) VALUES (:id, 'seed', :sub)"),
+            {"id": identity_id, "sub": str(identity_id)},
+        )
+        membership_id = (
+            await conn.execute(
+                text(
+                    "INSERT INTO memberships (tenant_id, identity_id, role) "
+                    "VALUES (:tid, :iid, :role) RETURNING id"
+                ),
+                {"tid": tenant_id, "iid": identity_id, "role": role},
+            )
+        ).scalar_one()
+        identities[role] = identity_id
+        memberships[role] = membership_id
 
-    app_secret = app_dir / alias
-    app_secret.parent.mkdir(parents=True, exist_ok=True)
-    app_secret.write_text(dedicated.app_url)
+    if documents:
+        creator_role = requested_roles[0] if requested_roles else None
+        creator_id = (
+            identities.get(creator_role, admin_identity_id) if creator_role else (admin_identity_id)
+        )
+        await conn.execute(
+            text("SELECT set_config('app.identity_id', :iid, true)"),
+            {"iid": str(creator_id)},
+        )
+        for index in range(documents):
+            doc_id = (
+                await conn.execute(
+                    text(
+                        "INSERT INTO documents (tenant_id, title, content, embedding) "
+                        "VALUES (:tid, :title, :content, CAST(:emb AS vector)) "
+                        "RETURNING id"
+                    ),
+                    {
+                        "tid": tenant_id,
+                        "title": f"Document {index}",
+                        "content": f"Content {index}",
+                        "emb": vector_literal(0.1 * (index + 1)),
+                    },
+                )
+            ).scalar_one()
+            document_ids.append(doc_id)
 
-    return dedicated
+    return identities, memberships, document_ids
 
 
 async def _insert_tenant_data_rows(
@@ -280,15 +395,14 @@ async def _insert_tenant_data_rows(
     documents: int,
     mirror_tenant_row: bool,
 ) -> tuple[dict[Role, uuid.UUID], dict[Role, uuid.UUID], list[uuid.UUID]]:
-    """The tenant's own rows -- optionally its `tenants` row (`mirror_tenant_row`: a pooled
-    tenant's row is inserted by its caller, in the same transaction, before this runs; a
+    """`via_operator=False`'s own rows -- optionally its `tenants` row (`mirror_tenant_row`: a
+    pooled tenant's row is inserted by its caller, in the same transaction, before this runs; a
     dedicated tenant's own database needs its own copy, since `memberships`/`documents` there
     foreign-key to it locally), one `control.identities` + `memberships` row per role in
     `roles`, and `documents` documents with a 1536-dim embedding, attributed to the first seeded
     role (or a dedicated seed identity if `roles` is empty). `app.identity_id` is set explicitly
     before the document inserts, exactly like a real `tenant_session()` write would set it, so
-    `documents.created_by`/`updated_by` (migration 0010) resolves the same way. Shared by both of
-    `seed_tenant`'s tiers -- see its own docstring for which connection/transaction each uses."""
+    `documents.created_by`/`updated_by` (migration 0010) resolves the same way."""
     identities: dict[Role, uuid.UUID] = {}
     memberships: dict[Role, uuid.UUID] = {}
     document_ids: list[uuid.UUID] = []
@@ -349,41 +463,130 @@ async def _insert_tenant_data_rows(
     return identities, memberships, document_ids
 
 
-async def seed_tenant(
+def _default_seed_name() -> str:
+    """A fresh default per call -- see this module's own docstring for why a fixed literal
+    default is unsafe once `via_operator=True` (the default) resolves an existing tenant by exact
+    name as its very first step."""
+    return f"Seed Co {uuid.uuid4().hex[:8]}"
+
+
+async def _seed_tenant_via_operator(
     cluster: Cluster,
     *,
-    name: str = "Acme",
-    residency: str | None = None,
-    roles: Iterable[Role] = (),
-    documents: int = 0,
-    isolation_tier: str = "pooled",
+    name: str,
+    residency: str,
+    roles: list[Role],
+    documents: int,
+    isolation_tier: str,
+    admin_email: str,
+    admin_client: GatewayAdminClient,
 ) -> SeededTenant:
-    """Seeds one tenant (ADR-0002): a `tenants` row, its `control.tenants` row (residency,
-    isolation tier, and -- for a dedicated tenant -- its database alias), one real
-    `control.identities` + `memberships` row per role in `roles`, and `documents` documents with
-    a 1536-dim embedding.
+    if isolation_tier == "dedicated":
+        _require_secrets_dir("TENANT_DB_MIGRATIONS_SECRETS_DIR")
+        _require_secrets_dir("TENANT_DB_SECRETS_DIR")
+    _require_secrets_dir("GATEWAY_CREDENTIALS_DIR")
 
-    `isolation_tier="pooled"` (the default) writes every row into `cluster` itself, in one
-    transaction, as the cluster's own superuser (test-only, like every other seed helper this
-    package replaces -- see `Cluster`): `app_owner` does not bypass RLS either, so it cannot
-    insert a brand-new tenant row without `app.tenant_id` already set to that row's own id,
-    exactly the chicken-and-egg problem plain test seeding (unlike a real request, which never
-    creates its own tenant row) always runs into.
+    extra_roles = [role for role in roles if role != "admin"]
+    dedicated_admin_url = cluster.superuser_url if isolation_tier == "dedicated" else None
 
-    `isolation_tier="dedicated"` additionally creates the tenant's own database on `cluster`'s
-    server, migrates it to head with the real runner, and writes its owner-role/app-role secret
-    files where `scripts/migrate.py`/`app/db/engine_registry.py` read them (see
-    `_provision_dedicated_tenant_database`; requires the `environment` fixture, which points
-    both secrets directories at temporary ones). Its `control.tenants` bookkeeping row (residency,
-    isolation tier, database alias) still lives in the pooled `cluster` -- the control plane is
-    never itself sharded -- but its own `tenants`/`memberships`/`documents` rows are written into
-    its own dedicated database instead. The returned `SeededTenant.database_alias`/`owner_url`/
-    `app_url` describe that database; `SeededTenant.ctx()` is unchanged either way -- a real
-    request never knows or cares which database serves it.
-    """
-    if isolation_tier not in ("pooled", "dedicated"):
-        raise ValueError(f"seed_tenant: unknown isolation_tier {isolation_tier!r}")
+    identities: dict[Role, uuid.UUID] = {}
+    memberships: dict[Role, uuid.UUID] = {}
+    document_ids: list[uuid.UUID] = []
 
+    owner_engine = create_async_engine(cluster.owner_url)
+    try:
+        async with owner_engine.begin() as conn:
+            await assert_known_not_null_columns(conn, _KNOWN_NOT_NULL_COLUMNS)
+            # Wraps the whole call, not just a dedicated tier's migration step: harmless for a
+            # pooled tenant (which never calls into Alembic at all) and this is the one call site
+            # every via_operator seed goes through -- see
+            # `migration_run_without_disrupting_logging`'s own docstring for why an in-process
+            # migration run must always be wrapped like this within a single pytest session.
+            with migration_run_without_disrupting_logging():
+                result = await create_tenant(
+                    conn,
+                    tenant_name=name,
+                    residency=residency,
+                    admin_email=admin_email,
+                    isolation_tier=isolation_tier,
+                    dedicated_db_admin_url=dedicated_admin_url,
+                    admin_client=admin_client,
+                )
+
+            if isolation_tier == "pooled":
+                admin_membership_id = await _admin_membership_id(
+                    conn, tenant_id=result.tenant_id, identity_id=result.identity_id
+                )
+                identities, memberships, document_ids = await _insert_extra_roles_and_documents(
+                    conn,
+                    tenant_id=result.tenant_id,
+                    admin_identity_id=result.identity_id,
+                    admin_membership_id=admin_membership_id,
+                    requested_roles=roles,
+                    extra_roles=extra_roles,
+                    documents=documents,
+                )
+    finally:
+        await owner_engine.dispose()
+
+    dedicated: Cluster | None = None
+    if isolation_tier == "dedicated":
+        alias = result.database_alias
+        assert alias is not None  # enforced by create_tenant for isolation_tier="dedicated"
+        migrations_dir = Path(os.environ["TENANT_DB_MIGRATIONS_SECRETS_DIR"])
+        app_dir = Path(os.environ["TENANT_DB_SECRETS_DIR"])
+        dedicated = Cluster(
+            superuser_url=_with_database(cluster.superuser_url, alias),
+            owner_url=(migrations_dir / alias).read_text(encoding="utf-8").strip(),
+            app_url=(app_dir / alias).read_text(encoding="utf-8").strip(),
+        )
+        data_engine = create_async_engine(dedicated.superuser_url)
+        try:
+            async with data_engine.begin() as conn:
+                await assert_known_not_null_columns(conn, _KNOWN_NOT_NULL_COLUMNS)
+                admin_membership_id = await _admin_membership_id(
+                    conn, tenant_id=result.tenant_id, identity_id=result.identity_id
+                )
+                identities, memberships, document_ids = await _insert_extra_roles_and_documents(
+                    conn,
+                    tenant_id=result.tenant_id,
+                    admin_identity_id=result.identity_id,
+                    admin_membership_id=admin_membership_id,
+                    requested_roles=roles,
+                    extra_roles=extra_roles,
+                    documents=documents,
+                )
+        finally:
+            await data_engine.dispose()
+
+    return SeededTenant(
+        tenant_id=result.tenant_id,
+        name=name,
+        residency=residency,
+        isolation_tier=isolation_tier,
+        identities=identities,
+        memberships=memberships,
+        document_ids=document_ids,
+        cluster=cluster,
+        database_alias=result.database_alias,
+        database=dedicated,
+        gateway_credential_alias=result.gateway_credential_alias,
+        gateway_admin_client=admin_client,
+    )
+
+
+async def _seed_tenant_raw(
+    cluster: Cluster,
+    *,
+    name: str,
+    residency: str | None,
+    roles: list[Role],
+    documents: int,
+    isolation_tier: str,
+) -> SeededTenant:
+    """`via_operator=False`: every row written directly, as the cluster's own superuser -- the
+    original #96/#97 seeding path. See `seed_tenant`'s own docstring for when to reach for this
+    instead of the default."""
     tenant_id = uuid.uuid4()
     seed_identity_id = uuid.uuid4()
     identities: dict[Role, uuid.UUID] = {}
@@ -461,4 +664,109 @@ async def seed_tenant(
         cluster=cluster,
         database_alias=database_alias,
         database=dedicated,
+    )
+
+
+async def _provision_dedicated_tenant_database(cluster: Cluster, alias: str) -> Cluster:
+    """Creates `alias`'s own database on `cluster`'s server (`tests.support.cluster.
+    create_database`), migrates it to head with the real runner -- `scripts.migrate.
+    migrate_alias`, the exact code path production uses for a dedicated alias -- and writes both
+    its owner-role and app-role tenant-secret files where `scripts/migrate.py` and
+    `app/db/engine_registry.py` read them respectively, so a test that later routes through
+    `tenant_session(ctx)` or runs `scripts/migrate.py` against this alias needs no seam of its
+    own. Used only by `via_operator=False`'s dedicated path -- `via_operator=True`'s own dedicated
+    path reuses `app.operator.dedicated_db.ensure_dedicated_database` instead (see `seed_tenant`'s
+    module docstring)."""
+    # Both directories checked upfront, before any database is created: a missing one must fail
+    # before any side effect, not after `CREATE DATABASE` has already run.
+    migrations_dir = _require_secrets_dir("TENANT_DB_MIGRATIONS_SECRETS_DIR")
+    app_dir = _require_secrets_dir("TENANT_DB_SECRETS_DIR")
+
+    dedicated = await create_database(cluster, alias)
+
+    migrations_secret = migrations_dir / alias
+    migrations_secret.parent.mkdir(parents=True, exist_ok=True)
+    migrations_secret.write_text(dedicated.owner_url)
+
+    # scripts.migrate.migrate_alias calls alembic's command.upgrade(), which (migrations/env.py)
+    # itself calls asyncio.run() -- fatal if invoked directly from a coroutine already running
+    # inside an event loop (this one), so it runs in a worker thread instead, exactly like
+    # app.operator.dedicated_db.ensure_dedicated_database does for the same reason.
+    with migration_run_without_disrupting_logging():
+        await asyncio.to_thread(migrate_module.migrate_alias, alias)
+
+    app_secret = app_dir / alias
+    app_secret.parent.mkdir(parents=True, exist_ok=True)
+    app_secret.write_text(dedicated.app_url)
+
+    return dedicated
+
+
+async def seed_tenant(
+    cluster: Cluster,
+    *,
+    name: str | None = None,
+    residency: str | None = None,
+    roles: Iterable[Role] = (),
+    documents: int = 0,
+    isolation_tier: str = "pooled",
+    via_operator: bool = True,
+    admin_email: str | None = None,
+    admin_client: GatewayAdminClient | None = None,
+) -> SeededTenant:
+    """Seeds one tenant (ADR-0002): a `tenants` row, its `control.tenants` row (residency,
+    isolation tier, and -- for a dedicated tenant -- its database alias), one real
+    `control.identities` + `memberships` row per role in `roles`, and `documents` documents with
+    a 1536-dim embedding. See this module's own docstring for the full contract, in particular
+    for what `via_operator` (default `True`) changes: it is the difference between "this went
+    through the operator tool's `create` command, gateway credential included" and "these rows
+    were written directly, with no gateway credential and no forced admin membership."
+
+    `name` defaults to a fresh value each call, not a fixed string -- see the module docstring for
+    why. `admin_email` (only meaningful for `via_operator=True`) defaults the same way.
+    `admin_client` (also only meaningful for `via_operator=True`) defaults to a fresh
+    `tests.support.gateway.fake_gateway_admin_client()`; pass one explicitly to inspect what it
+    recorded (`.fake.generate_requests`, `.fake.delete_requests`, ...) or to make it fail
+    (`fail_generate=True`/`fail_deletes_until=`).
+
+    `isolation_tier="dedicated"` additionally creates the tenant's own database, migrated to head
+    with the real runner, and writes its owner-role/app-role secret files where
+    `scripts/migrate.py`/`app/db/engine_registry.py` read them -- requires the `environment`
+    fixture (which points the relevant secrets directories at temporary ones); see the module
+    docstring for how the two `via_operator` values differ in *how* that database gets created.
+    Its `control.tenants` bookkeeping row (residency, isolation tier, database alias) still lives
+    in the pooled `cluster` -- the control plane is never itself sharded -- but its own
+    `tenants`/`memberships`/`documents` rows are written into its own dedicated database instead.
+    The returned `SeededTenant.database_alias`/`owner_url`/`app_url` describe that database;
+    `SeededTenant.ctx()` is unchanged either way -- a real request never knows or cares which
+    database serves it.
+    """
+    if isolation_tier not in ("pooled", "dedicated"):
+        raise ValueError(f"seed_tenant: unknown isolation_tier {isolation_tier!r}")
+
+    effective_name = name or _default_seed_name()
+    roles_list = list(roles)
+
+    if via_operator:
+        effective_residency = residency or "eu"
+        effective_admin_email = admin_email or f"seed-{uuid.uuid4()}@example.test"
+        effective_admin_client = admin_client or fake_gateway_admin_client()
+        return await _seed_tenant_via_operator(
+            cluster,
+            name=effective_name,
+            residency=effective_residency,
+            roles=roles_list,
+            documents=documents,
+            isolation_tier=isolation_tier,
+            admin_email=effective_admin_email,
+            admin_client=effective_admin_client,
+        )
+
+    return await _seed_tenant_raw(
+        cluster,
+        name=effective_name,
+        residency=residency,
+        roles=roles_list,
+        documents=documents,
+        isolation_tier=isolation_tier,
     )
