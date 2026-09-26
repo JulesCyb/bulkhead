@@ -8,7 +8,7 @@ connection runs as, and whether a token is required at all, depends on the trans
 | Transport | Who it's for | Identity comes from | Token required |
 |---|---|---|---|
 | `stdio` (default) | local development only | the process's own `MCP_TENANT_ID`/`MCP_IDENTITY_ID` | no |
-| `streamable-http` | production — the only path outside local development | the connection's own bearer token, verified per connection (`app.token_verifier.verify_tenant_token`) | **yes** |
+| `streamable-http` | production — the only path outside local development | the connection's own bearer token, resolved per connection through `app.context_resolution.resolve_bearer_context` — the same chain `app/deps.py`'s HTTP adapter calls | **yes** |
 
 `app.mcp.server.check_mcp_mode` enforces this at startup, fail-closed: `stdio`'s process-wide
 identity refuses to start outside `ENVIRONMENT=dev`/`test` (mirroring how `AUTH_MODE=dev-headers`
@@ -36,9 +36,11 @@ algorithm or key, even though both flow through the one `verify_tenant_token` fu
 | Minted by | your identity provider | this application (`POST /v1/t/{tenant_id}/agent-tokens`, `app/agent_credential_exchange.py`) |
 | Verified against | `JWT_VERIFICATION_KEY` / `JWT_ALGORITHM` (default `RS256` — a real IdP's public key) | `AGENT_TOKEN_SIGNING_KEY` (or `AGENT_TOKEN_VERIFICATION_KEY`) / `AGENT_TOKEN_ALGORITHM` (default `HS256`) |
 
-`app.deps.get_key_source` / `get_algorithm_source` pick the pair to check a token against purely
-from its own `iss` claim (never the reverse — `verify_tenant_token` re-checks `iss` under
-signature afterward, so a forged `iss` still fails). A token signed under one pair can never be
+`app.context_resolution.key_source_for` / `algorithm_source_for` (aliased for FastAPI's dependency
+injection as `app.deps.get_key_source` / `get_algorithm_source`; the MCP adapter gets the same
+pair as its `resolve_bearer_context` call's own defaults, never a second copy) pick the pair to
+check a token against purely from its own `iss` claim (never the reverse — `verify_tenant_token`
+re-checks `iss` under signature afterward, so a forged `iss` still fails). A token signed under one pair can never be
 revalidated under the other, even if a deployment configured both to the same literal secret —
 this is what stops the classic mistake of pointing a real IdP's `RS256` config at
 `JWT_ALGORITHM` and having every agent token, still checked against that same setting, break (or
@@ -80,10 +82,11 @@ Every connection needs a bearer token whose audience is that same tenant.
 2. Set `url` to `https://<your-deployment-host>/v1/t/<TENANT_ID>/mcp`.
 3. Set the `Authorization` header to `Bearer <TOKEN>` — a token minted for your own identity by
    whatever issues your tenant's person tokens (`AUTH_MODE=jwt`, `app/deps.py`).
-4. Connect. `MCPTenantAuthMiddleware` verifies the token via the exact module the HTTP API uses
-   (`app.token_verifier.verify_tenant_token`) and resolves your context by delegation: you are
-   the actor, the assistant's tools are the means (`RequestContext.acting_through("agent",
-   "assistant")`) — the same shape a chat message through the web UI produces.
+4. Connect. `MCPTenantAuthMiddleware` is only an adapter of the exact chain the HTTP API's
+   `app.deps.get_context` calls (`app.context_resolution.resolve_bearer_context`) and resolves
+   your context by delegation: you are the actor, the assistant's tools are the means
+   (`RequestContext.acting_through("agent", "assistant")`) — the same shape a chat message
+   through the web UI produces.
 
 A token naming a different tenant than the one in the URL is refused with 403, matching
 ADR-0012's three-way check on the HTTP side; an expired or otherwise invalid token gets 401 —

@@ -265,8 +265,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # middleware) -- fails this test until it is either routed through `app.context_resolution` or
 # added here with a reason a reviewer accepts.
 ALLOWED_CONSTRUCTION_SITES: dict[str, int] = {
-    # The one module that turns a request's inputs into the context it acts as.
-    "app/context_resolution.py": 1,
+    # The one module that turns a request's inputs into the context it acts as: `_new_context`
+    # (the bearer/dev-headers chain) plus `resolve_stdio_env_context` (#102 -- the stdio
+    # transport's own development-only environment identity, moved here from app/mcp/server.py).
+    "app/context_resolution.py": 2,
     # Role-free, never-returned context that only opens the tenant session for the membership
     # read inside the resolution chain (issue #91 story 23) -- internal to the verifier adapter.
     "app/token_verifier.py": 1,
@@ -274,8 +276,9 @@ ALLOWED_CONSTRUCTION_SITES: dict[str, int] = {
     "app/agent_credential_exchange.py": 1,
     # A job, not a request: the retention job's own fixed job identity (ADR-0006, rule 1).
     "app/retention.py": 1,
-    # The stdio-only development fallback (ADR-0005); #102 moves it behind the module.
-    "app/mcp/server.py": 1,
+    # #102 moved the stdio-only development fallback into `resolve_stdio_env_context` above;
+    # `app/mcp/server.py`'s `_context_from_env` is now a thin wrapper with no construction site
+    # of its own, so it no longer appears here at all.
 }
 
 
@@ -291,3 +294,20 @@ def test_request_context_is_constructed_only_at_the_allowed_sites():
             if count:
                 found[path.relative_to(REPO_ROOT).as_posix()] = count
     assert found == ALLOWED_CONSTRUCTION_SITES
+
+
+# --- Bearer parsing exists exactly once (#102 acceptance criterion) ---
+
+
+def test_bearer_parsing_exists_only_in_the_context_resolution_module():
+    """`parse_bearer_token` (module docstring) is the only place a raw `Authorization` header is
+    turned into a token -- the MCP middleware (`app/mcp/server.py`) used to keep its own copy of
+    exactly this parsing before #102; a second copy anywhere is exactly the kind of parsing
+    difference between transports a security reviewer would call a bypass (issue #91 story 21)."""
+    needles = ('startswith("bearer ")', 'split(" ", 1)')
+    found: set[str] = set()
+    for path in (REPO_ROOT / "app").rglob("*.py"):
+        text = path.read_text()
+        if any(needle in text for needle in needles):
+            found.add(path.relative_to(REPO_ROOT).as_posix())
+    assert found == {"app/context_resolution.py"}

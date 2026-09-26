@@ -4,11 +4,15 @@ Payoff: Claude Code / Claude Desktop during development, managed platforms later
 rewriting the tools.
 
 Context: in production, the tenant/identity context comes from the MCP connection's
-authentication (OAuth/token, `app.token_verifier`), per connection, held in the
-`_connection_context` contextvar for the lifetime of that connection's request. For local
-development (`MCP_TRANSPORT=stdio`, the default), from the process-wide MCP_TENANT_ID /
-MCP_IDENTITY_ID -- reachable only when no per-connection context is set, and only under `stdio`
-(issue #89: never a fallback under `streamable-http`, where an unset contextvar is a hard error).
+authentication -- `MCPTenantAuthMiddleware` below is an adapter of the same one chain the HTTP API
+uses (`app.context_resolution.resolve_bearer_context`, #101/#102), never its own bearer parsing or
+verification-error mapping -- per connection, held in the `_connection_context` contextvar for the
+lifetime of that connection's request. For local development (`MCP_TRANSPORT=stdio`, the
+default), from the process-wide MCP_TENANT_ID / MCP_IDENTITY_ID
+(`app.context_resolution.resolve_stdio_env_context`, #102) -- reachable only when no
+per-connection context is set, and only under `stdio` (issue #89: never a fallback under
+`streamable-http`, where an unset contextvar is a hard error).
+
 Which transport is active is a single setting (`Settings.mcp_transport`, issue #48 / ADR-0005),
 guarded at startup by `check_mcp_mode` below the same way `AUTH_MODE=dev-headers` is guarded by
 `app.main.check_auth_mode`.
@@ -27,9 +31,10 @@ Networked (`MCP_TRANSPORT=streamable-http`, issue #49 / ADR-0005): this module b
 server itself; the connection-authenticated ASGI app is `build_streamable_http_app()`, mounted by
 `app.main.create_app()` under the tenant's own path prefix (`/v1/t/{tenant_id}/mcp`, ADR-0012) --
 MCP now mounts inside the existing API service rather than adding a new one. Every connection's
-tenant/identity is derived from its own bearer token via `MCPTenantAuthMiddleware` below, which
-reuses the exact same shared check (`app.token_verifier.verify_tenant_token`) the HTTP API's
-`app.deps.get_context` does -- never a second, drifting copy of it.
+tenant/identity is derived from its own bearer token via `MCPTenantAuthMiddleware` below, which is
+only an adapter of `app.context_resolution.resolve_bearer_context` (#101/#102) -- the exact same
+chain the HTTP API's `app.deps.get_context` calls -- never a second, drifting copy of bearer
+parsing, verification-error mapping, or context construction.
 
 Two more conditions of the mount, closed by issue #116: the mounted sub-app's own lifespan never
 runs (Starlette forwards only `http`/`websocket` scopes to a `Mount`, never `lifespan`) --
@@ -68,17 +73,11 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 
+from app import context_resolution
 from app.config import Settings, get_settings
 from app.context import RequestContext
-from app.context_resolution import actor_context
-from app.deps import get_algorithm_source, get_key_source
 from app.startup_checks import run_startup_checks
 from app.tenant_suspension import TenantSuspendedError, ensure_tenant_not_suspended
-from app.token_verifier import (
-    TenantTokenVerificationError,
-    VerificationFailureReason,
-    verify_tenant_token,
-)
 from app.tools import documents as document_tools
 from app.tools import memberships as membership_tools
 
@@ -100,10 +99,10 @@ server = MCPServer(
 
 
 def _context_from_env() -> RequestContext:
-    s = get_settings()
-    if not (s.mcp_tenant_id and s.mcp_identity_id):
-        raise RuntimeError("Set MCP_TENANT_ID and MCP_IDENTITY_ID (development only).")
-    return RequestContext(tenant_id=UUID(s.mcp_tenant_id), identity_id=UUID(s.mcp_identity_id))
+    """Thin wrapper of `app.context_resolution.resolve_stdio_env_context` (#102) -- kept under
+    this name for #89's own semantics below (per-connection contextvar first, this fallback only
+    under `stdio`); the construction of `RequestContext` itself lives in that module, not here."""
+    return context_resolution.resolve_stdio_env_context(get_settings())
 
 
 # Per-connection context for the networked transport (issue #49): a `contextvars.ContextVar`
@@ -207,27 +206,43 @@ async def list_memberships() -> list[dict]:
 
 # --- Networked transport: per-connection context from a verified bearer token (issue #49) ---
 
-# Every rejected connection gets exactly this body, mirroring `app.deps.FORBIDDEN_DETAIL` -- the
-# specific reason is discoverable only from the server-side log, never the response (ADR-0012).
-_MCP_FORBIDDEN_DETAIL = "Not authorized for this tenant."
 
-
-# Builds the per-connection context from a verified token, naming the means (ADR-0005): shared
-# with the HTTP adapter, owned by `app.context_resolution` (#101) -- not a second copy here.
-_actor_context = actor_context
+def _render(rejection: context_resolution.ContextRejection, tenant_id: UUID) -> JSONResponse:
+    """The MCP transport's shape of a `ContextRejection` -- mirrors `app.deps._render` exactly
+    (the same status, the same client-visible `detail`, the same structured security-event
+    fields): the two adapters answer identically for the same rejection
+    (`tests/test_mcp_streamable_http.py::test_mcp_rejection_matches_the_http_adapters_for_the_same_reason`).
+    Only the response *type* differs (`JSONResponse` here, `HTTPException` there -- FastAPI's own
+    default handler turns that into the same `{"detail": ...}` body) and the log event's name
+    (`mcp_auth_forbidden`, this transport's own)."""
+    if rejection.is_security_event:
+        log.warning(
+            "MCP connection rejected",
+            extra={
+                "event": "mcp_auth_forbidden",
+                "reason": rejection.reason.value,
+                "tenant_id": str(tenant_id),
+                "issuer": rejection.issuer or "",
+                "request_id": rejection.request_id,
+            },
+        )
+    return JSONResponse({"detail": rejection.detail}, status_code=int(rejection.status))
 
 
 class MCPTenantAuthMiddleware:
-    """Wraps the MCP Streamable-HTTP ASGI app with the same three-way tenant check ADR-0012
-    requires of the HTTP API: the connection's bearer token is verified via the exact module the
-    HTTP path uses (`app.token_verifier.verify_tenant_token`, issue #44), and its resolved
-    identity/role become a per-connection `RequestContext` (via `_connection_context` above) for
-    the lifetime of that one ASGI request -- never the process-wide `_context_from_env` fallback.
+    """Adapter of `app.context_resolution.resolve_bearer_context` (#101/#102) for the MCP
+    Streamable-HTTP transport: reads this transport's own inputs (the path's `tenant_id`, the
+    `Authorization` header) and either sets the per-connection `RequestContext` (via
+    `_connection_context` above) for the lifetime of that one ASGI request, or renders the
+    module's `ContextRejection` (`_render` above) -- never the process-wide `_context_from_env`
+    fallback. No bearer parsing, no verification-error mapping, and no context construction of
+    its own live here -- all of that belongs to `app.context_resolution`
+    (`tests/test_context_resolution.py` greps for both).
 
     Mounted under `/v1/t/{tenant_id}/mcp` (`app.main.create_app`), so `tenant_id` arrives as an
     ordinary Starlette path parameter, exactly like every other tenant-scoped route -- the tenant
-    the connection is trying to reach, checked against the token's own audience by
-    `verify_tenant_token` itself (ADR-0012's three-way check, reused rather than reinvented).
+    the connection is trying to reach, checked against the token's own audience inside
+    `resolve_bearer_context` itself (ADR-0012's three-way check, reused rather than reinvented).
     """
 
     def __init__(self, app: ASGIApp, *, settings: Settings) -> None:
@@ -247,55 +262,16 @@ class MCPTenantAuthMiddleware:
             return
 
         headers = Headers(scope=scope)
-        authorization = headers.get("authorization")
-        if not authorization or not authorization.lower().startswith("bearer "):
-            response = JSONResponse(
-                {"detail": "Missing or malformed bearer token"}, status_code=401
-            )
-            await response(scope, receive, send)
-            return
-        token = authorization.split(" ", 1)[1].strip()
-        if not token:
-            response = JSONResponse(
-                {"detail": "Missing or malformed bearer token"}, status_code=401
-            )
-            await response(scope, receive, send)
+        outcome = await context_resolution.resolve_bearer_context(
+            tenant_id=tenant_id,
+            authorization=headers.get("authorization"),
+            settings=self.settings,
+        )
+        if isinstance(outcome, context_resolution.ContextRejection):
+            await _render(outcome, tenant_id)(scope, receive, send)
             return
 
-        key_source = get_key_source(self.settings)
-        algorithm_source = get_algorithm_source(self.settings)
-        try:
-            resolved = await verify_tenant_token(
-                token,
-                tenant_id=tenant_id,
-                key_source=key_source,
-                default_issuer=self.settings.default_identity_issuer,
-                algorithm_source=algorithm_source,
-            )
-        except TenantTokenVerificationError as exc:
-            if exc.reason is VerificationFailureReason.INVALID_OR_EXPIRED:
-                detail = (
-                    "No token issuer configured"
-                    if exc.issuer is None
-                    else "Invalid or expired token"
-                )
-                response = JSONResponse({"detail": detail}, status_code=401)
-            else:
-                log.warning(
-                    "MCP connection rejected",
-                    extra={
-                        "event": "mcp_auth_forbidden",
-                        "reason": exc.reason.value,
-                        "tenant_id": str(tenant_id),
-                        "issuer": exc.issuer or "",
-                    },
-                )
-                response = JSONResponse({"detail": _MCP_FORBIDDEN_DETAIL}, status_code=403)
-            await response(scope, receive, send)
-            return
-
-        ctx = _actor_context(tenant_id, resolved)
-        reset_token = _connection_context.set(ctx)
+        reset_token = _connection_context.set(outcome)
         try:
             await self.app(scope, receive, send)
         finally:

@@ -6,24 +6,29 @@ the MCP mount instead. The control-plane and membership repositories are faked (
 exactly like `tests/test_jwt_auth.py`; the real signature/tenant-check/RLS chain has its own
 coverage in `tests/test_agent_identity_end_to_end_integration.py`.
 
-`MCPServer.streamable_http_app()` (the MCP SDK's own session-negotiation layer -- SSE framing,
-protocol handshakes) is swapped for a tiny fake ASGI app that reports back whatever per-connection
-`RequestContext` `MCPTenantAuthMiddleware` set before calling it. This keeps the test's seam
-exactly at what issue #49 asks for -- the connection's tenant/identity/means resolution -- without
-re-implementing the MCP wire protocol; the tool-invocation path itself (a healthy call, a denied
-call, a masked exception) already has its own dedicated seam in `tests/test_mcp_tool_errors.py`.
-
-Issue #89 closes the gap those two seams left open, separately, between them: neither exercised
-`MCPTenantAuthMiddleware`'s write and a tool's `resolve_context()` read together. The tests below
-`RealWireProtocol` speak the actual MCP Streamable HTTP wire protocol -- JSON-RPC `initialize`,
+The two rejection tests (AC1 below) never reach `MCPServer.streamable_http_app()`'s own
+session-negotiation layer at all -- `MCPTenantAuthMiddleware` answers a rejected connection itself,
+before calling the wrapped app -- so they run against the real mount directly, no fake needed.
+Every other test speaks the actual MCP Streamable HTTP wire protocol -- JSON-RPC `initialize`,
 `notifications/initialized`, then `tools/call` -- over the real mount, through the real
-`MCPServer.streamable_http_app()` (not the fake above), with `app.tools.documents.search_documents`
-faked only at the tool-function boundary to capture the `RequestContext` it was actually called
-with. No monkeypatching of `context_provider` (it no longer exists) or `_connection_context`.
+`MCPServer.streamable_http_app()`, with `app.tools.documents.search_documents` faked only at the
+tool-function boundary to capture the `RequestContext` it was actually called with. The
+tool-invocation path itself (a healthy call, a denied call, a masked exception) has its own
+dedicated seam in `tests/test_mcp_tool_errors.py`.
 
-Issue #116 removes the two workarounds those `RealWireProtocol` tests still needed: they used to
-enter `MCPServer.session_manager` themselves (`app.main.lifespan` now does that, for any
-`streamable-http` deployment, not just a test) and forced a `Host: localhost` header (the mount
+(#102 retired the fake ASGI app this module used to swap in for `MCPServer.streamable_http_app()`,
+which reported back whatever `MCPTenantAuthMiddleware` had set on `_connection_context` directly.
+Making the middleware a thin adapter of `app.context_resolution.resolve_bearer_context` left
+nothing left to prove by bypassing it that the real-wire-protocol tests below don't already prove
+through an actual tool call.)
+
+Issue #89 closed the gap between this module's own seam and `tests/test_mcp_tool_errors.py`'s:
+neither used to exercise `MCPTenantAuthMiddleware`'s write and a tool's `resolve_context()` read
+together. No monkeypatching of `context_provider` (it no longer exists) or `_connection_context`.
+
+Issue #116 removed two workarounds the real-wire-protocol tests used to need: entering
+`MCPServer.session_manager` themselves (`app.main.lifespan` now does that, for any
+`streamable-http` deployment, not just a test) and forcing a `Host: localhost` header (the mount
 now configures a real `MCP_ALLOWED_HOSTS` allow-list, exercised here instead of bypassed).
 """
 
@@ -39,9 +44,11 @@ import httpx
 import jwt
 import pytest
 
+import app.context_resolution as context_resolution_module
 import app.deps as deps_module
 import app.mcp.server as mcp_server
 from app.config import Settings, get_settings
+from app.context_resolution import ContextRejection, RejectionReason, RejectionStatus
 from app.repositories.documents import DocumentHit
 from app.token_verifier import AGENT_IDENTITY_ISSUER, set_default_adapter_for_tests
 from tests.conftest import FakeControlPlaneReads
@@ -84,29 +91,6 @@ def _install_fake_control_plane(*, auth_settings, identities, memberships):
     )
 
 
-async def _fake_inner_app(scope, receive, send):
-    """Stands in for `MCPServer.streamable_http_app()`'s own session-negotiation app (see module
-    docstring): reports back whatever `MCPTenantAuthMiddleware` set as the per-connection
-    context, so the test can assert on it without speaking the MCP wire protocol."""
-    ctx = mcp_server._connection_context.get()
-    body = json.dumps(
-        {
-            "identity_id": str(ctx.identity_id),
-            "roles": sorted(ctx.roles),
-            "means_kind": ctx.means.kind if ctx.means else None,
-            "means_id": ctx.means.id if ctx.means else None,
-        }
-    ).encode()
-    await send(
-        {
-            "type": "http.response.start",
-            "status": 200,
-            "headers": [(b"content-type", b"application/json")],
-        }
-    )
-    await send({"type": "http.response.body", "body": body})
-
-
 MCP_ALLOWED_HOST = "mcp.example.com"
 
 
@@ -132,20 +116,6 @@ def _mcp_settings(**overrides) -> Settings:
     return Settings(**fields)
 
 
-@pytest.fixture
-def mcp_app(monkeypatch):
-    """A fresh `create_app()` with the networked MCP transport mounted and its inner
-    session-negotiation app swapped for `_fake_inner_app` (see module docstring)."""
-    from app import main as main_module
-
-    settings = _mcp_settings()
-    monkeypatch.setattr(main_module, "get_settings", lambda: settings)
-    monkeypatch.setattr(mcp_server.server, "streamable_http_app", lambda **kwargs: _fake_inner_app)
-    app = main_module.create_app()
-    app.dependency_overrides[get_settings] = lambda: settings
-    return app, settings
-
-
 async def _mcp_request(app, tenant_id: uuid.UUID, token: str | None) -> httpx.Response:
     transport = httpx.ASGITransport(app=app)
     headers = {}
@@ -156,6 +126,11 @@ async def _mcp_request(app, tenant_id: uuid.UUID, token: str | None) -> httpx.Re
 
 
 # --- AC1: a connection whose token names a different tenant than its address is refused ---
+#
+# Both tests below reject the connection inside `MCPTenantAuthMiddleware` itself, before it ever
+# calls the wrapped app -- so the real (not faked) `MCPServer.streamable_http_app()` the `mcp_app`
+# fixture below builds is never actually reached, and no wire-protocol handshake or running
+# lifespan is needed to observe the rejection.
 
 
 async def test_token_naming_a_different_tenant_is_refused(mcp_app):
@@ -182,57 +157,9 @@ async def test_missing_token_is_unauthorized(mcp_app):
     assert response.status_code == 401
 
 
-# --- AC2: a person's token resolves to delegation (actor=person, means=the assistant's tools) ---
-
-
-async def test_persons_token_resolves_to_delegation(mcp_app):
-    app, _ = mcp_app
-    tenant_id = uuid.uuid4()
-    identity_id = uuid.uuid4()
-    _install_fake_control_plane(
-        auth_settings={tenant_id: (HUMAN_ISSUER, False)},
-        identities={(HUMAN_ISSUER, "sub-1"): identity_id},
-        memberships={(tenant_id, identity_id): "member"},
-    )
-    token = _make_token(secret=HUMAN_SECRET, issuer=HUMAN_ISSUER, audience=str(tenant_id))
-
-    response = await _mcp_request(app, tenant_id, token)
-
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["identity_id"] == str(identity_id)
-    assert body["means_kind"] == "agent"
-    assert body["means_id"] == "assistant"
-
-
-# --- AC3: an agent identity's token resolves to autonomous use (actor=identity, means=cred) ---
-
-
-async def test_agent_identity_token_resolves_to_autonomous_use(mcp_app):
-    app, _ = mcp_app
-    tenant_id = uuid.uuid4()
-    identity_id = uuid.uuid4()
-    _install_fake_control_plane(
-        auth_settings={tenant_id: (HUMAN_ISSUER, False)},
-        identities={(AGENT_IDENTITY_ISSUER, "agent-sub-1"): identity_id},
-        memberships={(tenant_id, identity_id): "agent"},
-    )
-    token = _make_token(
-        secret=AGENT_SECRET,
-        issuer=AGENT_IDENTITY_ISSUER,
-        subject="agent-sub-1",
-        audience=str(tenant_id),
-        extra={"cred": "agt_abc123"},
-    )
-
-    response = await _mcp_request(app, tenant_id, token)
-
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["identity_id"] == str(identity_id)
-    assert body["roles"] == ["agent"]
-    assert body["means_kind"] == "credential"
-    assert body["means_id"] == "agt_abc123"
+# --- AC2/AC3 (person -> delegation, agent identity -> credential): covered below by the real
+# wire-protocol tests, which assert the identical facts (identity, role, means) through an actual
+# tool call rather than a fake inner app reporting `_connection_context` back directly. ---
 
 
 # --- #89: the real wire protocol, real tool dispatch, no fake inner app -----------------------
@@ -251,10 +178,13 @@ _INITIALIZE_PARAMS = {
 
 
 @pytest.fixture
-def mcp_app_real(monkeypatch):
+def mcp_app(monkeypatch):
     """A fresh `create_app()` with the networked MCP transport mounted, its *real*
-    `MCPServer.streamable_http_app()` -- unlike `mcp_app` above, nothing here fakes the inner
-    session-negotiation app: these tests speak the actual wire protocol against it.
+    `MCPServer.streamable_http_app()` -- nothing here fakes the inner session-negotiation app (the
+    fake that used to stand in for it, reading `_connection_context` directly, is retired: #102
+    made `MCPTenantAuthMiddleware` a thin adapter, so there is nothing left to prove by bypassing
+    it). Every test in this module speaks the actual wire protocol -- or, for the two rejection
+    tests above, is rejected before the wire protocol ever starts.
 
     `run_role_rls_guard` is substituted with a no-op: driving the real ASGI lifespan (issue #116,
     `_running_app` below) now reaches it too, and it needs a real database this unit test has
@@ -365,11 +295,11 @@ def _fixed_hit() -> DocumentHit:
 
 
 async def test_real_wire_protocol_hands_search_documents_the_verified_persons_context(
-    monkeypatch, mcp_app_real
+    monkeypatch, mcp_app
 ):
     """AC1 (person's token): over the real mount, speaking the real wire protocol, the tool
     receives the context carrying that token's identity and role, and `means.kind == "agent"`."""
-    app, _ = mcp_app_real
+    app, _ = mcp_app
     tenant_id = uuid.uuid4()
     identity_id = uuid.uuid4()
     _install_fake_control_plane(
@@ -413,10 +343,10 @@ async def test_real_wire_protocol_hands_search_documents_the_verified_persons_co
 
 
 async def test_real_wire_protocol_hands_search_documents_the_agent_identitys_context(
-    monkeypatch, mcp_app_real
+    monkeypatch, mcp_app
 ):
     """AC1 (agent identity's token): same wire protocol, `means.kind == "credential"`."""
-    app, _ = mcp_app_real
+    app, _ = mcp_app
     tenant_id = uuid.uuid4()
     identity_id = uuid.uuid4()
     _install_fake_control_plane(
@@ -464,11 +394,11 @@ async def test_real_wire_protocol_hands_search_documents_the_agent_identitys_con
     assert ctx.means.id == "agt_abc123"
 
 
-async def test_two_concurrent_connections_each_see_only_their_own_tenant(monkeypatch, mcp_app_real):
+async def test_two_concurrent_connections_each_see_only_their_own_tenant(monkeypatch, mcp_app):
     """AC2: two concurrent connections for two different tenants -- each `tools/call` sees only
     its own connection's tenant, never the other's, even though both run through the same shared
     MCP server instance concurrently (`asyncio.gather`)."""
-    app, _ = mcp_app_real
+    app, _ = mcp_app
     tenant_a, tenant_b = uuid.uuid4(), uuid.uuid4()
     identity_a, identity_b = uuid.uuid4(), uuid.uuid4()
     _install_fake_control_plane(
@@ -520,12 +450,12 @@ async def test_two_concurrent_connections_each_see_only_their_own_tenant(monkeyp
     assert seen_by_tenant[tenant_a].tenant_id != seen_by_tenant[tenant_b].tenant_id
 
 
-async def test_real_wire_protocol_rejects_an_unlisted_host_header(mcp_app_real):
+async def test_real_wire_protocol_rejects_an_unlisted_host_header(mcp_app):
     """Issue #116: `build_streamable_http_app` now passes `MCP_ALLOWED_HOSTS` through as the SDK's
     `TransportSecuritySettings.allowed_hosts` -- a Host header outside that list is rejected by the
     SDK's own DNS-rebinding middleware (421), proving the allow-list is actually enforced and not
     just accepted-and-ignored configuration."""
-    app, _ = mcp_app_real
+    app, _ = mcp_app
     tenant_id = uuid.uuid4()
     identity_id = uuid.uuid4()
     _install_fake_control_plane(
@@ -569,3 +499,68 @@ async def test_streamable_http_refuses_a_tools_call_with_no_connection_context(m
 
     with pytest.raises(RuntimeError, match="per-connection"):
         await mcp_server.resolve_context()
+
+
+# --- Delegation proof: the MCP adapter renders whatever the module returns, no second copy -----
+
+
+async def test_mcp_adapter_renders_a_rejection_it_did_not_compute(monkeypatch, mcp_app):
+    """The MCP twin of `tests/test_context_resolution.py`'s own delegation proof
+    (`test_dev_headers_adapter_renders_a_rejection_it_did_not_compute`): a perfectly valid,
+    verifiable token for an unsuspended tenant -- yet the substituted `resolve_bearer_context`
+    says the tenant is suspended, and `MCPTenantAuthMiddleware` answers exactly that. Proves the
+    middleware only renders what the module returns; it never re-implements a check of its own."""
+    app, _ = mcp_app
+    tenant_id = uuid.uuid4()
+    identity_id = uuid.uuid4()
+    _install_fake_control_plane(
+        auth_settings={tenant_id: (HUMAN_ISSUER, False)},
+        identities={(HUMAN_ISSUER, "sub-1"): identity_id},
+        memberships={(tenant_id, identity_id): "member"},
+    )
+    token = _make_token(secret=HUMAN_SECRET, issuer=HUMAN_ISSUER, audience=str(tenant_id))
+    rejection = ContextRejection(
+        status=RejectionStatus.FORBIDDEN,
+        reason=RejectionReason.TENANT_SUSPENDED,
+        detail=context_resolution_module.FORBIDDEN_DETAIL,
+        request_id="req-mcp-delegation",
+        issuer=HUMAN_ISSUER,
+    )
+    seen: list[dict] = []
+
+    async def _fake(**kwargs):
+        seen.append(kwargs)
+        return rejection
+
+    monkeypatch.setattr(context_resolution_module, "resolve_bearer_context", _fake)
+
+    response = await _mcp_request(app, tenant_id, token)
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == context_resolution_module.FORBIDDEN_DETAIL
+    assert seen and seen[0]["tenant_id"] == tenant_id
+
+
+# --- Both adapters render the same ContextRejection identically ---------------------------------
+
+
+def test_mcp_rejection_matches_the_http_adapters_for_the_same_reason():
+    """#102 acceptance criterion: the same `ContextRejection` renders identically on both
+    transports. `app.deps._render` (HTTPException, turned into a `{"detail": ...}` body by
+    FastAPI's own default exception handler) and `app.mcp.server._render` (JSONResponse,
+    constructing that same body directly) are two different response *types* standing in for the
+    same status and detail -- never two independently-decided answers for one rejection."""
+    tenant_id = uuid.uuid4()
+    rejection = ContextRejection(
+        status=RejectionStatus.FORBIDDEN,
+        reason=RejectionReason.TENANT_SUSPENDED,
+        detail=context_resolution_module.FORBIDDEN_DETAIL,
+        request_id="req-parity",
+        issuer=HUMAN_ISSUER,
+    )
+
+    http_exc = deps_module._render(rejection, tenant_id)
+    mcp_response = mcp_server._render(rejection, tenant_id)
+
+    assert http_exc.status_code == mcp_response.status_code
+    assert json.loads(mcp_response.body)["detail"] == http_exc.detail
