@@ -1744,11 +1744,12 @@ async def test_residency_resolves_through_real_rls_and_never_crosses_tenants(
     """Given two tenants set to different residencies, resolving one tenant's route never
     returns the other's -- read through the same tenant-scoped session/RLS scaffolding every
     repository uses, exactly like the document-search isolation test above (#60)."""
-    from app.config import RESIDENCY_ALLOW_LIST, Settings
+    from app.config import Settings
     from app.context import RequestContext
     from app.db.session import tenant_session
-    from app.residency import resolve_residency_route
+    from app.residency import ResidencyAllowList, resolve_residency_route
 
+    allow_list = ResidencyAllowList.load()
     tenant_eu, tenant_us = await _seed(database_urls["superuser"])
     await _set_residency(database_urls["superuser"], tenant_eu, "eu")
     await _set_residency(database_urls["superuser"], tenant_us, "us")
@@ -1767,11 +1768,11 @@ async def test_residency_resolves_through_real_rls_and_never_crosses_tenants(
         resolved_us = await resolve_residency_route(session, ctx_us, settings=settings)
 
     assert resolved_eu.residency == "eu"
-    assert resolved_eu.route == RESIDENCY_ALLOW_LIST["eu"]
+    assert resolved_eu.route == allow_list.route_for("eu")
     assert resolved_eu.gateway_credential.get_secret_value() == "sk-acme-secret"
 
     assert resolved_us.residency == "us"
-    assert resolved_us.route == RESIDENCY_ALLOW_LIST["us"]
+    assert resolved_us.route == allow_list.route_for("us")
     assert resolved_us.gateway_credential.get_secret_value() == "sk-globex-secret"
 
     # Never each other's route or credential.
@@ -1824,26 +1825,35 @@ async def test_resolver_fails_closed_for_a_tenant_with_no_residency_set(
 
 
 async def test_resolver_fails_closed_for_a_tenant_with_an_unknown_residency(
-    app_settings, database_urls, monkeypatch
+    app_settings, database_urls
 ):
-    import app.residency as residency_module
+    from app.config import Settings
     from app.context import RequestContext
     from app.db.session import tenant_session
-    from app.residency import ResidencyUnresolved, resolve_residency_route
+    from app.residency import ResidencyAllowList, ResidencyUnresolved, resolve_residency_route
 
     tenant_a, _ = await _seed(database_urls["superuser"])
     await _set_residency(database_urls["superuser"], tenant_a, "us")
     # The database only stores residencies it knows; a deployment whose configuration drops one
-    # must still fail closed for tenants recorded under it.
-    monkeypatch.setattr(
-        residency_module,
-        "RESIDENCY_ALLOW_LIST",
-        {k: v for k, v in residency_module.RESIDENCY_ALLOW_LIST.items() if k != "us"},
+    # must still fail closed for tenants recorded under it. No global to patch (spec A4 / #110):
+    # the allow-list is swapped on the settings object itself, then handed to the resolver
+    # explicitly.
+    settings = Settings(database_url=database_urls["app"])
+    settings.residency_allow_list = ResidencyAllowList.from_data(
+        {
+            "residency": {
+                "eu": {
+                    "model_host_patterns": ["gateway-eu.internal"],
+                    "embedding_endpoint": "https://gateway-eu.internal/v1",
+                    "trace_sink_host": "eu.cloud.langfuse.com",
+                }
+            }
+        }
     )
     ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
     with pytest.raises(ResidencyUnresolved):
         async with tenant_session(ctx_a) as session:
-            await resolve_residency_route(session, ctx_a)
+            await resolve_residency_route(session, ctx_a, settings=settings)
 
 
 # --- Chat and document-search routing through a tenant's real residency (Spec 8 / #61) -----

@@ -15,8 +15,9 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from app import observability
-from app.config import RESIDENCY_ALLOW_LIST, Settings
+from app.config import Settings
 from app.context import RequestContext
+from app.residency import ResidencyAllowList
 
 
 @pytest.fixture(autouse=True)
@@ -49,7 +50,7 @@ def test_no_credentials_at_all_leaves_tracing_off_and_the_process_still_starts()
 def test_credentials_configured_builds_one_tracer_provider_per_residency():
     assert observability.setup_observability(_configured_settings()) is True
     assert observability.is_tracing_configured() is True
-    for residency in RESIDENCY_ALLOW_LIST:
+    for residency in ResidencyAllowList.load().residencies:
         assert observability.instrumentation_capabilities(residency, False) != []
 
 
@@ -73,7 +74,9 @@ def test_otlp_endpoint_env_var_never_affects_the_configured_destination(monkeypa
 
     observability.setup_observability(_configured_settings())
 
-    for residency, route in RESIDENCY_ALLOW_LIST.items():
+    allow_list = ResidencyAllowList.load()
+    for residency in allow_list.residencies:
+        route = allow_list.route_for(residency)
         endpoint = observability.configured_trace_endpoint(residency)
         assert endpoint == f"https://{route.trace_sink_host}/api/public/otel"
         assert "attacker.example.com" not in endpoint

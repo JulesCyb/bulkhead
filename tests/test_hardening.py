@@ -1,15 +1,19 @@
 """Guard tests: SSE framing, the dev-headers environment guard, and residency/embedding
-configuration-property tests (ADR-0008, spec 8 / issue #58)."""
+configuration-property tests (ADR-0008, spec 8 / issue #58, spec A4 / #94, #110)."""
 
 from __future__ import annotations
+
+import subprocess
+import sys
 
 import httpx
 import pytest
 from pydantic import ValidationError
 
 from app.api.agents import _sse
-from app.config import RESIDENCY_ALLOW_LIST, Settings
+from app.config import Settings
 from app.main import check_auth_mode
+from app.residency import ResidencyAllowList
 
 _VALID_KWARGS = {"embedding_provider": "openai", "embedding_model": "text-embedding-3-small"}
 
@@ -49,8 +53,10 @@ def test_settings_requires_embedding_model():
 def test_settings_residency_allow_list_has_at_least_two_residencies():
     # Data-driven, not hard-coded per provider: at least two residencies for tests, each with
     # allowed model/gateway host patterns, an allowed embedding endpoint, and a trace sink host.
-    assert len(RESIDENCY_ALLOW_LIST) >= 2
-    for route in RESIDENCY_ALLOW_LIST.values():
+    allow_list = ResidencyAllowList.load()
+    assert len(allow_list.residencies) >= 2
+    for residency in allow_list.residencies:
+        route = allow_list.route_for(residency)
         assert route.model_host_patterns
         assert route.embedding_endpoint
         assert route.trace_sink_host
@@ -72,7 +78,7 @@ def test_settings_valid_configuration_constructs_cleanly():
         residency="eu",
     )
     assert settings.residency == "eu"
-    assert settings.residency_route == RESIDENCY_ALLOW_LIST["eu"]
+    assert settings.residency_route == ResidencyAllowList.load().route_for("eu")
 
     # A second, distinct residency also constructs cleanly and resolves its own route.
     other = Settings(
@@ -81,6 +87,41 @@ def test_settings_valid_configuration_constructs_cleanly():
         residency="us",
     )
     assert other.residency_route != settings.residency_route
+
+
+def test_importing_app_config_never_touches_the_filesystem(tmp_path):
+    """Spec A4 (#94, #110), acceptance: importing `app.config` has no side effects -- a missing
+    `RESIDENCY_CONFIG_PATH` must not stop the module from importing at all (the old
+    module-level `load_residency_config()` call did exactly that). Only constructing `Settings()`
+    -- which builds `residency_allow_list` from that path -- fails, and with the one exception
+    type this module now raises for every fail-closed residency lookup or validation
+    (`app.residency.ResidencyUnresolved`). Run in a fresh subprocess: `app.config` is already
+    imported (and cached) in this test process, so only a fresh interpreter actually proves
+    "importing has no side effects."
+    """
+    missing = tmp_path / "does-not-exist.toml"
+    script = (
+        "import app.config\n"
+        "from app.config import Settings\n"
+        "from app.residency import ResidencyUnresolved\n"
+        "try:\n"
+        "    Settings(environment='test', auth_mode='dev-headers', "
+        "litellm_base_url='http://litellm:4000', embedding_provider='openai', "
+        "embedding_model='text-embedding-3-small')\n"
+        "except ResidencyUnresolved:\n"
+        "    print('RAISED_RESIDENCY_UNRESOLVED')\n"
+        "else:\n"
+        "    print('DID_NOT_RAISE')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env={"RESIDENCY_CONFIG_PATH": str(missing), "PATH": "/usr/bin:/bin"},
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "RAISED_RESIDENCY_UNRESOLVED" in result.stdout, result.stdout + result.stderr
 
 
 def test_settings_backup_retention_days_has_a_documented_default(monkeypatch):

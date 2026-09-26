@@ -40,8 +40,8 @@ is only inserted if one does not already exist for that (tenant, identity) pair,
 database it belongs to for this tenant's tier.
 
 Residency and an optional per-tenant model override are validated against
-`app.config.RESIDENCY_ALLOW_LIST`/`RESIDENCY_MODEL_ALLOW_LIST` before any write happens at all --
-an unrecognized selection never leaves the control plane, a secret file, or a membership
+`settings.residency_allow_list` (`app.residency.ResidencyAllowList`) before any write happens at
+all -- an unrecognized selection never leaves the control plane, a secret file, or a membership
 half-written. `--dedicated-db-admin-url` is only required, and only checked, at the point a fresh
 dedicated database actually needs provisioning (see `ensure_dedicated_database`) -- a pooled
 `create`, or a re-run against an already-provisioned dedicated tenant, never needs it.
@@ -57,7 +57,7 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from app.config import RESIDENCY_ALLOW_LIST, RESIDENCY_MODEL_ALLOW_LIST, Settings, get_settings
+from app.config import Settings, get_settings
 from app.gateway_provisioning import (
     GATEWAY_MODEL_ALIASES_BY_RESIDENCY,
     GatewayAdminClient,
@@ -79,7 +79,8 @@ ISOLATION_TIERS = ("pooled", "dedicated")
 
 
 class UnrecognizedResidencyError(ValueError):
-    """`residency` is not a key of `RESIDENCY_ALLOW_LIST` -- rejected before any write."""
+    """`residency` is not a key of `settings.residency_allow_list.residencies` -- rejected before
+    any write."""
 
 
 class UnrecognizedModelError(ValueError):
@@ -109,22 +110,26 @@ class CreateTenantResult:
     dedicated_database: str | None = None  # "provisioned" | "already provisioned" | None (pooled)
 
 
-def _validate_residency(residency: str) -> None:
-    if residency not in RESIDENCY_ALLOW_LIST:
+def _validate_residency(residency: str, settings: Settings) -> None:
+    allow_list = settings.residency_allow_list
+    assert allow_list is not None  # set by Settings construction
+    if residency not in allow_list.residencies:
         raise UnrecognizedResidencyError(
             f"unrecognized residency {residency!r}; known residencies: "
-            f"{sorted(RESIDENCY_ALLOW_LIST)} (see RESIDENCY_ALLOW_LIST in app/config.py)"
+            f"{sorted(allow_list.residencies)} (see settings.residency_allow_list)"
         )
 
 
-def _validate_model(model: str | None, residency: str) -> None:
+def _validate_model(model: str | None, residency: str, settings: Settings) -> None:
     if model is None:
         return
-    allowed = RESIDENCY_MODEL_ALLOW_LIST.get(residency, ())
+    allow_list = settings.residency_allow_list
+    assert allow_list is not None  # set by Settings construction
+    allowed = allow_list.model_aliases(residency)
     if model not in allowed:
         raise UnrecognizedModelError(
             f"unrecognized model {model!r} for residency {residency!r}; allowed models: "
-            f"{sorted(allowed)} (see RESIDENCY_MODEL_ALLOW_LIST in app/config.py)"
+            f"{sorted(allowed)} (see settings.residency_allow_list)"
         )
 
 
@@ -156,18 +161,19 @@ async def create_tenant(
     consulted when `isolation_tier="dedicated"` and this is a fresh tenant whose database has not
     already been provisioned (see `app.operator.dedicated_db.ensure_dedicated_database`).
     """
+    settings = settings or get_settings()
+
     # Validated before any write, in this order, per acceptance criteria: an unrecognized
     # residency, model-allow-list, or isolation-tier selection must reject before the
     # control-plane record, the credential, or the membership is touched.
-    _validate_residency(residency)
-    _validate_model(model, residency)
+    _validate_residency(residency, settings)
+    _validate_model(model, residency, settings)
     _validate_isolation_tier(isolation_tier)
     tenant_settings = TenantSettings(model=model) if model is not None else None
     tenant_settings_json = json.dumps(
         tenant_settings.model_dump(exclude_none=True) if tenant_settings else {}
     )
 
-    settings = settings or get_settings()
     subject = subject or admin_email
 
     try:

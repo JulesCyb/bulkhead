@@ -10,10 +10,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from app.config import RESIDENCY_ALLOW_LIST, Settings
+from app.config import Settings
 from app.context import RequestContext
 from app.gateway_credentials import GatewayCredentialUnavailable
-from app.residency import ResidencyUnresolved, resolve_residency_route
+from app.residency import ResidencyAllowList, ResidencyUnresolved, resolve_residency_route
+
+ALLOW_LIST = ResidencyAllowList.load()
 
 
 @pytest.fixture
@@ -67,7 +69,7 @@ async def test_resolved_route_matches_the_allow_list_entry(tmp_path, settings) -
     resolved = await resolve_residency_route(session, ctx, settings=settings)
 
     assert resolved.residency == "eu"
-    assert resolved.route == RESIDENCY_ALLOW_LIST["eu"]
+    assert resolved.route == ALLOW_LIST.route_for("eu")
     assert resolved.gateway_credential.get_secret_value() == "sk-acme-secret"
 
 
@@ -119,6 +121,6 @@ def _build_resolved_for_frozen_check():
 
     return ResolvedResidencyRoute(
         residency="eu",
-        route=RESIDENCY_ALLOW_LIST["eu"],
+        route=ALLOW_LIST.route_for("eu"),
         gateway_credential=SecretStr("sk-test"),
     )

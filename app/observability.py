@@ -10,7 +10,8 @@ Content-free by default, per-tenant opt-in, per-residency sink:
   (`app.tenant_settings.TenantSettings`) — resolved per run, never a process-wide toggle.
 - The trace sink a run's spans reach is resolved from the tenant's residency exactly like the
   model and embedding routes: one `TracerProvider` per residency
-  (`RESIDENCY_ALLOW_LIST[residency].trace_sink_host`, `app.config`), so two tenants in different
+  (`settings.residency_allow_list.route_for(residency).trace_sink_host`,
+  `app.residency.ResidencyAllowList`), so two tenants in different
   residencies can never share an exporter, and a tenant whose residency can't be resolved simply
   runs untraced rather than falling back to someone else's sink.
 - The OTLP endpoint and the Langfuse Basic-auth header are set directly as constructor arguments
@@ -51,7 +52,7 @@ from pydantic_ai.capabilities.instrumentation import Instrumentation
 from pydantic_ai.models.instrumented import InstrumentationSettings
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import RESIDENCY_ALLOW_LIST, Settings
+from app.config import Settings
 from app.context import RequestContext
 from app.db.session import tenant_session
 from app.repositories.control import ControlRepository
@@ -141,14 +142,14 @@ _residency_tracer_providers: dict[str, TracerProvider] = {}
 
 # Exporters `setup_observability()` itself built, kept only so a test can read back exactly what
 # endpoint was configured (`configured_trace_endpoint`) — proving the destination came from
-# `RESIDENCY_ALLOW_LIST`, not from an `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable. No
+# the residency allow-list, not from an `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable. No
 # production code reads this dict.
 _residency_exporters: dict[str, OTLPSpanExporter] = {}
 
 
 def setup_observability(settings: Settings) -> bool:
-    """Builds one `TracerProvider` per residency in `RESIDENCY_ALLOW_LIST`, each pointed at that
-    residency's own `trace_sink_host` (ADR-0008) — called once from the ASGI lifespan
+    """Builds one `TracerProvider` per residency in `settings.residency_allow_list`, each pointed
+    at that residency's own `trace_sink_host` (ADR-0008) — called once from the ASGI lifespan
     (`app/main.py`).
 
     Returns `False`, with tracing left off, when no Langfuse credentials are configured at all —
@@ -169,7 +170,10 @@ def setup_observability(settings: Settings) -> bool:
         auth_header = f"Basic {auth}"
         providers: dict[str, TracerProvider] = {}
         exporters: dict[str, OTLPSpanExporter] = {}
-        for residency, route in RESIDENCY_ALLOW_LIST.items():
+        allow_list = settings.residency_allow_list
+        assert allow_list is not None  # set by Settings construction
+        for residency in allow_list.residencies:
+            route = allow_list.route_for(residency)
             exporter = OTLPSpanExporter(
                 endpoint=f"https://{route.trace_sink_host}/api/public/otel",
                 headers={"Authorization": auth_header},
@@ -212,7 +216,7 @@ def is_tracing_configured() -> bool:
 
 def configured_trace_endpoint(residency: str) -> str | None:
     """Test-only introspection: the exact OTLP endpoint URL `setup_observability()` configured
-    for `residency`'s exporter — proves that endpoint came from `RESIDENCY_ALLOW_LIST`, set
+    for `residency`'s exporter — proves that endpoint came from the residency allow-list, set
     directly on the exporter, never from `OTEL_EXPORTER_OTLP_ENDPOINT`."""
     exporter = _residency_exporters.get(residency)
     return exporter._endpoint if exporter is not None else None  # noqa: SLF001
