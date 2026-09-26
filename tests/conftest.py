@@ -61,13 +61,13 @@ def ctx() -> RequestContext:
 class FakeControlPlaneReads:
     """The one shared fake of `app.token_verifier.ControlPlaneReads` (#100): replaces every
     hand-written per-repository fake (tenant auth settings, memberships, identities) that used to
-    be monkeypatched directly onto `app.token_verifier` or `app.tenant_suspension`. Installed as
-    the process-wide default via
-    `app.token_verifier.set_default_adapter_for_tests` (the `not_suspended` fixture below does
-    this for every test by default); a test that needs specific identities, memberships, or
-    auth settings installs its own instance the same way, or constructs one and passes it as
-    `verify_tenant_token`'s own `adapter=` keyword directly (`tests/test_token_verifier.py`'s
-    pattern).
+    be monkeypatched directly onto `app.token_verifier`. Installed as the process-wide default via
+    `app.token_verifier.set_default_adapter_for_tests` (the `default_control_plane_reads` fixture
+    below does this for every test by default); a test that needs specific identities,
+    memberships, or auth settings -- including a suspended tenant, since #106 retired the
+    dedicated `not_suspended` fixture this one replaces -- installs its own instance the same way,
+    or constructs one and passes it as `verify_tenant_token`'s own `adapter=` keyword directly
+    (`tests/test_token_verifier.py`'s pattern).
 
     `identities`: {(issuer, subject): identity_id}.
     `memberships`: {(tenant_id, identity_id): role}.
@@ -130,16 +130,21 @@ class FakeControlPlaneReads:
 
 
 @pytest.fixture(autouse=True)
-def not_suspended():
-    """Default fake control-plane-reads adapter (Spec 9 / #69, and #100's adapter seam): no test
-    in this file-free suite has a real database, so by default every tenant looks unsuspended --
+def default_control_plane_reads():
+    """Default fake control-plane-reads adapter (#100's adapter seam): no test in this
+    file-free suite has a real database, so by default every tenant looks unsuspended --
     mirroring the real repository's own "no control-plane row -> not suspended" default
     (ADR-0002), and every identity/membership lookup returns nothing. Installed once, process-wide,
     via `app.token_verifier.set_default_adapter_for_tests` -- the one seam
-    `app.tenant_suspension.ensure_tenant_not_suspended` and `app.token_verifier.verify_tenant_token`
-    both fall back to (app/deps.py's dev-headers branch, app/mcp/server.py, app/agents/assistant.py,
-    app/api/chat.py all share it). A test that wants a suspended tenant, or specific identities/
-    memberships, installs its own `FakeControlPlaneReads` the same way, after this fixture runs.
+    `app.context_resolution`'s tenant-record read and `app.token_verifier.verify_tenant_token`
+    both fall back to (`app/deps.py`'s dev-headers branch and every bearer-token path share it).
+
+    Suspension itself has exactly two enforcement points project-wide (`app/db/session.py`'s
+    module docstring), neither of which lives in this fixture (#106 retired the old
+    `not_suspended` fixture that used to be about suspension specifically): a test that wants a
+    suspended tenant installs its own `FakeControlPlaneReads(auth_settings=...)` or
+    `FakeControlPlaneReads(records=...)` the same way, after this fixture runs, or -- for a real
+    control-plane row -- calls the seeded tenant's own `suspend()` (`tests/support/seeding.py`).
     """
     set_default_adapter_for_tests(FakeControlPlaneReads())
     yield

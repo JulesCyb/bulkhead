@@ -22,10 +22,20 @@ tenant's own record (`app.tenant_record.TenantRecord`, built by the very functio
 context resolution uses: `ControlRepository.get_tenant_record`, #104/#105), the same settings
 object `content_tracing_opt_in` and `model` are read from, so the setting is actually honored
 rather than merely readable.
+
+A suspended tenant is skipped outright (#106, ADR-0010): its record is read (the same one read
+every tenant gets), `record.suspended` is checked before anything else, and a suspended tenant
+gets one log line and no `tenant_session()` -- never `TenantSuspendedError` raised mid-sweep, which
+would otherwise abort the whole job's `for` loop at whichever tenant happened to be suspended.
+This is this job's own instance of the same two-enforcement-point rule `app/db/session.py`
+documents: a job is exactly the kind of record-carrying, non-HTTP caller that rule expects to
+decide suspension for itself, right after building the record, rather than letting
+`tenant_session()` raise for it.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
@@ -38,6 +48,8 @@ from app.operator.listing import list_tenants
 from app.repositories.control import ControlRepository
 from app.repositories.conversations import ConversationsRepository
 from app.tenant_settings import DEFAULT_RETENTION_DAYS
+
+log = logging.getLogger(__name__)
 
 # This job has no acting person or agent identity behind it -- it is a scheduled sweep, not a
 # request on anyone's behalf. It is only ever used as the per-transaction `app.identity_id`
@@ -60,8 +72,9 @@ async def run_retention_job(conn: AsyncConnection) -> list[RetentionOutcome]:
     """Visits every tenant the control plane currently knows about (`conn`, an `app_owner`
     connection, used only to enumerate them) and deletes that tenant's conversations -- and their
     messages, via cascade -- whose `last_activity_at` is older than that tenant's own retention
-    cutoff. Returns one `RetentionOutcome` per tenant visited, in the order `list_tenants` returns
-    them.
+    cutoff. A suspended tenant is skipped (one log line, no `tenant_session()` opened for it --
+    module docstring) rather than counted as visited. Returns one `RetentionOutcome` per
+    non-suspended tenant visited, in the order `list_tenants` returns them.
     """
     outcomes: list[RetentionOutcome] = []
     for tenant in await list_tenants(conn):
@@ -69,6 +82,9 @@ async def run_retention_job(conn: AsyncConnection) -> list[RetentionOutcome]:
             record = await ControlRepository().get_tenant_record(
                 record_session, tenant_id=tenant.tenant_id
             )
+        if record.suspended:
+            log.info("retention: skipping suspended tenant %s (%r)", tenant.tenant_id, tenant.name)
+            continue
         ctx = RequestContext(
             tenant_id=tenant.tenant_id, identity_id=JOB_IDENTITY_ID, tenant_record=record
         )

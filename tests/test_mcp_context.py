@@ -1,6 +1,6 @@
-"""The MCP server's development-only context provider (identity_id naming, env-based), its
-suspension check (Spec 9 / #69, ADR-0010), and its startup transport guard (issue #48 /
-ADR-0005)."""
+"""The MCP server's development-only context provider (identity_id naming, env-based), tenant
+suspension's second enforcement point for the `stdio` fallback (#106, ADR-0010), and its startup
+transport guard (issue #48 / ADR-0005)."""
 
 from __future__ import annotations
 
@@ -9,9 +9,10 @@ from types import SimpleNamespace
 
 import pytest
 
+import app.db.session as session_module
 from app.config import Settings
+from app.db.session import TenantSuspendedError
 from app.mcp import server as mcp_server
-from app.tenant_suspension import TenantSuspendedError
 from app.token_verifier import set_default_adapter_for_tests
 from tests.conftest import FakeControlPlaneReads
 
@@ -42,28 +43,54 @@ def test_retired_mcp_user_id_setting_is_not_silently_accepted(monkeypatch):
         mcp_server._context_from_env()
 
 
-async def test_resolve_context_rejects_a_suspended_tenant_before_any_tool_runs(monkeypatch):
-    """The MCP connection handler's own, independent suspension check (#69, ADR-0010): raised by
-    `resolve_context()`, which every tool calls instead of reading `_connection_context` directly,
-    before any tool body -- here `search_documents` -- ever runs."""
+async def test_resolve_context_no_longer_checks_suspension_itself(monkeypatch):
+    """`resolve_context()` (#106) carries no suspension check of its own any more -- a
+    per-connection context, however implausible to find suspended (real ones are only ever set by
+    `MCPTenantAuthMiddleware` after `resolve_bearer_context` already refused a suspended tenant),
+    is simply returned unchanged."""
     tenant_id, identity_id = uuid.uuid4(), uuid.uuid4()
     token = mcp_server._connection_context.set(
         SimpleNamespace(tenant_id=tenant_id, identity_id=identity_id)
     )
     try:
         _install_suspended_tenant(tenant_id)
-
-        with pytest.raises(TenantSuspendedError):
-            await mcp_server.resolve_context()
-
-        async def _boom(*args, **kwargs):
-            pytest.fail("search_documents' tool body must not run for a suspended tenant")
-
-        monkeypatch.setattr(mcp_server.document_tools, "search_documents", _boom)
-        with pytest.raises(TenantSuspendedError):
-            await mcp_server.search_documents("query")
+        ctx = await mcp_server.resolve_context()
     finally:
         mcp_server._connection_context.reset(token)
+    assert ctx.tenant_id == tenant_id
+
+
+async def test_stdio_fallback_tool_call_is_refused_by_the_session_layer_when_suspended(
+    monkeypatch,
+):
+    """Suspension's second enforcement point (#106, `app/db/session.py`'s module docstring): the
+    `stdio` transport's env-based context (`_context_from_env`) carries no tenant record, so
+    nothing refuses it at `resolve_context()` -- the first tool call that actually opens a
+    `tenant_session()` (here, the real `document_tools.search_documents`, reached through the
+    real `resolve_context()`/`_masked` chain, not a stand-in) hits `tenant_session()`'s own routing
+    read and raises there instead, and `_masked` lets `TenantSuspendedError` propagate unmasked."""
+    tenant_id, identity_id = uuid.uuid4(), uuid.uuid4()
+    monkeypatch.setattr(
+        mcp_server,
+        "get_settings",
+        lambda: Settings(
+            _env_file=None,
+            mcp_transport="stdio",
+            mcp_tenant_id=str(tenant_id),
+            mcp_identity_id=str(identity_id),
+            **_VALID_KWARGS,
+        ),
+    )
+    assert mcp_server._connection_context.get() is None
+
+    async def _raise_suspended(ctx):
+        assert ctx.tenant_id == tenant_id
+        raise TenantSuspendedError(ctx.tenant_id)
+
+    monkeypatch.setattr(session_module, "_resolve_tenant_alias", _raise_suspended)
+
+    with pytest.raises(TenantSuspendedError):
+        await mcp_server.search_documents("query")
 
 
 def _install_suspended_tenant(tenant_id: uuid.UUID) -> None:

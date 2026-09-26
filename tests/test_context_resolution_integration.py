@@ -88,8 +88,9 @@ ALLOWED_HOST = "mcp.example.com"
 @pytest.fixture(autouse=True)
 def _real_control_plane_reads():
     """Every test in this file drives a real cluster; the suite-wide fake
-    (`tests/conftest.py`'s autouse `not_suspended`) would answer every read from memory and
-    nothing would reach the database at all -- exactly the gap this file exists to close."""
+    (`tests/conftest.py`'s autouse `default_control_plane_reads`) would answer every read from
+    memory and nothing would reach the database at all -- exactly the gap this file exists to
+    close."""
     set_default_adapter_for_tests(None)
     yield
 

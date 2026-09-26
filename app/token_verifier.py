@@ -30,8 +30,8 @@ signature still fails closed the same way it always did.
 subject), and a membership's role -- each previously reached by importing a repository class and
 a session function (`control_session`/`tenant_session`) at module level and calling it directly.
 Those five names are now reached through one object, `ControlPlaneReads`, that `verify_tenant_token`
-accepts as an optional `adapter=` keyword and that `app.tenant_suspension.ensure_tenant_not_
-suspended` (a sixth caller of the same auth-settings read) shares via `default_adapter()` below.
+accepts as an optional `adapter=` keyword and that `app.context_resolution`'s own tenant-record
+read (`_read_tenant_record`, the dev-headers path) shares via `default_adapter()` below.
 `RepositoryControlPlaneReads` is the only place in this module that still imports the real
 repositories and session functions; nothing else here does, and no caller needs to know that.
 Tests install one fake of `ControlPlaneReads` (`tests.conftest.FakeControlPlaneReads`) instead of
@@ -160,13 +160,12 @@ class TenantSuspendedAtVerification(TenantSuspendedError):
 
 
 class ControlPlaneReads(Protocol):
-    """The one seam through which `verify_tenant_token` (and `app.tenant_suspension.
-    ensure_tenant_not_suspended`) reach a tenant's auth settings, an identity, and a membership
-    role (#100), and through which `app.context_resolution` reads the tenant record (#104) --
-    never a repository class or a session function imported directly. Every method
-    takes plain ids/strings and returns a plain value, never a session: an implementation owns its
-    own session/transaction, whatever that means for it (a real database, an in-memory dict for a
-    test)."""
+    """The one seam through which `verify_tenant_token` reaches a tenant's auth settings, an
+    identity, and a membership role (#100), and through which `app.context_resolution` reads the
+    tenant record (#104) -- never a repository class or a session function imported directly.
+    Every method takes plain ids/strings and returns a plain value, never a session: an
+    implementation owns its own session/transaction, whatever that means for it (a real database,
+    an in-memory dict for a test)."""
 
     async def find_identity_by_issuer_and_subject(
         self, *, issuer: str, subject: str
@@ -246,18 +245,18 @@ _test_default_adapter: ControlPlaneReads | None = None
 
 def set_default_adapter_for_tests(adapter: ControlPlaneReads | None) -> None:
     """Test-only hook (#100): installs `adapter` as what `default_adapter()` below returns, for
-    every call to `verify_tenant_token`/`ensure_tenant_not_suspended` that doesn't pass its own
-    `adapter=` explicitly -- the one seam `tests/conftest.py`'s autouse `not_suspended` fixture
-    uses instead of monkeypatching a repository or a session function on this module. Call with
-    `None` to restore the real, repository-backed adapter."""
+    every call to `verify_tenant_token` (and `app.context_resolution`'s own tenant-record read)
+    that doesn't pass its own `adapter=` explicitly -- the one seam `tests/conftest.py`'s autouse
+    `default_control_plane_reads` fixture uses instead of monkeypatching a repository or a session
+    function on this module. Call with `None` to restore the real, repository-backed adapter."""
     global _test_default_adapter
     _test_default_adapter = adapter
 
 
 def default_adapter() -> ControlPlaneReads:
-    """The adapter `verify_tenant_token`/`ensure_tenant_not_suspended` use when no explicit
-    `adapter=` is passed: the test override installed via `set_default_adapter_for_tests` above,
-    if any, else a fresh `RepositoryControlPlaneReads`."""
+    """The adapter `verify_tenant_token` (and `app.context_resolution`'s own tenant-record read)
+    use when no explicit `adapter=` is passed: the test override installed via
+    `set_default_adapter_for_tests` above, if any, else a fresh `RepositoryControlPlaneReads`."""
     if _test_default_adapter is not None:
         return _test_default_adapter
     return RepositoryControlPlaneReads()

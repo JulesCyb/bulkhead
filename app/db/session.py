@@ -76,9 +76,10 @@ _session_factory: async_sessionmaker[AsyncSession] | None = None
 
 
 class TenantSuspendedError(RuntimeError):
-    """Raised by `tenant_session()` (and `app.tenant_suspension.ensure_tenant_not_suspended`,
-    which reuses this same exception type) when `tenant_id` is currently suspended. Callers map
-    this to their own transport's documented rejection status -- 403 for the HTTP API, a tool
+    """Raised when `tenant_id` is currently suspended, by whichever of the two enforcement points
+    (module docstring) actually sees it: `_resolve_tenant_alias` (below, for a record-less
+    context) or `tenant_session()` itself (for a context whose `tenant_record` says so). Callers
+    map this to their own transport's documented rejection status -- 403 for the HTTP API, a tool
     error for the MCP server -- never to a raw 500."""
 
     def __init__(self, tenant_id: UUID) -> None:

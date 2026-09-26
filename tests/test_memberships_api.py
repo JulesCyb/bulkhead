@@ -195,8 +195,8 @@ def _jwt_settings() -> Settings:
 
 def _install_fake_control_plane(*, auth_settings, identities, memberships):
     """Installs one `FakeControlPlaneReads` (#100) as the default adapter both
-    `app.token_verifier.verify_tenant_token` (#44) and `app.tenant_suspension.
-    ensure_tenant_not_suspended` (#69) fall back to -- `app.deps` keeps neither check itself."""
+    `app.token_verifier.verify_tenant_token` (#44) and `app.context_resolution`'s own tenant-record
+    read fall back to -- `app.deps` keeps neither check itself."""
     set_default_adapter_for_tests(
         FakeControlPlaneReads(
             auth_settings=auth_settings, identities=identities, memberships=memberships
