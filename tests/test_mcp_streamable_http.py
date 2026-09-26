@@ -12,10 +12,19 @@ protocol handshakes) is swapped for a tiny fake ASGI app that reports back whate
 exactly at what issue #49 asks for -- the connection's tenant/identity/means resolution -- without
 re-implementing the MCP wire protocol; the tool-invocation path itself (a healthy call, a denied
 call, a masked exception) already has its own dedicated seam in `tests/test_mcp_tool_errors.py`.
+
+Issue #89 closes the gap those two seams left open, separately, between them: neither exercised
+`MCPTenantAuthMiddleware`'s write and a tool's `resolve_context()` read together. The tests below
+`RealWireProtocol` speak the actual MCP Streamable HTTP wire protocol -- JSON-RPC `initialize`,
+`notifications/initialized`, then `tools/call` -- over the real mount, through the real
+`MCPServer.streamable_http_app()` (not the fake above), with `app.tools.documents.search_documents`
+faked only at the tool-function boundary to capture the `RequestContext` it was actually called
+with. No monkeypatching of `context_provider` (it no longer exists) or `_connection_context`.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
@@ -31,6 +40,7 @@ import app.mcp.server as mcp_server
 import app.token_verifier as token_verifier_module
 from app.config import Settings, get_settings
 from app.context import RequestContext
+from app.repositories.documents import DocumentHit
 
 HUMAN_SECRET = "mcp-streamable-http-test-human-secret-32-bytes"
 AGENT_SECRET = "mcp-streamable-http-test-agent-secret-32-bytes!"
@@ -241,3 +251,302 @@ async def test_agent_identity_token_resolves_to_autonomous_use(monkeypatch, mcp_
     assert body["roles"] == ["agent"]
     assert body["means_kind"] == "credential"
     assert body["means_id"] == "agt_abc123"
+
+
+# --- #89: the real wire protocol, real tool dispatch, no fake inner app -----------------------
+
+_MCP_ACCEPT = "application/json, text/event-stream"
+# `MCPServer.streamable_http_app()` auto-enables DNS-rebinding protection when no explicit
+# `host=` is passed (its own default, "127.0.0.1", is exactly the kind of host that triggers it) --
+# `app.mcp.server.build_streamable_http_app` doesn't override it, so the allow-list is the SDK's
+# default (`127.0.0.1`/`localhost`/`::1`, each with any port). Test-only plumbing to satisfy that
+# check; unrelated to #89's own context-resolution fix.
+_DNS_REBIND_SAFE_HOST_HEADER = {"Host": "localhost:80"}
+_INITIALIZE_PARAMS = {
+    "protocolVersion": "2025-06-18",
+    "capabilities": {},
+    "clientInfo": {"name": "bulkhead-test-client", "version": "0.1"},
+}
+
+
+@pytest.fixture
+def mcp_app_real(monkeypatch):
+    """A fresh `create_app()` with the networked MCP transport mounted, its *real*
+    `MCPServer.streamable_http_app()` -- unlike `mcp_app` above, nothing here fakes the inner
+    session-negotiation app: these tests speak the actual wire protocol against it.
+
+    Does *not* itself start `MCPServer.session_manager` -- see `_real_mcp_session` below for why
+    that has to happen inside the same task as the test body, not spread across a fixture's
+    setup/teardown."""
+    from app import main as main_module
+
+    settings = _mcp_settings()
+    monkeypatch.setattr(main_module, "get_settings", lambda: settings)
+    app = main_module.create_app()
+    app.dependency_overrides[get_settings] = lambda: settings
+    return app, settings
+
+
+@asynccontextmanager
+async def _real_mcp_session():
+    """Starts `MCPServer.session_manager` (the anyio task group its Streamable HTTP requests
+    need) for the enclosed block.
+
+    Starlette never starts a *mounted* sub-app's own lifespan on its parent's behalf (`Mount`
+    only matches `scope["type"] in ("http", "websocket")`, never `"lifespan"`) -- the MCP SDK
+    documents exactly this for a mounted `streamable_http_app()`, exposing `MCPServer.
+    session_manager` "to enable advanced use cases like mounting ... in a ... application" so the
+    embedder can run it itself. `httpx.ASGITransport` never sends `lifespan` scope messages at
+    all, so tests enter it explicitly -- test-only wiring, not a change to `app.main`/
+    `app.mcp.server`.
+
+    Used as `async with _real_mcp_session():` directly inside each test body, never as a
+    `pytest.fixture` spanning a `yield`: `session_manager.run()` holds an anyio cancel scope that
+    must exit in the same task it was entered in, and a fixture's setup/teardown can run as two
+    separate tasks under `pytest-asyncio`."""
+    async with mcp_server.server.session_manager.run():
+        yield
+
+
+async def _rpc_call(
+    client: httpx.AsyncClient, path: str, headers: dict, body: dict
+) -> tuple[int, str | None, dict | None]:
+    """POSTs one JSON-RPC message and returns `(status_code, mcp_session_id, payload)`.
+
+    The MCP SDK's `streamable_http_app()` answers a request (as opposed to a notification) over
+    an SSE stream when `json_response` is left at its default `False` -- exactly how
+    `app.mcp.server.build_streamable_http_app` calls it -- so this parses the `data:` line of the
+    single `message` event the server sends for one request, rather than assuming a plain JSON
+    body."""
+    async with client.stream("POST", path, json=body, headers=headers) as response:
+        status_code = response.status_code
+        session_id = response.headers.get("mcp-session-id")
+        content_type = response.headers.get("content-type", "")
+        payload: dict | None = None
+        if "text/event-stream" in content_type:
+            async for line in response.aiter_lines():
+                if line.startswith("data:"):
+                    data = line[len("data:") :].strip()
+                    if data:
+                        payload = json.loads(data)
+        else:
+            raw = await response.aread()
+            if raw:
+                payload = json.loads(raw)
+        return status_code, session_id, payload
+
+
+async def _initialize_session(client: httpx.AsyncClient, path: str, headers: dict) -> dict:
+    """Runs the handshake (`initialize` then `notifications/initialized`) and returns the
+    headers a subsequent `tools/call` on the same session must send."""
+    status_code, session_id, payload = await _rpc_call(
+        client,
+        path,
+        headers,
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": _INITIALIZE_PARAMS},
+    )
+    assert status_code == 200, payload
+    assert session_id, "initialize must hand back an Mcp-Session-Id"
+    session_headers = {**headers, "Mcp-Session-Id": session_id}
+
+    status_code, _, _ = await _rpc_call(
+        client, path, session_headers, {"jsonrpc": "2.0", "method": "notifications/initialized"}
+    )
+    assert status_code == 202
+
+    return session_headers
+
+
+async def _call_search_documents(
+    client: httpx.AsyncClient, path: str, headers: dict, *, request_id: int = 2
+) -> dict:
+    status_code, _, payload = await _rpc_call(
+        client,
+        path,
+        headers,
+        {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/call",
+            "params": {"name": "search_documents", "arguments": {"query": "hello"}},
+        },
+    )
+    assert status_code == 200, payload
+    return payload["result"]
+
+
+def _fixed_hit() -> DocumentHit:
+    return DocumentHit(id=uuid.uuid4(), title="Runbook", snippet="A fixed hit.", score=0.9)
+
+
+async def test_real_wire_protocol_hands_search_documents_the_verified_persons_context(
+    monkeypatch, mcp_app_real
+):
+    """AC1 (person's token): over the real mount, speaking the real wire protocol, the tool
+    receives the context carrying that token's identity and role, and `means.kind == "agent"`."""
+    app, _ = mcp_app_real
+    tenant_id = uuid.uuid4()
+    identity_id = uuid.uuid4()
+    _install_fake_control_plane(
+        monkeypatch,
+        auth_settings={tenant_id: (HUMAN_ISSUER, False)},
+        identities={(HUMAN_ISSUER, "sub-1"): identity_id},
+        memberships={(tenant_id, identity_id): "member"},
+    )
+    token = _make_token(secret=HUMAN_SECRET, issuer=HUMAN_ISSUER, audience=str(tenant_id))
+
+    captured: dict = {}
+
+    async def fake_search_documents(ctx, query, limit=5):
+        captured["ctx"] = ctx
+        return [_fixed_hit()]
+
+    monkeypatch.setattr(mcp_server.document_tools, "search_documents", fake_search_documents)
+
+    path = f"/v1/t/{tenant_id}/mcp/"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": _MCP_ACCEPT,
+        **_DNS_REBIND_SAFE_HOST_HEADER,
+    }
+    transport = httpx.ASGITransport(app=app)
+    async with (
+        _real_mcp_session(),
+        httpx.AsyncClient(transport=transport, base_url="http://localhost") as client,
+    ):
+        session_headers = await _initialize_session(client, path, headers)
+        result = await _call_search_documents(client, path, session_headers)
+
+    assert result["isError"] is False
+    assert "ctx" in captured, "search_documents must have been called"
+    ctx = captured["ctx"]
+    assert ctx.tenant_id == tenant_id
+    assert ctx.identity_id == identity_id
+    assert ctx.has_role("member")
+    assert ctx.means is not None
+    assert ctx.means.kind == "agent"
+
+
+async def test_real_wire_protocol_hands_search_documents_the_agent_identitys_context(
+    monkeypatch, mcp_app_real
+):
+    """AC1 (agent identity's token): same wire protocol, `means.kind == "credential"`."""
+    app, _ = mcp_app_real
+    tenant_id = uuid.uuid4()
+    identity_id = uuid.uuid4()
+    _install_fake_control_plane(
+        monkeypatch,
+        auth_settings={tenant_id: (HUMAN_ISSUER, False)},
+        identities={(mcp_server.AGENT_IDENTITY_ISSUER, "agent-sub-1"): identity_id},
+        memberships={(tenant_id, identity_id): "agent"},
+    )
+    token = _make_token(
+        secret=AGENT_SECRET,
+        issuer=mcp_server.AGENT_IDENTITY_ISSUER,
+        subject="agent-sub-1",
+        audience=str(tenant_id),
+        extra={"cred": "agt_abc123"},
+    )
+
+    captured: dict = {}
+
+    async def fake_search_documents(ctx, query, limit=5):
+        captured["ctx"] = ctx
+        return [_fixed_hit()]
+
+    monkeypatch.setattr(mcp_server.document_tools, "search_documents", fake_search_documents)
+
+    path = f"/v1/t/{tenant_id}/mcp/"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": _MCP_ACCEPT,
+        **_DNS_REBIND_SAFE_HOST_HEADER,
+    }
+    transport = httpx.ASGITransport(app=app)
+    async with (
+        _real_mcp_session(),
+        httpx.AsyncClient(transport=transport, base_url="http://localhost") as client,
+    ):
+        session_headers = await _initialize_session(client, path, headers)
+        result = await _call_search_documents(client, path, session_headers)
+
+    assert result["isError"] is False
+    ctx = captured["ctx"]
+    assert ctx.tenant_id == tenant_id
+    assert ctx.identity_id == identity_id
+    assert ctx.means is not None
+    assert ctx.means.kind == "credential"
+    assert ctx.means.id == "agt_abc123"
+
+
+async def test_two_concurrent_connections_each_see_only_their_own_tenant(monkeypatch, mcp_app_real):
+    """AC2: two concurrent connections for two different tenants -- each `tools/call` sees only
+    its own connection's tenant, never the other's, even though both run through the same shared
+    MCP server instance concurrently (`asyncio.gather`)."""
+    app, _ = mcp_app_real
+    tenant_a, tenant_b = uuid.uuid4(), uuid.uuid4()
+    identity_a, identity_b = uuid.uuid4(), uuid.uuid4()
+    _install_fake_control_plane(
+        monkeypatch,
+        auth_settings={tenant_a: (HUMAN_ISSUER, False), tenant_b: (HUMAN_ISSUER, False)},
+        identities={
+            (HUMAN_ISSUER, "sub-a"): identity_a,
+            (HUMAN_ISSUER, "sub-b"): identity_b,
+        },
+        memberships={(tenant_a, identity_a): "member", (tenant_b, identity_b): "member"},
+    )
+    token_a = _make_token(
+        secret=HUMAN_SECRET, issuer=HUMAN_ISSUER, subject="sub-a", audience=str(tenant_a)
+    )
+    token_b = _make_token(
+        secret=HUMAN_SECRET, issuer=HUMAN_ISSUER, subject="sub-b", audience=str(tenant_b)
+    )
+
+    seen: list = []
+
+    async def fake_search_documents(ctx, query, limit=5):
+        seen.append(ctx)
+        return [_fixed_hit()]
+
+    monkeypatch.setattr(mcp_server.document_tools, "search_documents", fake_search_documents)
+
+    async def _run(tenant_id: uuid.UUID, token: str) -> dict:
+        path = f"/v1/t/{tenant_id}/mcp/"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": _MCP_ACCEPT,
+            **_DNS_REBIND_SAFE_HOST_HEADER,
+        }
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as client:
+            session_headers = await _initialize_session(client, path, headers)
+            return await _call_search_documents(client, path, session_headers)
+
+    async with _real_mcp_session():
+        result_a, result_b = await asyncio.gather(_run(tenant_a, token_a), _run(tenant_b, token_b))
+
+    assert result_a["isError"] is False
+    assert result_b["isError"] is False
+    assert len(seen) == 2
+    seen_by_tenant = {ctx.tenant_id: ctx for ctx in seen}
+    assert seen_by_tenant[tenant_a].identity_id == identity_a
+    assert seen_by_tenant[tenant_b].identity_id == identity_b
+    # Never the other connection's tenant on either call.
+    assert seen_by_tenant[tenant_a].tenant_id != seen_by_tenant[tenant_b].tenant_id
+
+
+async def test_streamable_http_refuses_a_tools_call_with_no_connection_context(monkeypatch):
+    """AC3: under `streamable-http`, a `tools/call` with no per-connection context set is
+    refused -- never served from the environment identity. Exercised directly against
+    `resolve_context()` (the seam `search_documents`/`list_memberships` both call): no HTTP
+    request can reach a tool without `MCPTenantAuthMiddleware` setting the contextvar first, so
+    this is the only way to observe "unset" for this transport."""
+    settings = _mcp_settings()
+    monkeypatch.setattr(mcp_server, "get_settings", lambda: settings)
+    assert mcp_server._connection_context.get() is None
+
+    with pytest.raises(RuntimeError, match="per-connection"):
+        await mcp_server.resolve_context()

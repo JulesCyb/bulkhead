@@ -49,6 +49,15 @@ def _context_with_role(role: str) -> RequestContext:
     return RequestContext(tenant_id=uuid.uuid4(), identity_id=uuid.uuid4(), roles=frozenset({role}))
 
 
+def _set_connection_context(role: str) -> None:
+    """Installs a context on the per-connection contextvar `resolve_context()` reads first
+    (issue #89) -- the seam every tool call in this file goes through instead of the deleted
+    `context_provider` indirection. No explicit teardown: `contextvars.ContextVar.set` only ever
+    mutates the copy of the context `asyncio` gave this test's own task (each `pytest-asyncio`
+    test runs in a fresh task), so it never leaks into another test."""
+    mcp_server._connection_context.set(_context_with_role(role))
+
+
 async def _call(name: str, arguments: dict | None = None):
     params = CallToolRequestParams(name=name, arguments=arguments or {})
     # `None`: see module docstring -- no tool below reads the MCP `Context`.
@@ -58,7 +67,7 @@ async def _call(name: str, arguments: dict | None = None):
 async def test_denied_membership_listing_returns_a_structured_tool_error(monkeypatch):
     """Acceptance criterion 1: a non-admin caller gets a structured tool error, not a raised
     exception past the invocation boundary."""
-    monkeypatch.setattr(mcp_server, "context_provider", lambda: _context_with_role("member"))
+    _set_connection_context("member")
     _install_fake_memberships(monkeypatch, [])
 
     result = await _call("list_memberships")
@@ -71,7 +80,7 @@ async def test_denied_call_names_the_same_missing_role_as_the_http_403(monkeypat
     """Acceptance criterion 3: the same missing-role phrasing the HTTP 403 handler
     (`app.main.handle_permission_error`) puts in its body -- `PermissionError`'s own message,
     matched by `app.main._REQUIRED_ROLE_RE`."""
-    monkeypatch.setattr(mcp_server, "context_provider", lambda: _context_with_role("support"))
+    _set_connection_context("support")
     _install_fake_memberships(monkeypatch, [])
 
     result = await _call("list_memberships")
@@ -84,7 +93,7 @@ async def test_a_denied_call_does_not_affect_a_later_unrelated_call(monkeypatch)
     """Acceptance criterion 2: the same invocation path is exercised for every tool, not a
     special case for `list_memberships` -- a denial on one call leaves the server instance
     healthy for a completely unrelated tool call afterward."""
-    monkeypatch.setattr(mcp_server, "context_provider", lambda: _context_with_role("member"))
+    _set_connection_context("member")
     _install_fake_memberships(monkeypatch, [])
 
     denied = await _call("list_memberships")
@@ -105,7 +114,7 @@ async def test_a_generic_exception_is_masked_and_never_reaches_the_caller(monkey
     (a database error, a model provider's raw error body, anything) comes back as the one generic
     message (`mcp_server.GENERIC_TOOL_ERROR`), never its own text -- the real error is only in the
     server-side log."""
-    monkeypatch.setattr(mcp_server, "context_provider", lambda: _context_with_role("member"))
+    _set_connection_context("member")
 
     async def _boom(ctx, query, limit=5):
         raise RuntimeError('column "secret_column" does not exist -- a raw DB error')
@@ -128,7 +137,7 @@ async def test_a_generic_exception_is_masked_and_never_reaches_the_caller(monkey
 async def test_a_masked_exception_does_not_affect_a_later_unrelated_call(monkeypatch):
     """The wrapper only replaces this one call's outcome -- a completely different, healthy tool
     call on the same server instance afterward is unaffected."""
-    monkeypatch.setattr(mcp_server, "context_provider", lambda: _context_with_role("admin"))
+    _set_connection_context("admin")
     _install_fake_memberships(monkeypatch, [])
 
     async def _boom(ctx, query, limit=5):
@@ -146,7 +155,7 @@ async def test_a_masked_exception_does_not_affect_a_later_unrelated_call(monkeyp
 async def test_admin_call_still_succeeds_through_the_same_wrapper(monkeypatch):
     """The wrapper only intercepts a raised exception -- it never mangles a healthy result."""
     identity_id = uuid.uuid4()
-    monkeypatch.setattr(mcp_server, "context_provider", lambda: _context_with_role("admin"))
+    _set_connection_context("admin")
     _install_fake_memberships(
         monkeypatch,
         [
