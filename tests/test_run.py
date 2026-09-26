@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from pydantic_ai import Agent, DeferredToolRequests, RunContext
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
@@ -28,8 +29,9 @@ from pydantic_ai.toolsets.function import FunctionToolset
 from pydantic_ai.ui.vercel_ai import VercelAIAdapter
 
 from app import observability
-from app.agents.assistant import chat_assistant, one_shot_assistant
+from app.agents.assistant import AssistantDeps, chat_assistant, one_shot_assistant
 from app.agents.run import prepare_run
+from app.agents.writing_tools import writing_tool
 from app.config import Settings
 from app.residency import ResidencyUnresolved
 from app.run_limits import RunDeadlineExceeded
@@ -340,6 +342,65 @@ async def test_every_span_of_either_execution_carries_the_runs_identifiers(
         assert span.attributes["tenant_id"] == str(ctx.tenant_id)
         assert span.attributes["identity_id"] == str(ctx.identity_id)
         assert span.attributes["request_id"] == ctx.request_id
+
+
+# --- The writing_tool decorator (spec A3 / #93, #109) ------------------------------------------
+
+
+def test_writing_tool_decorator_sets_args_validator_to_require_approval() -> None:
+    """`@writing_tool(agent)` alone -- with no other approval wiring at the call site -- produces
+    a tool whose `args_validator` is `require_approval` (ADR-0007), the same object
+    `rename_document` relies on. Proven on a throwaway agent, not `chat_assistant`, so this test
+    says nothing about `rename_document` specifically -- only about what the decorator itself
+    does to *any* function it wraps."""
+    test_agent: Agent[AssistantDeps, str | DeferredToolRequests] = Agent(
+        deps_type=AssistantDeps,
+        name="test-writing-tool-agent",
+        output_type=[str, DeferredToolRequests],
+    )
+
+    @writing_tool(test_agent)
+    async def throwaway(ctx: RunContext[AssistantDeps], x: str) -> str | None:
+        return x
+
+    tool = _function_toolset(test_agent).tools["throwaway"]
+    assert tool.args_validator is require_approval
+
+
+_APP_DIR = Path(__file__).resolve().parent.parent / "app"
+_WRITING_TOOLS_PATH = _APP_DIR / "agents" / "writing_tools.py"
+_APPROVALS_PATH = _APP_DIR / "tools" / "approvals.py"
+
+
+def test_pending_approval_is_read_only_inside_the_writing_tool_decorator() -> None:
+    """`ctx.deps.pending_approval` is read back (`approval = ctx.deps.pending_approval`) only by
+    `app/agents/writing_tools.py`'s decorator -- never by a route or a tool body directly, which
+    would duplicate the wrapper the decorator exists to replace (CLAUDE.md rule 4)."""
+    pattern = re.compile(r"=\s*ctx\.deps\.pending_approval\b")
+    offenders = []
+    for path in sorted(_APP_DIR.rglob("*.py")):
+        if path == _WRITING_TOOLS_PATH:
+            continue
+        text = path.read_text(encoding="utf-8")
+        for match in pattern.finditer(text):
+            offenders.append(f"{path.relative_to(_APP_DIR)}: {match.group(0)!r}")
+    assert offenders == [], offenders
+
+
+def test_pending_approval_is_set_only_in_the_approvals_module() -> None:
+    """`ctx.deps.pending_approval` is set to a real `ApprovalContext` -- the approval hand-off --
+    only by `app/tools/approvals.py::require_approval`. The decorator's own clear
+    (`ctx.deps.pending_approval = None`) is a different thing (module docstring,
+    `app/agents/writing_tools.py`): it never sets a new approval, so it does not match here."""
+    pattern = re.compile(r"ctx\.deps\.pending_approval\s*=\s*ApprovalContext\(")
+    offenders = []
+    for path in sorted(_APP_DIR.rglob("*.py")):
+        if path == _APPROVALS_PATH:
+            continue
+        text = path.read_text(encoding="utf-8")
+        for match in pattern.finditer(text):
+            offenders.append(f"{path.relative_to(_APP_DIR)}: {match.group(0)!r}")
+    assert offenders == [], offenders
 
 
 # --- No test patches a run's collaborators onto a module (spec A3 / #93, #108) ------------------

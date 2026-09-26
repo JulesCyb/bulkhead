@@ -45,6 +45,11 @@ per-tenant extension if a customer demands it.
 
 - Positive: every write has a named person or an admin's explicit grant behind it; the approval
   is bound to what the person actually saw; the mechanism is the library's, not a custom one.
+- Positive (spec A3 / #109): the reading/writing split -- which agent a run binds, and the
+  read/clear/execute/record sequence around a writing tool's body -- lives in one place,
+  `app/agents/run.py`, with the `writing_tool` decorator it re-exports
+  (`app/agents/writing_tools.py`); a second writing tool applies that decorator instead of
+  copying `rename_document`'s former hand-written wrapper.
 - Negative / costs: a pending-action table (tenant-scoped, RLS) and a standing-grant table in
   the tenant; two agents instead of one; every writing tool needs a test that the approval
   binding and the role check hold.

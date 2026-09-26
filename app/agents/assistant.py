@@ -10,7 +10,10 @@
   / #40). Used exclusively by `/v1/t/{tenant_id}/api/chat`, where a conversation and an approval
   round-trip both exist. Its own output type includes `DeferredToolRequests` so a run that pauses
   on the writing tool's approval completes normally with that as its output, rather than raising —
-  see `app/tools/approvals.py` for the approval mechanism itself.
+  see `app/tools/approvals.py` for the approval mechanism itself, and `app/agents/writing_tools.py`
+  for the one decorator (`writing_tool`) that registers a writing tool and wraps its body's
+  read/clear/execute/record sequence -- `rename_document` below applies it and copies nothing by
+  hand (spec A3 / #109; CLAUDE.md rule 4 points here instead of at a "copy this shape" example).
 
 Kept as two separate `Agent` objects (not one agent with a flag) so that wiring a writing tool
 into the one-shot agent is a change to code that doesn't exist, not a config toggle to flip back.
@@ -20,8 +23,9 @@ This module holds the two agents, their instructions, and their tool registratio
 the model from the tenant record (no model is hard-wired here), builds the run limit, the tracing
 capabilities and span attributes, and the `AssistantDeps` below, and its execution method decides
 which of the two agents runs (`answer`/`stream_text` bind `one_shot_assistant`, only `chat` binds
-`chat_assistant`, #108). Tests inject a TestModel/FunctionModel through that module -- no real
-model call.
+`chat_assistant`, #108) -- the reading/writing split lives in that module and in
+`app/agents/writing_tools.py` next to it, never in a route. Tests inject a TestModel/FunctionModel
+through that module -- no real model call.
 
 - `AssistantDeps` is internal to a run: what the tools read from `ctx.deps`, constructed by
   `app.agents.run.prepare_run` and never by a route.
@@ -34,16 +38,20 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from pydantic_ai import Agent, DeferredToolRequests, RunContext
 from pydantic_ai.messages import ModelMessage
 
+from app.agents.writing_tools import writing_tool
 from app.context import RequestContext
 from app.repositories.documents import DocumentHit
 from app.tools import conversations as conversation_tools
 from app.tools import documents as document_tools
-from app.tools.approvals import ApprovalContext, record_write_outcome, require_approval
+
+if TYPE_CHECKING:
+    from app.tools.approvals import ApprovalContext
 
 SearchFn = Callable[[RequestContext, str, int], Awaitable[list[DocumentHit]]]
 LoadHistoryFn = Callable[[RequestContext, str], Awaitable[list[ModelMessage]]]
@@ -75,9 +83,10 @@ class AssistantDeps:
     # tool, so it never needs this).
     conversation_id: str | None = None
     # Set by `app.tools.approvals.require_approval` just before it lets a writing tool's body run,
-    # and read (then left for the next call to overwrite) by that tool's own body to record its
-    # `executed`/`failed_to_execute` outcome (`app.tools.approvals.record_write_outcome`). Never
-    # set by anything else.
+    # and read (then cleared for the next call) only by `app.agents.writing_tools.writing_tool`'s
+    # own wrapper, which records the `executed`/`failed_to_execute` outcome
+    # (`app.tools.approvals.record_write_outcome`) around the body itself. Never set or read by
+    # anything else.
     pending_approval: ApprovalContext | None = None
     # Tracing (Spec 8 / #62, ADR-0008): the preparation takes both from the tenant record its
     # context carries (`app.observability.resolve_tenant_tracing`, #105 -- no database read) and
@@ -132,17 +141,19 @@ def _register_writing_tools(agent: Agent[AssistantDeps, str | DeferredToolReques
     the module docstring: wiring a writing tool into the reading-only one-shot agent is a change
     to code that does not exist here, not a config toggle to flip back.
 
-    `args_validator=require_approval` is what makes this tool require approval at all: it is the
-    two-pass hook `app/tools/approvals.py` needs to write a pending action down *before* the
-    model's `DeferredToolRequests` output can reach a client, and to re-verify that approval, at
-    execution time, against the database rather than the resumed request itself. A future writing
-    tool copies this shape verbatim -- `args_validator=require_approval`, and a body that reads
-    `ctx.deps.pending_approval`, does its one repository call, then reports the outcome through
-    `record_write_outcome`.
+    `@writing_tool(agent)` (`app/agents/writing_tools.py`) is what makes this tool require
+    approval at all and what the "future writing tool" comment used to describe by hand: it
+    registers `args_validator=require_approval` -- the two-pass hook `app/tools/approvals.py`
+    needs to write a pending action down *before* the model's `DeferredToolRequests` output can
+    reach a client, and to re-verify that approval, at execution time, against the database rather
+    than the resumed request itself -- and wraps the body's read/clear/execute/record sequence, so
+    a future writing tool applies the same decorator instead of copying that sequence by hand.
     """
 
-    @agent.tool(args_validator=require_approval)
-    async def rename_document(ctx: RunContext[AssistantDeps], document_id: str, title: str) -> str:
+    @writing_tool(agent)
+    async def rename_document(
+        ctx: RunContext[AssistantDeps], document_id: str, title: str
+    ) -> str | None:
         """Renames one of the tenant's documents. Requires an approval from the asking member
         before it runs (ADR-0007).
 
@@ -150,18 +161,11 @@ def _register_writing_tools(agent: Agent[AssistantDeps, str | DeferredToolReques
             document_id: The id (UUID) of the document to rename.
             title: The new title.
         """
-        approval = ctx.deps.pending_approval
-        ctx.deps.pending_approval = None
-        try:
-            renamed = await document_tools.rename_document(
-                ctx.deps.ctx, document_id=UUID(document_id), title=title
-            )
-        except Exception:
-            await record_write_outcome(ctx.deps.ctx, approval, success=False)
-            raise
-        await record_write_outcome(ctx.deps.ctx, approval, success=renamed is not None)
+        renamed = await document_tools.rename_document(
+            ctx.deps.ctx, document_id=UUID(document_id), title=title
+        )
         if renamed is None:
-            return f"No document {document_id!r} was found to rename."
+            return None
         return f"Renamed document {document_id!r} to {title!r}."
 
 

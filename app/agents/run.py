@@ -1,5 +1,12 @@
 """One agent run, prepared once (spec A3 / #93, #107): the one narrative of what a run is.
 
+The reading/writing split (ADR-0007) lives here and in `app/agents/writing_tools.py` next to it:
+`AssistantDeps` (built only by `prepare_run`, below) is internal to a run, and its
+`pending_approval` slot is read and cleared by exactly one thing -- the `writing_tool` decorator
+this module re-exports (#109) -- never by a route or a tool body directly. A writing tool applies
+`@writing_tool(chat_assistant)` (`app/agents/assistant.py`'s `rename_document` is the worked
+example) instead of copying that read/clear/execute/record sequence by hand.
+
 A route (or any future entry point, e.g. a jobs API) calls `prepare_run(ctx)` with the context
 it already resolved -- carrying the tenant record read once at context resolution (#104/#105) --
 and gets a `PreparedRun` back. Preparation does, in this order and exactly once per run:
@@ -116,6 +123,7 @@ from app.agents.assistant import (
     chat_assistant,
     one_shot_assistant,
 )
+from app.agents.writing_tools import writing_tool
 from app.context import RequestContext
 from app.llm import resolve_tenant_chat_model
 from app.observability import (
@@ -434,4 +442,5 @@ __all__ = [
     "chat_adapter_from_request",
     "prepare_run",
     "set_run_collaborators_for_tests",
+    "writing_tool",
 ]

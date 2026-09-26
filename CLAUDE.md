@@ -139,11 +139,16 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    `asyncio.run(run_operator(argv))` — that `scripts/operator.py` calls.
 4. **Agents access data only through tools** (`app/tools/`) that check the context and return only
    what is needed. Never a DB connection or credentials to the model. **Every writing tool
-   requires approval** (ADR-0007, Spec 5): mark it with `args_validator=require_approval`
-   (`app/tools/approvals.py`) exactly as the one worked example, `rename_document`
-   (`app/tools/documents.py`, registered on `chat_assistant` in `app/agents/assistant.py`), does.
-   Before the member ever sees the request, the server writes a **pending action** — tenant,
-   conversation, tool, a hash of the exact arguments, the asking membership, an expiry — and the
+   requires approval** (ADR-0007, Spec 5): apply the `writing_tool` decorator
+   (`app/agents/writing_tools.py`, re-exported by `app/agents/run.py` -- the module that owns the
+   reading/writing split, #109) exactly as the one worked example, `rename_document`
+   (`app/agents/assistant.py`), does. The decorator registers `args_validator=require_approval`
+   (`app/tools/approvals.py`) and wraps the body's read/clear/execute/record sequence, so a
+   derived project's own first writing tool applies the decorator and writes nothing else of the
+   approval mechanism -- no read of `ctx.deps.pending_approval`, no call to
+   `record_write_outcome`, of its own. Before the member ever sees the request, the server writes
+   a **pending action** — tenant, conversation, tool, a hash of the exact arguments, the asking
+   membership, an expiry — and the
    member's answer is checked against *that stored record*, never against whatever the client
    sends back; a mismatching hash or an expired record fails closed. The tool re-checks the
    acting membership's role a second time, fresh, at the moment it actually executes — minutes
