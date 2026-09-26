@@ -44,7 +44,6 @@ from app.observability import instrumentation_capabilities, tenant_span_attribut
 from app.repositories.documents import DocumentHit
 from app.residency import ResidencyUnresolved
 from app.run_limits import RunLimits, build_run_limits, run_deadline
-from app.tenant_suspension import ensure_tenant_not_suspended
 from app.tools import conversations as conversation_tools
 from app.tools import documents as document_tools
 from app.tools.approvals import ApprovalContext, record_write_outcome, require_approval
@@ -213,11 +212,12 @@ async def resolve_chat_model(deps: AssistantDeps) -> Model:
 async def run_assistant(prompt: str, deps: AssistantDeps, limits: RunLimits | None = None) -> str:
     """Runs the one-shot (reading-only) agent — backs `/v1/t/{tenant_id}/agents/assistant/run`.
 
-    Checks suspension itself (Spec 9 / #69, ADR-0010), independently of whatever context-building
-    layer called it — this is "the agent-run entry point" ADR-0010 names alongside the HTTP API
-    and the MCP server, not merely a route behind one of deps.py's checks.
+    Checks suspension nowhere in this function (#106, ADR-0010): suspension has exactly two
+    enforcement points now -- context resolution, which refuses a suspended tenant's record before
+    `deps.ctx` is ever built, and `tenant_session()`'s own routing read, which a tool's repository
+    call still hits for a context that carries no record at all (a job, a test). This entry point
+    no longer duplicates either check.
     """
-    await ensure_tenant_not_suspended(deps.ctx.tenant_id)
     limits = limits or build_run_limits()
     model = await resolve_chat_model(deps)
     capabilities = instrumentation_capabilities(deps.residency, deps.content_tracing_opt_in)
@@ -244,8 +244,8 @@ async def stream_assistant(
 
     Backs `/v1/t/{tenant_id}/agents/assistant/stream` — runs the one-shot (reading-only) agent.
 
-    Checks suspension itself (Spec 9 / #69, ADR-0010) before ever opening the underlying stream —
-    see `run_assistant`'s docstring for why this is independent of the context-building layer.
+    Checks suspension nowhere in this function (#106, ADR-0010) — see `run_assistant`'s docstring
+    for the two enforcement points that cover it instead.
 
     Does NOT itself enforce the run's wall-clock deadline, and does NOT itself wrap
     `tenant_span_attributes` (Spec 8 / #62): both must bound the full open-and-consume lifecycle
@@ -260,7 +260,6 @@ async def stream_assistant(
     catches it inside its own streaming generator and emits a mapped SSE error event instead of a
     raw exception on an already-started stream.
     """
-    await ensure_tenant_not_suspended(deps.ctx.tenant_id)
     limits = limits or build_run_limits()
     model = await resolve_chat_model(deps)
     capabilities = instrumentation_capabilities(deps.residency, deps.content_tracing_opt_in)

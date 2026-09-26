@@ -500,6 +500,78 @@ def test_claude_md_per_table_rule_names_conversations_retention_with_no_exceptio
     assert "90" in section
 
 
+# --- Spec A2's closing ticket (#106): suspension has exactly two enforcement points -------------
+
+SESSION_SOURCE = (REPO_ROOT / "app" / "db" / "session.py").read_text(encoding="utf-8")
+ASSISTANT_SOURCE = (REPO_ROOT / "app" / "agents" / "assistant.py").read_text(encoding="utf-8")
+CHAT_SOURCE = (REPO_ROOT / "app" / "api" / "chat.py").read_text(encoding="utf-8")
+RETENTION_SOURCE = (REPO_ROOT / "app" / "retention.py").read_text(encoding="utf-8")
+
+
+def test_ensure_tenant_not_suspended_is_fully_removed() -> None:
+    """#106's acceptance criterion 1: the standalone suspension module and every explicit call to
+    it are gone -- the six-entry-point pattern ADR-0010 describes as "checked on every request" no
+    longer means six independent reads, it means the two enforcement points below."""
+    for path in (REPO_ROOT / "app").rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        assert "ensure_tenant_not_suspended" not in text, f"still referenced in {path}"
+        assert "tenant_suspension" not in text, f"still referenced in {path}"
+    assert not (REPO_ROOT / "app" / "tenant_suspension.py").exists()
+
+
+def test_claude_md_retention_bullet_states_the_job_skips_suspended_tenants() -> None:
+    rule_2 = next(line for line in CLAUDE_MD.splitlines() if line.strip().startswith("2. **Every"))
+    section_start = CLAUDE_MD.index(rule_2)
+    section_end = CLAUDE_MD.index("\n3. ", section_start)
+    section = " ".join(CLAUDE_MD[section_start:section_end].split())
+
+    assert "skips a suspended tenant" in section
+    assert "two enforcement points" in section
+
+
+def test_session_layer_docstring_describes_the_two_suspension_enforcement_points() -> None:
+    """The session layer's own docstring (`app/db/session.py`) is the one place that must state
+    plainly that suspension has exactly two enforcement points -- context resolution for a
+    request, and `tenant_session()`'s own routing read for a caller that carries no record."""
+    assert "one enforcement per path" in SESSION_SOURCE
+    assert "context_resolution" in SESSION_SOURCE
+    assert "TenantSuspendedError" in SESSION_SOURCE
+
+
+RETIRED_SUSPENSION_CLAIM_PHRASES = [
+    "independent check at every entry point",
+    "checks suspension itself",
+    "its own, independent check",
+    "independently of whatever context-building",
+    "independently of whatever `tenant_session()` will separately",
+    "own suspension check",
+]
+
+
+def test_no_app_comment_still_claims_an_independent_check_at_every_entry_point() -> None:
+    """#106: the "independent check at every entry point" framing (ADR-0010's six call sites) is
+    retired along with the calls themselves -- no comment anywhere in `app/` may still describe
+    the old, six-independent-reads model."""
+    for path in (REPO_ROOT / "app").rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        for phrase in RETIRED_SUSPENSION_CLAIM_PHRASES:
+            assert phrase not in text, f"retired claim {phrase!r} still present in {path}"
+
+
+def test_assistant_and_chat_modules_no_longer_claim_their_own_suspension_check() -> None:
+    """`run_assistant`/`stream_assistant` (`app/agents/assistant.py`) and the chat route
+    (`app/api/chat.py`) used to each document their own suspension check (Spec 9 / #69) -- #106
+    removed the check itself, so neither module's docstrings/comments may still claim one."""
+    for source in (ASSISTANT_SOURCE, CHAT_SOURCE):
+        assert "ensure_tenant_not_suspended" not in source
+        assert "tenant_suspension" not in source
+
+
+def test_retention_module_documents_skipping_suspended_tenants() -> None:
+    assert "skipped" in RETENTION_SOURCE.lower() or "skip" in RETENTION_SOURCE.lower()
+    assert "suspended" in RETENTION_SOURCE.lower()
+
+
 def test_claude_md_and_readme_document_the_retention_script_command() -> None:
     assert "scripts/retention.py" in CLAUDE_MD
     assert "scripts/retention.py" in README

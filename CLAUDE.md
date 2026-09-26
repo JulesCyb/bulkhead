@@ -106,7 +106,14 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    `app/tenant_settings.py`) when it has never set one, measured from `last_activity_at`. The
    retention job (`app/retention.py`, run via `scripts/retention.py`) deletes what that period
    expires, one tenant at a time, through the same `tenant_session(ctx)` every other request uses
-   — never a superuser or bypass-RLS statement against either table.
+   — never a superuser or bypass-RLS statement against either table. It builds each tenant's own
+   record first (the same one-per-tenant read rule 1 describes for a request) and skips a
+   suspended tenant outright on it — one log line, no `tenant_session()` opened for it (#106) —
+   rather than letting `tenant_session()`'s own suspension check raise mid-sweep and abort the
+   whole run. Suspension has exactly two enforcement points project-wide (`app/db/session.py`'s
+   module docstring: context resolution for a request, `tenant_session()`'s own routing read for a
+   record-less caller); a job that already holds a record, like this one, decides suspension on it
+   directly rather than adding a third, independent check.
 3. **DB access only through repositories** (`app/repositories/`) with sessions from
    `tenant_session(ctx)`. `tenant_session(ctx)` resolves which engine to use internally, from the
    tenant's isolation tier and database alias in the control plane (ADR-0002) — pooled by

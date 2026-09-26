@@ -64,9 +64,9 @@ def _install_fake_control_plane(*, auth_settings, identities, memberships):
     `identities`: {(issuer, subject): identity_id}. `memberships`: {(tenant_id, identity_id): role}.
 
     Installs one `FakeControlPlaneReads` (#100) as the default adapter both
-    `app.tenant_suspension.ensure_tenant_not_suspended` (issue #69) and
-    `app.token_verifier.verify_tenant_token` (issue #44) fall back to — `app.deps` calls into
-    both, and keeps no copy of either check itself.
+    `app.token_verifier.verify_tenant_token` (issue #44) and `app.context_resolution`'s own
+    tenant-record read fall back to — `app.deps` calls into both, and keeps no copy of either
+    check itself.
     """
     set_default_adapter_for_tests(
         FakeControlPlaneReads(

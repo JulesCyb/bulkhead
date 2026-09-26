@@ -58,9 +58,10 @@ pgserver = pytest.importorskip("pgserver")
 def _real_control_plane_reads():
     """This file's tests call `verify_tenant_token` directly against a real, ephemeral Postgres
     cluster and need its real, repository-backed `ControlPlaneReads` -- never the suite-wide fake
-    `tests/conftest.py`'s autouse `not_suspended` fixture installs by default (#100). Restores the
-    real adapter for the duration of every test in this file; `not_suspended`'s own teardown
-    already restores it process-wide afterward regardless."""
+    `tests/conftest.py`'s autouse `default_control_plane_reads` fixture installs by default
+    (#100). Restores the real adapter for the duration of every test in this file;
+    `default_control_plane_reads`'s own teardown already restores it process-wide afterward
+    regardless."""
     set_default_adapter_for_tests(None)
     yield
 

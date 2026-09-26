@@ -18,11 +18,15 @@ guarded at startup by `check_mcp_mode` below the same way `AUTH_MODE=dev-headers
 `app.main.check_auth_mode`.
 
 Every tool resolves its context through `resolve_context()`, never `_connection_context` or
-`_context_from_env` directly (Spec 9 / #69, ADR-0010, issue #89): it builds the context (per
-connection first, env fallback only under `stdio`), then checks suspension
-(`app.tenant_suspension.ensure_tenant_not_suspended`) before any tool body runs -- the MCP
-connection handler's own, independent check, alongside the HTTP API's (`app/deps.py`) and the
-agent-run entry points' (`app/agents/assistant.py`).
+`_context_from_env` directly (ADR-0010, issue #89): it builds the context (per connection first,
+env fallback only under `stdio`) and returns it -- no suspension check of its own (#106).
+Suspension has exactly two enforcement points project-wide (`app/db/session.py`'s module
+docstring): a per-connection context already carries the record `MCPTenantAuthMiddleware`'s call
+to `app.context_resolution.resolve_bearer_context` read and refused a suspended tenant on, before
+`_connection_context` was ever set; the `stdio` fallback's env-based context carries no record at
+all, so the first tool call that opens a `tenant_session()` -- `document_tools.search_documents`,
+`membership_tools.list_memberships` -- hits that function's own routing read and raises there
+instead.
 
 Start (stdio, e.g. in Claude Code's .mcp.json):
     uv run python -m app.mcp.server
@@ -76,8 +80,8 @@ from starlette.responses import JSONResponse
 from app import context_resolution
 from app.config import Settings, get_settings
 from app.context import RequestContext
+from app.db.session import TenantSuspendedError
 from app.startup_checks import run_startup_checks
-from app.tenant_suspension import TenantSuspendedError, ensure_tenant_not_suspended
 from app.tools import documents as document_tools
 from app.tools import memberships as membership_tools
 
@@ -129,7 +133,10 @@ async def resolve_context() -> RequestContext:
     contextvar exists to prevent, and `check_mcp_mode` below separately refuses to even start
     with those two settings present under this transport).
 
-    Either way, rejects a suspended tenant before any tool body runs (Spec 9 / #69, ADR-0010).
+    No suspension check of its own (#106): the per-connection branch already carries the record
+    `resolve_bearer_context` read and refused a suspended tenant on; the `stdio` fallback carries
+    no record at all, so the first tool call that opens a `tenant_session()` is what refuses it
+    (module docstring above).
     """
     ctx = _connection_context.get()
     if ctx is None:
@@ -141,7 +148,6 @@ async def resolve_context() -> RequestContext:
                 "MCP_TRANSPORT=streamable-http there is no environment fallback."
             )
         ctx = _context_from_env()
-    await ensure_tenant_not_suspended(ctx.tenant_id)
     return ctx
 
 
@@ -158,11 +164,12 @@ def _masked(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
     `MCPServer._handle_call_tool`'s own catch-all (which otherwise answers with the exception's
     own `str(e)` -- see that method's source). `PermissionError` is deliberately let through
     unmasked: issue #27 already relies on its exact message (the missing role) reaching the
-    caller, the same way the HTTP API's 403 body names it. `TenantSuspendedError` (issue #69) is
-    the same kind of controlled, expected rejection -- `resolve_context()` above already raises it
-    before this wrapper's own function body ever runs, and every other place a context is resolved
-    (`app/deps.py`, `app/api/chat.py`, `app/api/agents.py`) lets it propagate as itself rather than
-    folding it into a generic 500/masked error."""
+    caller, the same way the HTTP API's 403 body names it. `TenantSuspendedError` is the same kind
+    of controlled, expected rejection (#106): a `stdio`-fallback tool call raises it from inside
+    `tenant_session()` the moment its own body opens one (no record to have refused it earlier),
+    and every other place a context is resolved (`app/deps.py`, `app/api/chat.py`,
+    `app/api/agents.py`) lets it propagate as itself rather than folding it into a generic
+    500/masked error."""
 
     @functools.wraps(fn)
     async def wrapper(*args: Any, **kwargs: Any) -> Any:

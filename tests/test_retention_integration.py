@@ -392,3 +392,54 @@ async def test_retention_script_entry_point_runs_end_to_end(
     await retention_script._main()
 
     assert await _conversation_ids(database_urls["superuser"], tenant) == ["conv-fresh"]
+
+
+async def test_a_suspended_tenants_conversations_are_untouched_by_the_job(
+    app_settings, database_urls
+):
+    """#106, ADR-0010: a suspended tenant is skipped outright (one log line, no `tenant_session()`
+    opened for it) rather than raising `TenantSuspendedError` mid-sweep -- its own expired
+    conversation survives the run untouched, and it is not counted among the returned outcomes,
+    while an unsuspended tenant in the very same run is swept normally."""
+    now = datetime.now(UTC)
+    suspended = await _seed_tenant(database_urls["superuser"], name="Suspended")
+    active = await _seed_tenant(database_urls["superuser"], name="Active")
+    identity_suspended = await _seed_identity(database_urls["superuser"])
+    identity_active = await _seed_identity(database_urls["superuser"])
+    await _seed_conversation(
+        database_urls["superuser"],
+        tenant_id=suspended,
+        identity_id=identity_suspended,
+        conversation_id="conv-suspended-expired",
+        last_activity_at=now - timedelta(days=DEFAULT_RETENTION_DAYS + 30),
+    )
+    await _seed_conversation(
+        database_urls["superuser"],
+        tenant_id=active,
+        identity_id=identity_active,
+        conversation_id="conv-active-expired",
+        last_activity_at=now - timedelta(days=DEFAULT_RETENTION_DAYS + 30),
+    )
+
+    engine = create_async_engine(database_urls["superuser"])
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE control.tenants SET suspended_at = now() WHERE tenant_id = :tid"),
+            {"tid": suspended},
+        )
+    await engine.dispose()
+
+    engine = create_async_engine(database_urls["migrations"])
+    try:
+        async with engine.begin() as conn:
+            outcomes = await run_retention_job(conn)
+    finally:
+        await engine.dispose()
+
+    assert suspended not in {o.tenant_id for o in outcomes}
+    assert {o.tenant_id: o.deleted for o in outcomes}[active] == 1
+
+    assert await _conversation_ids(database_urls["superuser"], suspended) == [
+        "conv-suspended-expired"
+    ]
+    assert await _conversation_ids(database_urls["superuser"], active) == []
