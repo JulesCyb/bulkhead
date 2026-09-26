@@ -51,8 +51,11 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
 
 ## Architecture rules — non-negotiable
 
-1. **Context object**: `RequestContext(tenant_id, identity_id, roles)` is created in `app/deps.py` and
-   passed through every request, agent run, tool call, and job. No global state.
+1. **Context object**: `RequestContext(tenant_id, identity_id, roles)` is created in
+   `app/context_resolution.py` -- the one chain (bearer parsing, per-issuer key/algorithm
+   pinning, audience against the path, membership, suspension, means) that returns a context or a
+   typed `ContextRejection`; `app/deps.py` is only its HTTP adapter -- and passed through every
+   request, agent run, tool call, and job. No global state.
 1a. **Roles gate actions, never visibility** (ADR-0004): a role check is `ctx.require_role(role)`,
    called at the top of a tool (`app/tools/`) or a route (`app/api/`) — before any data access —
    never inside a repository's read path (`app/repositories/`), since RLS already handles the only
@@ -148,9 +151,10 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    algorithm — this holds only its public key); an agent identity's token is minted by this
    application itself and checked against `AGENT_TOKEN_SIGNING_KEY` (or
    `AGENT_TOKEN_VERIFICATION_KEY`)/`AGENT_TOKEN_ALGORITHM` (default `HS256`, since this process is
-   both signer and verifier here). `app.deps.get_key_source`/`get_algorithm_source` pin the pair
-   per issuer (never per what the token's own header claims) — do not point `JWT_ALGORITHM` at an
-   agent token's algorithm or vice versa; see `.env.example`'s `AGENT_TOKEN_*` block and
+   both signer and verifier here). `app.context_resolution.key_source_for`/`algorithm_source_for`
+   (aliased as `app.deps.get_key_source`/`get_algorithm_source`) pin the pair per issuer (never
+   per what the token's own header claims) — do not point `JWT_ALGORITHM` at an agent token's
+   algorithm or vice versa; see `.env.example`'s `AGENT_TOKEN_*` block and
    `docs/mcp-connection.md` for the full table. See
    [`docs/mcp-connection.md`](docs/mcp-connection.md) for connecting a client or issuing a
    credential.
@@ -209,7 +213,8 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
 app/main.py           app factory, CORS, routers
 app/config.py         settings (process-wide; tenant-specific things live in tenants.settings)
 app/context.py        RequestContext
-app/deps.py           context from the request, tenant-bound session
+app/deps.py           context from the request (HTTP adapter), tenant-bound session
+app/context_resolution.py  path tenant + authorization -> RequestContext or ContextRejection (one chain, every adapter)
 app/db/               engine, tenant_session(), models
 app/repositories/     data access (the only path to the DB)
 app/tools/            tool functions (agent + MCP)

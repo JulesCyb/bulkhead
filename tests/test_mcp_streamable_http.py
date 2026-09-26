@@ -43,7 +43,7 @@ import app.deps as deps_module
 import app.mcp.server as mcp_server
 from app.config import Settings, get_settings
 from app.repositories.documents import DocumentHit
-from app.token_verifier import set_default_adapter_for_tests
+from app.token_verifier import AGENT_IDENTITY_ISSUER, set_default_adapter_for_tests
 from tests.conftest import FakeControlPlaneReads
 
 HUMAN_SECRET = "mcp-streamable-http-test-human-secret-32-bytes"
@@ -214,12 +214,12 @@ async def test_agent_identity_token_resolves_to_autonomous_use(mcp_app):
     identity_id = uuid.uuid4()
     _install_fake_control_plane(
         auth_settings={tenant_id: (HUMAN_ISSUER, False)},
-        identities={(mcp_server.AGENT_IDENTITY_ISSUER, "agent-sub-1"): identity_id},
+        identities={(AGENT_IDENTITY_ISSUER, "agent-sub-1"): identity_id},
         memberships={(tenant_id, identity_id): "agent"},
     )
     token = _make_token(
         secret=AGENT_SECRET,
-        issuer=mcp_server.AGENT_IDENTITY_ISSUER,
+        issuer=AGENT_IDENTITY_ISSUER,
         subject="agent-sub-1",
         audience=str(tenant_id),
         extra={"cred": "agt_abc123"},
@@ -421,12 +421,12 @@ async def test_real_wire_protocol_hands_search_documents_the_agent_identitys_con
     identity_id = uuid.uuid4()
     _install_fake_control_plane(
         auth_settings={tenant_id: (HUMAN_ISSUER, False)},
-        identities={(mcp_server.AGENT_IDENTITY_ISSUER, "agent-sub-1"): identity_id},
+        identities={(AGENT_IDENTITY_ISSUER, "agent-sub-1"): identity_id},
         memberships={(tenant_id, identity_id): "agent"},
     )
     token = _make_token(
         secret=AGENT_SECRET,
-        issuer=mcp_server.AGENT_IDENTITY_ISSUER,
+        issuer=AGENT_IDENTITY_ISSUER,
         subject="agent-sub-1",
         audience=str(tenant_id),
         extra={"cred": "agt_abc123"},

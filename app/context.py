@@ -1,10 +1,11 @@
 """The context object: who is acting, for which tenant.
 
-Built once per HTTP request (`app/deps.py`) and once per MCP connection -- `streamable-http`
-builds one per connection from a verified bearer token (`app/mcp/server.py`'s
-`MCPTenantAuthMiddleware`/`_actor_context`); `stdio` builds one process-wide from the
-`MCP_TENANT_ID`/`MCP_IDENTITY_ID` dev fallback (`_context_from_env`), never per connection, since
-`stdio` is a single local development client (ADR-0005). Either way it is then passed through the
+Built once per HTTP request and once per MCP connection by `app/context_resolution.py` (#101;
+`app/deps.py` is its HTTP adapter) -- `streamable-http` builds one per connection from a verified
+bearer token (`app/mcp/server.py`'s `MCPTenantAuthMiddleware`, via `actor_context`); `stdio`
+builds one process-wide from the `MCP_TENANT_ID`/`MCP_IDENTITY_ID` dev fallback
+(`_context_from_env`), never per connection, since `stdio` is a single local development client
+(ADR-0005). Either way it is then passed through the
 agent run, every tool call, and every repository call -- an agent run receives exactly the
 context its caller (the HTTP route or the MCP tool) already built, never one of its own. Nothing
 reads tenant or identity from global state.

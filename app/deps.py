@@ -1,211 +1,76 @@
 """FastAPI dependencies: context from the request, a tenant-bound DB session.
 
-Every tenant-scoped route lives under `/v1/t/{tenant_id}/` (ADR-0012) — the tenant id in the
-URL path is the request's sole statement of intent; nothing else may name the tenant, so no
-stray client-supplied header can override it.
+Every tenant-scoped route lives under `/v1/t/{tenant_id}/` (ADR-0012) -- the tenant id in the
+URL path is the request's sole statement of intent; nothing else may name the tenant.
 
-AUTH_MODE=dev-headers reads X-Identity-Id / X-Roles from the headers — for local development
-ONLY. X-Roles is a development-only convenience that lets a caller assert its own roles
-directly; it has no production equivalent — under AUTH_MODE=jwt, roles come from exactly one
-place, the caller's membership row, never from a client-supplied header.
-
-AUTH_MODE=jwt (issue #24, ADR-0003, ADR-0012) checks, in this order:
-
-1. A bearer token is present and its signature, issuer, and expiry verify (`app/jwt_verifier.py`,
-   no database involved) — otherwise 401 Unauthorized. An unconfigured token issuer or
-   verification key also lands here: nothing to verify a signature against is the same as no
-   valid signature.
-2. The token's audience names the same tenant as the URL path — otherwise 403 Forbidden.
-3. The (issuer, subject) the token names is on file as a known identity
-   (`control.identity_lookup`) — otherwise 403 Forbidden.
-4. That identity has a membership in that tenant (`memberships`, read inside the tenant's own
-   context — no RLS bypass needed: no row means 403) — otherwise 403 Forbidden. This is also
-   what makes a path naming a tenant that does not exist at all behave identically to one naming
-   a tenant the caller simply isn't a member of: neither has a membership row.
-
-Checks 1-4 above are delegated to `app/token_verifier.py::verify_tenant_token` (issue #44) — a
-module with no FastAPI/HTTP dependency of its own, so a second caller (the MCP transport, Spec 6)
-can reuse the exact same check instead of a second implementation of it.
-
-5. The tenant is not suspended (`control.tenant_auth_settings`) — otherwise 403 Forbidden. This
-   check is *not* part of the shared module above; it is enforced here, directly, the same way
-   every other place that resolves a context enforces it (issue #69).
-
-Every step-2-through-5 rejection returns the exact same generic body (`FORBIDDEN_DETAIL` below)
-and is logged as a security event (`app/deps.py`'s `log`) naming the reason, the tenant id, the
-issuer, and a request id — never the raw token — so the specific reason is discoverable only
-from the log, never from the response.
+`get_context` is the HTTP adapter of `app/context_resolution.py` (#101), which owns the whole
+chain under both `AUTH_MODE` values -- bearer parsing, token verification with per-issuer key and
+algorithm pinning, audience against the path, identity, membership, suspension, and the means --
+and returns either a `RequestContext` or a `ContextRejection`. This module only reads the
+request's inputs, renders a rejection as an `HTTPException` (logging a forbidden one as the
+`jwt_auth_forbidden` security event, never the token), and stashes the context on
+`request.state` for the exception handlers and the request-id middleware in `app/main.py`.
 """
 
 from __future__ import annotations
 
 import logging
-import uuid
 from collections.abc import AsyncIterator
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import Depends, Header, HTTPException, Path, Request, status
+from fastapi import Depends, Header, HTTPException, Path, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import context_resolution
 from app.config import Settings, get_settings
 from app.context import RequestContext
+from app.context_resolution import FORBIDDEN_DETAIL, ContextRejection
 from app.db.session import tenant_session
-from app.jwt_verifier import KeySource, TokenVerificationError
-from app.tenant_suspension import TenantSuspendedError, ensure_tenant_not_suspended
-from app.token_verifier import (
-    AGENT_IDENTITY_ISSUER,
-    AlgorithmSource,
-    TenantTokenVerificationError,
-    VerificationFailureReason,
-    verify_tenant_token,
-)
+from app.jwt_verifier import KeySource
+from app.token_verifier import AlgorithmSource
+
+__all__ = [
+    "FORBIDDEN_DETAIL",
+    "Context",
+    "Session",
+    "get_algorithm_source",
+    "get_context",
+    "get_key_source",
+    "get_session",
+]
 
 log = logging.getLogger(__name__)
 
-# Every forbidden (403) branch under AUTH_MODE=jwt returns exactly this body, regardless of which
-# check failed — the reason is discoverable only from the structured log line, never the
-# response (see module docstring and the ASGI-seam tests in tests/test_jwt_auth.py).
-FORBIDDEN_DETAIL = "Not authorized for this tenant."
-
 
 def get_key_source(settings: Annotated[Settings, Depends(get_settings)]) -> KeySource:
-    """The default key source: a single process-wide verification key (interim, ADR-0003's
-    "one operator-run identity provider" case) — never a network JWKS fetch. A customer-owned
-    identity provider needs a real JWKS-backed KeySource; override this dependency
-    (`app.dependency_overrides[get_key_source] = ...`, exactly how tests inject their own),
-    never edit `app/jwt_verifier.py` to make it reach the network itself.
-
-    Issuer-aware (gap fix, Spec 6 / #49): `app.token_verifier.verify_tenant_token` calls this with
-    `AGENT_IDENTITY_ISSUER` for an agent identity's token (minted by
-    `app/agent_credential_exchange.py`, signed with `agent_token_signing_key`) and with the
-    tenant's own configured issuer for everyone else (signed with `jwt_verification_key`) — two
-    different signing keys for two different token populations, resolved by the one thing that
-    distinguishes them (`iss`), not by two separate KeySource implementations one caller could
-    forget to keep in sync.
-    """
-
-    def _source(issuer: str, kid: str | None) -> str:
-        if issuer == AGENT_IDENTITY_ISSUER:
-            if settings.agent_token_signing_key is None:
-                raise TokenVerificationError("no agent token signing key configured")
-            # Asymmetric agent_token_algorithm: verify against the public key
-            # (agent_token_verification_key -- explicit, or derived at Settings construction from
-            # agent_token_signing_key, see app/config.py), never the private signing key itself.
-            # Symmetric (HS*, the default): no separate verification key exists; the signing key
-            # doubles as the shared secret, exactly as before.
-            if settings.agent_token_verification_key is not None:
-                return settings.agent_token_verification_key.get_secret_value()
-            return settings.agent_token_signing_key.get_secret_value()
-        if settings.jwt_verification_key is None:
-            raise TokenVerificationError("no verification key configured")
-        return settings.jwt_verification_key.get_secret_value()
-
-    return _source
+    """Thin FastAPI alias of `app.context_resolution.key_source_for` (per-issuer key pinning).
+    Override this dependency (`app.dependency_overrides[get_key_source] = ...`) to inject a
+    JWKS-backed or test key source; never edit `app/jwt_verifier.py` to reach the network."""
+    return context_resolution.key_source_for(settings)
 
 
 def get_algorithm_source(settings: Annotated[Settings, Depends(get_settings)]) -> AlgorithmSource:
-    """The algorithm half of the same per-issuer pinning `get_key_source` above does for the
-    verification key (algorithm-confusion guard, review finding Spec 6 / ADR-0005 / ADR-0003): an
-    agent identity's token (`iss == AGENT_IDENTITY_ISSUER`) is only ever checked against
-    `agent_token_algorithm` (default `HS256`, the algorithm `app/agent_credential_exchange.py`
-    mints with); every other issuer -- a tenant's real IdP -- is only ever checked against
-    `jwt_algorithm` (default `RS256`). Never derived from the token's own header: `verify_token`
-    always passes whatever this returns as an explicit `algorithms` allow-list to `jwt.decode`, so
-    a token cannot pick its own algorithm, and an agent token can never be revalidated under the
-    human algorithm/key (or a human token under the agent one) even if both happened to be
-    configured to the same literal value.
-    """
-
-    def _source(issuer: str) -> tuple[str, ...]:
-        if issuer == AGENT_IDENTITY_ISSUER:
-            return (settings.agent_token_algorithm,)
-        return (settings.jwt_algorithm,)
-
-    return _source
+    """Thin FastAPI alias of `app.context_resolution.algorithm_source_for` (per-issuer algorithm
+    pinning, the algorithm-confusion guard)."""
+    return context_resolution.algorithm_source_for(settings)
 
 
-def _log_forbidden(*, reason: str, tenant_id: UUID, issuer: str, request_id: str) -> HTTPException:
-    """Logs the one structured security-event line every forbidden branch produces (both
-    AUTH_MODE=jwt's own checks and AUTH_MODE=dev-headers' suspension check, #69), then returns
-    (does not raise) the generic HTTPException the caller raises itself — keeping `raise
-    _log_forbidden(...)` readable at each call site."""
-    log.warning(
-        "request rejected: not authorized for this tenant",
-        extra={
-            "event": "jwt_auth_forbidden",
-            "reason": reason,
-            "tenant_id": str(tenant_id),
-            "issuer": issuer,
-            "request_id": request_id,
-        },
-    )
-    return HTTPException(status.HTTP_403_FORBIDDEN, FORBIDDEN_DETAIL)
-
-
-async def _get_jwt_context(
-    request: Request,
-    settings: Settings,
-    tenant_id: UUID,
-    key_source: KeySource,
-    algorithm_source: AlgorithmSource,
-    authorization: str | None,
-) -> RequestContext:
-    request_id = uuid.uuid4().hex
-
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing or malformed bearer token")
-    token = authorization.split(" ", 1)[1].strip()
-    if not token:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing or malformed bearer token")
-
-    try:
-        resolved = await verify_tenant_token(
-            token,
-            tenant_id=tenant_id,
-            key_source=key_source,
-            default_issuer=settings.default_identity_issuer,
-            algorithm_source=algorithm_source,
+def _render(rejection: ContextRejection, tenant_id: UUID) -> HTTPException:
+    """The HTTP shape of a rejection: its status and client-visible detail; a forbidden one is
+    also the one structured security-event line naming reason, tenant, issuer, and request id."""
+    if rejection.is_security_event:
+        log.warning(
+            "request rejected: not authorized for this tenant",
+            extra={
+                "event": "jwt_auth_forbidden",
+                "reason": rejection.reason.value,
+                "tenant_id": str(tenant_id),
+                "issuer": rejection.issuer or "",
+                "request_id": rejection.request_id,
+            },
         )
-    except TenantTokenVerificationError as exc:
-        if exc.reason is VerificationFailureReason.INVALID_OR_EXPIRED:
-            detail = (
-                "No token issuer configured" if exc.issuer is None else "Invalid or expired token"
-            )
-            raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail) from None
-        raise _log_forbidden(
-            reason=exc.reason.value,
-            tenant_id=tenant_id,
-            issuer=exc.issuer or "",
-            request_id=request_id,
-        ) from None
-
-    # Tenant suspension is *not* part of the shared verifier above -- it is enforced here,
-    # directly, via the same shared check every other context-resolution seam uses
-    # (`app.tenant_suspension`, issue #69). A tenant with no control-plane row at all (never
-    # marked dedicated/suspended, or not created in the control plane yet) is treated as not
-    # suspended (ADR-0002, app/db/session.py).
-    try:
-        await ensure_tenant_not_suspended(tenant_id)
-    except TenantSuspendedError:
-        raise _log_forbidden(
-            reason="tenant_suspended",
-            tenant_id=tenant_id,
-            issuer=resolved.issuer,
-            request_id=request_id,
-        ) from None
-
-    ctx = RequestContext(
-        tenant_id=tenant_id,
-        identity_id=resolved.identity_id,
-        roles=frozenset({resolved.role}),
-        request_id=request_id,
-    )
-    request.state.request_id = ctx.request_id
-    # Also stashed whole (S3-T1 / #26): `app.main.handle_permission_error` reads it back to
-    # log a denied role check with identifiers only, without re-deriving them.
-    request.state.context = ctx
-    return ctx
+    return HTTPException(int(rejection.status), rejection.detail)
 
 
 async def get_context(
@@ -218,43 +83,25 @@ async def get_context(
     x_roles: Annotated[str | None, Header()] = None,
     authorization: Annotated[str | None, Header()] = None,
 ) -> RequestContext:
-    if settings.auth_mode == "dev-headers":
-        if not x_identity_id:
-            raise HTTPException(
-                status.HTTP_401_UNAUTHORIZED,
-                "X-Identity-Id is missing (AUTH_MODE=dev-headers)",
-            )
-        try:
-            identity_id = UUID(x_identity_id)
-        except ValueError as exc:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid UUID in header") from exc
-        roles = frozenset(r.strip() for r in (x_roles or "").split(",") if r.strip())
-        ctx = RequestContext(tenant_id=tenant_id, identity_id=identity_id, roles=roles)
-        # dev-headers has no other check standing between a client and its tenant's data, so
-        # suspension has to be checked here explicitly (AUTH_MODE=jwt already does, above) —
-        # same generic 403 body, same "never say why" logging as the jwt branch (#69, ADR-0010).
-        try:
-            await ensure_tenant_not_suspended(ctx.tenant_id)
-        except TenantSuspendedError:
-            raise _log_forbidden(
-                reason="tenant_suspended",
-                tenant_id=tenant_id,
-                issuer="dev-headers",
-                request_id=ctx.request_id,
-            ) from None
-        # Stashed on request.state (not returned as a header here) so the ASGI middleware in
-        # app/main.py can attach it to the response regardless of the route's return type
-        # (JSONResponse, StreamingResponse, or the chat endpoint's Vercel AI stream), and so a
-        # request that fails before a context exists never gets the header at all.
-        request.state.request_id = ctx.request_id
-        # Also stashed whole (S3-T1 / #26): `app.main.handle_permission_error` reads it back to
-        # log a denied role check with identifiers only, without re-deriving them.
-        request.state.context = ctx
-        return ctx
-
-    return await _get_jwt_context(
-        request, settings, tenant_id, key_source, algorithm_source, authorization
+    outcome = await context_resolution.resolve_request_context(
+        tenant_id=tenant_id,
+        authorization=authorization,
+        settings=settings,
+        dev_identity_id=x_identity_id,
+        dev_roles=x_roles,
+        key_source=key_source,
+        algorithm_source=algorithm_source,
     )
+    if isinstance(outcome, ContextRejection):
+        raise _render(outcome, tenant_id)
+    # Stashed on request.state (not returned as a header here) so the ASGI middleware in
+    # app/main.py can attach it to the response regardless of the route's return type, and so a
+    # request that fails before a context exists never gets the header at all.
+    request.state.request_id = outcome.request_id
+    # Also stashed whole (S3-T1 / #26): `app.main.handle_permission_error` reads it back to log a
+    # denied role check with identifiers only, without re-deriving them.
+    request.state.context = outcome
+    return outcome
 
 
 Context = Annotated[RequestContext, Depends(get_context)]
