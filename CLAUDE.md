@@ -123,14 +123,18 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    The app connects as `app` (no superuser, `NOBYPASSRLS`); migrations and the operator tool
    (`app/operator/`, `scripts/operator.py`) run as the separate `app_owner` role (no superuser,
    `NOBYPASSRLS`, owns every object) via `DATABASE_URL_MIGRATIONS` — a DSN the API container's
-   own configuration never holds. `app/repositories/control.py` (`ControlRepository`) is the only
-   module that issues SQL against the `control` schema, on either role's session — its owner-role
-   side (spec A5 / #113: `create_tenant_record`, `set_suspended`, `read_gateway_credential_alias`/
-   `write_gateway_credential_alias`, `enumerate_referenced_aliases`, `get_record`, behind the one
-   private `_set_owner_tenant_context` forced-RLS helper) is what the session router, the guard,
-   and the migration runner now read through; the operator commands and
-   `app/gateway_provisioning.py` still carry their own inline copies of that SQL until #114
-   rewires them onto it too.
+   own configuration never holds. `app/repositories/control.py` (`ControlRepository`) is the
+   **one path** for every SQL statement against the `control` schema, on either role's session —
+   its owner-role side (spec A5 / #113: `create_tenant_record`, `set_suspended`,
+   `read_gateway_credential_alias`/`write_gateway_credential_alias`, `enumerate_referenced_aliases`,
+   `get_record`, behind the one private `_set_owner_tenant_context` forced-RLS helper) is what the
+   session router, the guard, the migration runner, the operator commands
+   (`app/operator/create.py`/`erase.py`/`suspend.py`/`listing.py`/`lookup.py`), and
+   `app/gateway_provisioning.py` all read and write through now (spec A5 / #114) — no other module
+   issues SQL against `control.*` directly. The operator tool's own public entry point is
+   `app.operator.cli.main(argv, *, engine=None, admin_client=None)` (spec A5 / #115): it parses,
+   dispatches to the matching command, audits, and prints — dispatch itself stays private, so a
+   test drives a command only through `main()`, never a private function.
 4. **Agents access data only through tools** (`app/tools/`) that check the context and return only
    what is needed. Never a DB connection or credentials to the model. **Every writing tool
    requires approval** (ADR-0007, Spec 5): mark it with `args_validator=require_approval`
@@ -261,7 +265,7 @@ tests/                pytest; RLS integration test with pgserver
 docker/               Postgres init (app role), LiteLLM config
 config/               residency.toml -- the residency allow-list (ADR-0008), loaded by app/config.py
 docs/                 adr/, agents/ (skill config), frontend.md, mobile.md, deployment.md, residency.md, mcp-connection.md
-app/operator/          operator tool: audited dispatch, tenant lookup, tenant listing, `create`, `suspend`/`unsuspend`, `erase` (scripts/operator.py entry point; replaces scripts/seed.py)
+app/operator/          operator tool: `cli.py`'s `main()` is the one public entry point (scripts/operator.py's own entry point; replaces scripts/seed.py); tenant lookup, tenant listing, `create`, `suspend`/`unsuspend`, `erase` are compositions over `app/repositories/control.py`'s `ControlRepository`, the one path for `control` schema SQL
 ```
 
 ## Do not touch without checking first

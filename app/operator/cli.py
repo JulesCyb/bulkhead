@@ -1,38 +1,87 @@
-"""The operator CLI (Spec 9 / #68, ADR-0010): a runnable command-line entry point
-(`scripts/operator.py` is the thin wrapper) connecting only as the owner database role.
+"""The operator CLI (Spec 9 / #68, ADR-0010; public entry point spec A5 / #115): a runnable
+command-line entry point (`scripts/operator.py` is the thin wrapper) connecting only as the owner
+database role.
+
+`main(argv, *, engine=None, admin_client=None)` is the one public function here -- it parses
+`argv`, dispatches to the matching command, records the operator-action audit row, prints the
+result, and returns the process exit code. Dispatch (`_COMMANDS`, `_run`) stays private: a test
+drives a command end to end through `main()` alone, with an injected `engine` and (for `create`/
+`erase`) an injected `admin_client`, never by importing `_run`/`build_parser`/`_COMMANDS`
+directly. `scripts/operator.py` calls `main()` unchanged.
+
+`main()` always owns whichever engine it ends up using -- one it builds itself from the owner DSN
+(`app.db.lifecycle.owner_engine`) when none is given, or one a caller injects -- and disposes it
+before returning, on whichever event loop actually used it (see below): a caller that injects an
+engine hands over its lifecycle for exactly the one call, the same way `owner_engine` already
+does for the DSN case, rather than the two cases leaving disposal split across two different
+owners. `main()` is also callable from inside a running event loop (an async test driving it
+directly, most commonly): `asyncio.run()` cannot itself be called there, so in that case the
+whole call runs to completion on a fresh loop of its own, in one worker thread, rather than
+raising -- this is also why an injected engine's connections must never be opened before this
+call (they would be bound to the wrong loop): build it and hand it straight to `main()`.
 
 Every invocation reads its connection string from `app.migration_settings.get_migration_settings`
--- the same owner DSN Alembic's migrations use -- and nothing else: there is no flag or
-environment variable here that accepts a different connection string, so this module can never
-fall back to, or be pointed at, the cluster superuser. `app.config.Settings` (the long-running
-API's settings object) is never imported here either -- `create` (Spec 9 / #70) needs it (model
-allow-list validation, gateway defaults), so that work lives in `app.operator.create`, imported
-by name here rather than reached through `app.config` directly.
+-- the same owner DSN Alembic's migrations use -- and nothing else, unless a caller injects an
+`engine` itself: there is no flag or environment variable here that accepts a different
+connection string, so this module can never fall back to, or be pointed at, the cluster
+superuser. `app.config.Settings` (the long-running API's settings object) is never imported here
+either -- `create` (Spec 9 / #70) needs it (model allow-list validation, gateway defaults), so
+that work lives in `app.operator.create`, imported by name here rather than reached through
+`app.config` directly.
 
-Command dispatch and audit recording are deliberately two separate transactions on two separate
-connections (see `_run` below): if a command's own transaction rolls back on failure, the audit
-row describing that failure must still commit.
+Command dispatch and audit recording are deliberately two separate transactions on the same
+engine (see `_run` below): if a command's own transaction rolls back on failure, the audit row
+describing that failure must still commit.
+
+One formatter per command, not five: every command's result type (`app.operator.listing.
+TenantListing`, `app.operator.suspend.SuspendResult`, `app.operator.create.CreateTenantResult`,
+`app.operator.erase.EraseResult`) implements the same small protocol -- `render()` for the text
+`main()` prints, `audit_outcome` for the free-text summary `main()` writes to the operator-action
+log -- so this module never hand-writes a `print` call of its own per command.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import os
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from typing import Protocol
 from uuid import UUID
 
-from sqlalchemy.ext.asyncio import AsyncConnection
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from app.db.lifecycle import owner_engine
+from app.gateway_provisioning import GatewayAdminClient
 from app.migration_settings import get_migration_settings
 from app.operator.audit import UNSCOPED_TENANT_ID, record_action
 from app.operator.create import create_tenant
 from app.operator.erase import erase_tenant, record_erasure
-from app.operator.listing import list_tenants
+from app.operator.listing import TenantListing, list_tenants
 from app.operator.suspend import set_tenant_suspended
 
 OPERATOR_IDENTITY_ENV_VAR = "OPERATOR_IDENTITY"
+
+
+class CommandResult(Protocol):
+    """What every command's result type provides to `_run` below: text to print, and the
+    free-text summary the audit log records. The two are not always the same string -- `create`
+    and `erase` print more than their audit line says, and `list` prints something different
+    from its audit line entirely -- so a result type provides both rather than `_run` trying to
+    derive one from the other."""
+
+    def render(self) -> str: ...
+
+    @property
+    def audit_outcome(self) -> str: ...
+
+
+CommandFn = Callable[
+    [AsyncConnection, argparse.Namespace, GatewayAdminClient | None],
+    Awaitable[tuple[CommandResult, UUID | None]],
+]
 
 
 def _operator_identity() -> str:
@@ -42,43 +91,44 @@ def _operator_identity() -> str:
     return os.environ.get(OPERATOR_IDENTITY_ENV_VAR) or os.environ.get("USER", "unknown")
 
 
-async def _run_list(conn: AsyncConnection, args: argparse.Namespace) -> tuple[str, None]:
-    tenants = await list_tenants(conn)
-    if not tenants:
-        print("No tenants in the control plane.")
-    for t in tenants:
-        print(
-            f"{t.tenant_id}  {t.name!r:30}  tier={t.isolation_tier:9}  "
-            f"residency={t.residency or '-':6}  alias={t.database_alias or '-':12}  "
-            f"suspended={t.suspended}"
-        )
+async def _dispatch_list(
+    conn: AsyncConnection,
+    args: argparse.Namespace,
+    admin_client: GatewayAdminClient | None,
+) -> tuple[TenantListing, None]:
     # `list` has no single target tenant -- it targets every tenant -- so its audit row uses the
-    # documented sentinel (see app.operator.audit), not a real id.
-    return f"ok: listed {len(tenants)} tenant(s)", None
+    # documented sentinel (see app.operator.audit), never a real id.
+    return TenantListing(tenants=await list_tenants(conn)), None
 
 
-async def _run_suspend_or_unsuspend(
-    conn: AsyncConnection, args: argparse.Namespace, *, suspended: bool
-) -> tuple[str, UUID]:
-    verb = "suspended" if suspended else "unsuspended"
+async def _dispatch_suspend_or_unsuspend(
+    conn: AsyncConnection,
+    args: argparse.Namespace,
+    admin_client: GatewayAdminClient | None,
+    *,
+    suspended: bool,
+) -> tuple[CommandResult, UUID]:
     result = await set_tenant_suspended(conn, args.identifier, suspended=suspended)
-    if not result.changed:
-        outcome = f"no-op: {result.name!r} ({result.tenant_id}) was already {verb}"
-    else:
-        outcome = f"ok: {result.name!r} ({result.tenant_id}) is now {verb}"
-    print(outcome)
-    return outcome, result.tenant_id
+    return result, result.tenant_id
 
 
-async def _run_suspend(conn: AsyncConnection, args: argparse.Namespace) -> tuple[str, UUID]:
-    return await _run_suspend_or_unsuspend(conn, args, suspended=True)
+async def _dispatch_suspend(
+    conn: AsyncConnection, args: argparse.Namespace, admin_client: GatewayAdminClient | None
+) -> tuple[CommandResult, UUID]:
+    return await _dispatch_suspend_or_unsuspend(conn, args, admin_client, suspended=True)
 
 
-async def _run_unsuspend(conn: AsyncConnection, args: argparse.Namespace) -> tuple[str, UUID]:
-    return await _run_suspend_or_unsuspend(conn, args, suspended=False)
+async def _dispatch_unsuspend(
+    conn: AsyncConnection, args: argparse.Namespace, admin_client: GatewayAdminClient | None
+) -> tuple[CommandResult, UUID]:
+    return await _dispatch_suspend_or_unsuspend(conn, args, admin_client, suspended=False)
 
 
-async def _run_create(conn: AsyncConnection, args: argparse.Namespace) -> tuple[str, UUID]:
+async def _dispatch_create(
+    conn: AsyncConnection,
+    args: argparse.Namespace,
+    admin_client: GatewayAdminClient | None,
+) -> tuple[CommandResult, UUID]:
     result = await create_tenant(
         conn,
         tenant_name=args.tenant_name,
@@ -89,107 +139,81 @@ async def _run_create(conn: AsyncConnection, args: argparse.Namespace) -> tuple[
         dedicated_db_admin_url=args.dedicated_db_admin_url,
         issuer=args.issuer,
         subject=args.subject,
+        admin_client=admin_client,
     )
-    print(f"MCP_TENANT_ID={result.tenant_id}")
-    print(f"MCP_IDENTITY_ID={result.identity_id}")
-    print(f"Gateway credential alias: {result.gateway_credential_alias}")
-    if result.isolation_tier == "dedicated":
-        print(f"Database alias: {result.database_alias}")
-    print(
-        f"control-plane record: {result.control_plane}; "
-        f"gateway credential: {result.gateway_credential}; "
-        f"admin membership: {result.admin_membership}"
-        + (
-            f"; dedicated database: {result.dedicated_database}"
-            if result.isolation_tier == "dedicated"
-            else ""
-        )
-    )
-    print(
-        f"\ncurl -H 'X-Identity-Id: {result.identity_id}' "
-        f"http://localhost:8000/v1/t/{result.tenant_id}/agents/assistant/run ..."
-    )
-    outcome = (
-        f"ok: tenant {result.tenant_id} "
-        f"(control-plane: {result.control_plane}, "
-        f"isolation tier: {result.isolation_tier}, "
-        f"gateway: {result.gateway_credential}, "
-        f"membership: {result.admin_membership})"
-    )
-    return outcome, result.tenant_id
+    return result, result.tenant_id
 
 
-async def _run_erase(conn: AsyncConnection, args: argparse.Namespace) -> tuple[str, UUID]:
+async def _dispatch_erase(
+    conn: AsyncConnection,
+    args: argparse.Namespace,
+    admin_client: GatewayAdminClient | None,
+) -> tuple[CommandResult, UUID]:
     result = await erase_tenant(
         conn,
         args.identifier,
         dry_run=args.dry_run,
         dedicated_db_admin_url=args.dedicated_db_admin_url,
+        admin_client=admin_client,
     )
-    for step in result.steps:
-        print(f"{step.step}: {step.outcome}")
-    if result.dry_run:
-        outcome = f"dry-run: {result.name!r} ({result.tenant_id}) -- no changes made"
-    else:
-        assert result.backup_horizon is not None
-        print(f"backup horizon: {result.backup_horizon.isoformat()}")
+    if not result.dry_run:
         # Written whether or not every step succeeded (see app.operator.erase's module
         # docstring): a partial failure must still be visible on the erasure record, and a
         # re-run only needs to retry what this record shows as not yet done.
         await record_erasure(conn, result)
-        prefix = "partial" if result.any_step_failed else "ok"
-        verb = "partially erased (see steps above)" if result.any_step_failed else "erased"
-        outcome = f"{prefix}: {verb} {result.name!r} ({result.tenant_id})"
-    return outcome, result.tenant_id
+    return result, result.tenant_id
 
 
-# Every command's target tenant id for the audit log. `list` has none -- it targets every
-# tenant, not one -- so it uses the documented sentinel (see app.operator.audit). Every other
-# command resolves or mints a real tenant id as part of its own work, so it returns that id here
-# rather than the sentinel.
-_COMMANDS = {
-    "list": _run_list,
-    "suspend": _run_suspend,
-    "unsuspend": _run_unsuspend,
-    "create": _run_create,
-    "erase": _run_erase,
+# Every command's dispatch function, keyed by its `build_parser()` subcommand name. Private:
+# a test drives a command through `main()`, never this dict directly.
+_COMMANDS: dict[str, CommandFn] = {
+    "list": _dispatch_list,
+    "suspend": _dispatch_suspend,
+    "unsuspend": _dispatch_unsuspend,
+    "create": _dispatch_create,
+    "erase": _dispatch_erase,
 }
 
 
-async def _run(command: str, args: argparse.Namespace) -> int:
-    dsn = get_migration_settings().database_url_migrations.get_secret_value()
+async def _run(
+    command: str,
+    args: argparse.Namespace,
+    engine: AsyncEngine,
+    admin_client: GatewayAdminClient | None,
+) -> int:
     started_at = datetime.now(UTC)
     outcome = "error"
     target_tenant_id: UUID | None = None
     error: str | None = None
     exit_code = 1
-    async with owner_engine(dsn) as engine:
-        try:
-            async with engine.begin() as conn:
-                outcome, target_tenant_id = await _COMMANDS[command](conn, args)
-            exit_code = 0
-        except Exception as exc:  # noqa: BLE001 - recorded below, then re-raised as a nonzero exit
-            # A lookup failure (TenantNotFoundError/AmbiguousTenantNameError) never resolved a
-            # real tenant, so `target_tenant_id` stays None here -- the sentinel below is the
-            # only honest target id for this row, same as any other failure.
-            error = f"{type(exc).__name__}: {exc}"
-            outcome = "error"
-        finally:
-            finished_at = datetime.now(UTC)
-            async with engine.begin() as audit_conn:
-                await record_action(
-                    audit_conn,
-                    operator=_operator_identity(),
-                    command=command,
-                    target_tenant_id=(
-                        target_tenant_id if target_tenant_id is not None else UNSCOPED_TENANT_ID
-                    ),
-                    args=vars(args),
-                    outcome=outcome,
-                    started_at=started_at,
-                    finished_at=finished_at,
-                    error=error,
-                )
+    try:
+        async with engine.begin() as conn:
+            result, target_tenant_id = await _COMMANDS[command](conn, args, admin_client)
+        print(result.render())
+        outcome = result.audit_outcome
+        exit_code = 0
+    except Exception as exc:  # noqa: BLE001 - recorded below, then re-raised as a nonzero exit
+        # A lookup failure (TenantNotFoundError/AmbiguousTenantNameError) never resolved a
+        # real tenant, so `target_tenant_id` stays None here -- the sentinel below is the
+        # only honest target id for this row, same as any other failure.
+        error = f"{type(exc).__name__}: {exc}"
+        outcome = "error"
+    finally:
+        finished_at = datetime.now(UTC)
+        async with engine.begin() as audit_conn:
+            await record_action(
+                audit_conn,
+                operator=_operator_identity(),
+                command=command,
+                target_tenant_id=(
+                    target_tenant_id if target_tenant_id is not None else UNSCOPED_TENANT_ID
+                ),
+                args=vars(args),
+                outcome=outcome,
+                started_at=started_at,
+                finished_at=finished_at,
+                error=error,
+            )
     if error is not None:
         print(f"error: {error}")
     return exit_code
@@ -289,9 +313,56 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
+async def _main_async(
+    args: argparse.Namespace,
+    *,
+    engine: AsyncEngine | None,
+    admin_client: GatewayAdminClient | None,
+) -> int:
+    if engine is not None:
+        try:
+            return await _run(args.command, args, engine, admin_client)
+        finally:
+            await engine.dispose()
+    dsn = get_migration_settings().database_url_migrations.get_secret_value()
+    async with owner_engine(dsn) as owned_engine:
+        return await _run(args.command, args, owned_engine, admin_client)
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    engine: AsyncEngine | None = None,
+    admin_client: GatewayAdminClient | None = None,
+) -> int:
+    """The one public entry point (spec A5 / #115): parses `argv`, dispatches to the matching
+    command, records the operator-action audit row, prints the result, and returns the process
+    exit code. Dispatch (`_COMMANDS`, `_run`) stays private.
+
+    With no `engine`, this builds one from the owner DSN
+    (`app.migration_settings.get_migration_settings`) via `app.db.lifecycle.owner_engine`; either
+    way -- built here or injected -- this call disposes it before returning (see the module
+    docstring for why disposal never splits across two owners). `admin_client` is forwarded
+    verbatim to whichever of `create`/`erase` the command names -- the only two that ever touch
+    the gateway; `list`/`suspend`/`unsuspend` ignore it.
+
+    Callable from a plain script (`scripts/operator.py`) or from inside an already-running event
+    loop alike (an async test driving this function directly): with no loop running, this runs
+    the command via a plain `asyncio.run()`; with one already running, `asyncio.run()` cannot be
+    called here, so the whole call instead runs to completion on a fresh loop of its own, in one
+    worker thread, and this blocks until it finishes.
+    """
     args = build_parser().parse_args(argv)
-    return asyncio.run(_run(args.command, args))
+
+    def _invoke() -> int:
+        return asyncio.run(_main_async(args, engine=engine, admin_client=admin_client))
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return _invoke()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(_invoke).result()
 
 
 if __name__ == "__main__":

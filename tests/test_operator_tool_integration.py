@@ -15,11 +15,15 @@ Cluster boot, role bootstrap, and tenant seeding come from `tests.support` (issu
 from __future__ import annotations
 
 import json
+import re
 import uuid
+from pathlib import Path
 
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 pgserver = pytest.importorskip("pgserver")
 
@@ -180,16 +184,23 @@ async def _operator_actions(superuser_url: str, action: str) -> list:
     ]
 
 
-async def test_cli_list_records_the_invocation_in_the_operator_action_log(environment):
-    from app.operator.cli import _run, build_parser
+async def test_cli_list_records_the_invocation_in_the_operator_action_log(environment, capsys):
+    from app.operator.cli import main
 
-    await seed_tenant(environment, name="Umbrella", via_operator=False)
+    tenant = await seed_tenant(environment, name="Umbrella", residency="eu", via_operator=False)
 
-    # `_run` directly, not `main()`: `main()` wraps this in `asyncio.run`, which cannot be
-    # called from the event loop pytest-asyncio is already running this test in.
-    args = build_parser().parse_args(["list"])
-    exit_code = await _run(args.command, args)
+    engine = create_async_engine(environment.owner_url)
+    exit_code = main(["list"], engine=engine)
     assert exit_code == 0
+
+    # Golden output (spec A5 / #115, acceptance criterion 2): byte-identical to what the retired
+    # `_run_list` printed directly, for this test's own tenant -- `environment`'s underlying
+    # cluster is shared across this file, so `list`'s real output also names every tenant an
+    # earlier test seeded; this test's own line is checked verbatim, not the whole listing.
+    assert (
+        f"{tenant.tenant_id}  'Umbrella'                      tier=pooled     "
+        "residency=eu      alias=-             suspended=False"
+    ) in capsys.readouterr().out.splitlines()
 
     rows = await _operator_actions(environment.superuser_url, "list")
     assert len(rows) >= 1
@@ -205,23 +216,21 @@ async def test_cli_list_records_the_invocation_in_the_operator_action_log(enviro
     assert performed_at is not None
 
 
-async def test_cli_records_a_failed_invocation_too(environment, monkeypatch):
-    """Even a failed command is recorded, with its error, not silently dropped."""
-    import app.operator.cli as cli_module
+async def test_cli_records_a_failed_invocation_too(environment):
+    """Even a failed command is recorded, with its error, not silently dropped -- driven through
+    a real failure (an unknown tenant), not a monkeypatched private dispatch entry (spec A5 /
+    #115: no test reaches `_COMMANDS`)."""
+    from app.operator.cli import main
 
-    async def _boom(conn, args):
-        raise RuntimeError("simulated failure")
-
-    monkeypatch.setitem(cli_module._COMMANDS, "list", _boom)
-
-    args = cli_module.build_parser().parse_args(["list"])
-    exit_code = await cli_module._run(args.command, args)
+    unknown_id = str(uuid.uuid4())
+    engine = create_async_engine(environment.owner_url)
+    exit_code = main(["suspend", unknown_id], engine=engine)
     assert exit_code == 1
 
-    rows = await _operator_actions(environment.superuser_url, "list")
+    rows = await _operator_actions(environment.superuser_url, "suspend")
     _, _, details, _ = rows[-1]
     assert details["outcome"] == "error"
-    assert "simulated failure" in details["error"]
+    assert "TenantNotFoundError" in details["error"]
 
 
 async def test_suspend_sets_the_flag_and_timestamp_and_reruns_as_a_no_op(environment):
@@ -333,15 +342,24 @@ async def test_app_cannot_widen_its_control_plane_write_with_the_operator_write_
 
 
 async def test_cli_suspend_is_idempotent_and_records_both_invocations_in_the_audit_log(
-    environment,
+    environment, capsys
 ):
-    from app.operator.cli import _run, build_parser
+    from app.operator.cli import main
 
     tenant = await seed_tenant(environment, name="Audited Suspend Co", via_operator=False)
 
-    args = build_parser().parse_args(["suspend", str(tenant.tenant_id)])
-    assert await _run(args.command, args) == 0
-    assert await _run(args.command, args) == 0
+    argv = ["suspend", str(tenant.tenant_id)]
+    assert main(argv, engine=create_async_engine(environment.owner_url)) == 0
+    first_printed = capsys.readouterr().out
+    assert main(argv, engine=create_async_engine(environment.owner_url)) == 0
+    second_printed = capsys.readouterr().out
+
+    # Golden output (spec A5 / #115): byte-identical to what the retired
+    # `_run_suspend_or_unsuspend` printed directly.
+    assert first_printed == f"ok: {tenant.name!r} ({tenant.tenant_id}) is now suspended\n"
+    assert second_printed == (
+        f"no-op: {tenant.name!r} ({tenant.tenant_id}) was already suspended\n"
+    )
 
     rows = await _operator_actions(environment.superuser_url, "suspend")
     assert len(rows) >= 2
@@ -353,15 +371,18 @@ async def test_cli_suspend_is_idempotent_and_records_both_invocations_in_the_aud
     assert second_details["outcome"].startswith("no-op: ")
 
 
-async def test_cli_unsuspend_records_the_invocation_by_tenant_name(environment):
-    from app.operator.cli import _run, build_parser
+async def test_cli_unsuspend_records_the_invocation_by_tenant_name(environment, capsys):
+    from app.operator.cli import main
 
     tenant = await seed_tenant(environment, name="Named Unsuspend Co", via_operator=False)
     await tenant.suspend()
 
-    args = build_parser().parse_args(["unsuspend", "Named Unsuspend Co"])
-    exit_code = await _run(args.command, args)
+    engine = create_async_engine(environment.owner_url)
+    exit_code = main(["unsuspend", "Named Unsuspend Co"], engine=engine)
     assert exit_code == 0
+    assert (
+        capsys.readouterr().out == f"ok: {tenant.name!r} ({tenant.tenant_id}) is now unsuspended\n"
+    )
 
     rows = await _operator_actions(environment.superuser_url, "unsuspend")
     tenant_id_logged, _, details, _ = rows[-1]
@@ -379,6 +400,28 @@ def test_cli_has_no_flag_or_env_var_for_an_alternate_connection_string():
         opt for action in parser._actions for opt in getattr(action, "option_strings", [])
     }
     assert not any("dsn" in opt.lower() or "database" in opt.lower() for opt in option_strings)
+
+
+_RETIRED_PRIVATE_DISPATCH_PATTERN = re.compile(
+    r"from app\.operator\.cli import _run|cli_module\._run|_COMMANDS"
+)
+
+
+def test_no_test_imports_the_operator_clis_private_dispatch_function():
+    """Acceptance (spec A5 / #115): `main(argv, *, engine=None, admin_client=None)` is the one
+    entry point every operator test drives -- dispatch (`_run`, `_COMMANDS`) stays private, so no
+    test file may import or monkeypatch either. Mirrors
+    `grep -rn 'from app.operator.cli import _run\\|cli_module\\._run\\|_COMMANDS' tests/` finding
+    nothing, in pure Python rather than depending on the `grep` binary. This file itself (naming
+    the retired pattern above, in prose, for exactly this test) is the one file the scan skips --
+    every other file in `tests/` is checked, this one included would only ever flag itself."""
+    this_file = Path(__file__).resolve()
+    for path in (REPO_ROOT / "tests").rglob("*.py"):
+        if path.resolve() == this_file:
+            continue
+        text = path.read_text(encoding="utf-8")
+        match = _RETIRED_PRIVATE_DISPATCH_PATTERN.search(text)
+        assert match is None, f"{path} still reaches the operator CLI's private dispatch: {match}"
 
 
 def test_cli_module_never_imports_the_application_settings_object():
@@ -588,35 +631,69 @@ async def test_create_rejects_unrecognized_model_before_any_write(environment, t
 
 
 async def test_cli_create_records_the_invocation_in_the_operator_action_log(
-    environment, tmp_path, monkeypatch
+    environment, tmp_path, monkeypatch, capsys
 ):
     """Acceptance (#70): a `create` invocation through the real CLI dispatch is recorded in the
     operator-action log, with secrets redacted from the logged arguments (none of `create`'s own
-    arguments are secret-shaped, so this also proves ordinary arguments still show up plainly)."""
-    import app.operator.create as create_module
+    arguments are secret-shaped, so this also proves ordinary arguments still show up plainly).
+    The gateway admin client is injected straight into `main()` (spec A5 / #115), not
+    monkeypatched onto `app.operator.create.build_admin_client`."""
     from app import config
-    from app.operator.cli import _run, build_parser
+    from app.operator.cli import main
 
     monkeypatch.setenv("GATEWAY_CREDENTIALS_DIR", str(tmp_path))
     config.get_settings.cache_clear()
-    monkeypatch.setattr(
-        create_module,
-        "build_admin_client",
-        lambda settings: fake_gateway_admin_client(key="sk-cli"),
-    )
 
-    args = build_parser().parse_args(
-        ["create", "CLI Co", "--residency", "eu", "--admin-email", "admin@cli.test"]
+    engine = create_async_engine(environment.owner_url)
+    exit_code = main(
+        ["create", "CLI Co", "--residency", "eu", "--admin-email", "admin@cli.test"],
+        engine=engine,
+        admin_client=fake_gateway_admin_client(key="sk-cli"),
     )
-    exit_code = await _run(args.command, args)
     config.get_settings.cache_clear()
     assert exit_code == 0
 
     rows = await _operator_actions(environment.superuser_url, "create")
     assert len(rows) >= 1
-    _, action, details, performed_at = rows[-1]
+    tenant_id, action, details, performed_at = rows[-1]
     assert action == "create"
     assert details["outcome"].startswith("ok: tenant ")
     assert details["args"]["tenant_name"] == "CLI Co"
     assert details["args"]["admin_email"] == "admin@cli.test"
     assert performed_at is not None
+
+    verify_engine = create_async_engine(environment.superuser_url)
+    try:
+        async with verify_engine.connect() as conn:
+            membership_row = (
+                await conn.execute(
+                    text("SELECT identity_id FROM memberships WHERE tenant_id = :tid"),
+                    {"tid": tenant_id},
+                )
+            ).one()
+            alias = (
+                await conn.execute(
+                    text(
+                        "SELECT gateway_credential_alias FROM control.tenants "
+                        "WHERE tenant_id = :tid"
+                    ),
+                    {"tid": tenant_id},
+                )
+            ).scalar_one()
+    finally:
+        await verify_engine.dispose()
+
+    # Golden output (spec A5 / #115, acceptance criterion 2): byte-identical to what the retired
+    # `_run_create` printed directly, reconstructed from independently-queried database state
+    # (not from the result object under test).
+    identity_id = membership_row.identity_id
+    assert capsys.readouterr().out == (
+        f"MCP_TENANT_ID={tenant_id}\n"
+        f"MCP_IDENTITY_ID={identity_id}\n"
+        f"Gateway credential alias: {alias}\n"
+        "control-plane record: created; gateway credential: provisioned; "
+        "admin membership: created\n"
+        "\n"
+        f"curl -H 'X-Identity-Id: {identity_id}' "
+        f"http://localhost:8000/v1/t/{tenant_id}/agents/assistant/run ...\n"
+    )

@@ -92,6 +92,26 @@ class EraseResult:
     def any_step_failed(self) -> bool:
         return any(step.outcome.startswith(_FAILED_PREFIX) for step in self.steps)
 
+    def render(self) -> str:
+        """Byte-identical to what `app.operator.cli`'s retired `_run_erase` printed (spec A5 /
+        #115): one line per step, then -- for a real (non-dry-run) erasure -- the backup horizon.
+        Never the `audit_outcome` line below; that one was never printed by `_run_erase` either,
+        only written to the operator-action log."""
+        lines = [f"{step.step}: {step.outcome}" for step in self.steps]
+        if not self.dry_run:
+            assert self.backup_horizon is not None
+            lines.append(f"backup horizon: {self.backup_horizon.isoformat()}")
+        return "\n".join(lines)
+
+    @property
+    def audit_outcome(self) -> str:
+        """The one line `app.operator.cli` writes to the operator-action log for this command."""
+        if self.dry_run:
+            return f"dry-run: {self.name!r} ({self.tenant_id}) -- no changes made"
+        prefix = "partial" if self.any_step_failed else "ok"
+        verb = "partially erased (see steps above)" if self.any_step_failed else "erased"
+        return f"{prefix}: {verb} {self.name!r} ({self.tenant_id})"
+
     def as_details(self) -> dict[str, object]:
         """The JSON-shaped payload `app.operator.cli` writes into
         `control.tenant_erasures.details` -- never called for a dry run."""

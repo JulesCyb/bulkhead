@@ -340,16 +340,15 @@ async def test_erase_dry_run_reports_without_changing_anything(environment, tmp_
 
 
 async def test_erase_pooled_tenant_removes_every_registered_table_and_records_erasure(
-    environment, tmp_path, monkeypatch
+    environment, tmp_path, monkeypatch, capsys
 ):
     """Acceptance: erasing a suspended pooled tenant seeded with rows in every registered tenant
     table leaves no such rows behind (via cascade), deletes the secret file, invokes the fake
     gateway revocation and the stub trace deletion, and writes an erasure record with no foreign
-    key to the tenant plus (via the real CLI dispatch) an operator-action-log entry."""
-    import app.gateway_provisioning as gateway_provisioning_module
+    key to the tenant plus (via the real CLI entry point) an operator-action-log entry."""
     import app.operator.erase as erase_module
     from app import config
-    from app.operator.cli import _run, build_parser
+    from app.operator.cli import main
 
     settings = Settings(gateway_credentials_dir=str(tmp_path))
     admin_client = fake_gateway_admin_client(key="sk-pooled-erase")
@@ -393,29 +392,31 @@ async def test_erase_pooled_tenant_removes_every_registered_table_and_records_er
     secret_path = tmp_path / created.gateway_credential_alias
     assert secret_path.exists()
 
-    # Erase through the real CLI dispatch, so this also proves the operator-action-log entry
-    # (app.operator.cli._run writes it in its own `finally`, same as every other command). The
-    # CLI itself takes no admin_client/trace_deleter arguments (those are internal test seams,
-    # not something a real operator invocation would ever override), so the two not-yet-real
-    # backends -- the gateway and Spec 8's tracing deletion -- are monkeypatched at their own
-    # module-level names instead, exactly where `app.operator.erase.erase_tenant`'s defaults
-    # resolve them.
+    # Erase through the real CLI entry point, so this also proves the operator-action-log entry
+    # (app.operator.cli.main writes it via `_run`'s own `finally`, same as every other command).
+    # The gateway admin client is injected straight into `main()` (spec A5 / #115); Spec 8's
+    # tracing deletion has no such seam yet, so it stays monkeypatched at its own module-level
+    # name, exactly where `app.operator.erase.erase_tenant`'s default resolves it.
     monkeypatch.setenv("GATEWAY_CREDENTIALS_DIR", str(tmp_path))
     config.get_settings.cache_clear()
     trace_deleter = _fake_trace_deleter()
     monkeypatch.setattr(erase_module, "delete_tenant_traces", trace_deleter)
-    monkeypatch.setattr(
-        gateway_provisioning_module, "build_admin_client", lambda settings: admin_client
-    )
 
-    args = build_parser().parse_args(["erase", str(created.tenant_id)])
-    exit_code = await _run(args.command, args)
+    erase_engine = create_async_engine(environment.owner_url)
+    exit_code = main(
+        ["erase", str(created.tenant_id)], engine=erase_engine, admin_client=admin_client
+    )
     config.get_settings.cache_clear()
 
     assert exit_code == 0
     assert trace_deleter.calls == [created.tenant_id]
     assert admin_client.fake.delete_calls == 1
     assert not secret_path.exists()
+
+    # Golden output (spec A5 / #115, acceptance criterion 2), reconstructed from the erasure
+    # record's own steps/backup_horizon below (independently-queried database state), not from
+    # the result object under test.
+    printed = capsys.readouterr().out
 
     after = await _row_counts(environment.superuser_url, tenant_id=created.tenant_id)
     assert all(count == 0 for count in after.values())
@@ -428,6 +429,13 @@ async def test_erase_pooled_tenant_removes_every_registered_table_and_records_er
     assert details["steps"]["gateway_credential"] == "removed"
     assert details["steps"]["traces"] == "requested"
     assert details["steps"]["tenant_row"] == "removed"
+
+    assert printed == (
+        f"gateway_credential: {details['steps']['gateway_credential']}\n"
+        f"traces: {details['steps']['traces']}\n"
+        f"tenant_row: {details['steps']['tenant_row']}\n"
+        f"backup horizon: {details['backup_horizon']}\n"
+    )
 
     rows = await _operator_actions(environment.superuser_url, "erase")
     assert len(rows) >= 1

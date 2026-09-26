@@ -59,6 +59,12 @@ We choose **option 3** now and option 2 as the growth step.
 - Negative / costs: two roles and a schema to explain in the template; provisioning writes to
   the deployment, not only to the database; beyond a few dozen tenants the file-per-alias model
   becomes unwieldy (the trigger for option 2).
+- Consolidation (spec A5 / #113-#115): `app/repositories/control.py`'s `ControlRepository` is now
+  the one path for every SQL statement against the `control` schema, on either role's session --
+  the session router, the guard, the migration runner, the operator commands, and
+  `app/gateway_provisioning.py` all read and write through it, and the operator tool's own public
+  entry point (`app.operator.cli.main`) is what drives every command through it, checkable rather
+  than merely stated.
 - What becomes harder later: none of substance; option 2 replaces the file loader with a
   client and keeps the aliases.
 
