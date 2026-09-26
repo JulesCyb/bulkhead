@@ -1,7 +1,11 @@
 """Control-plane data access -- the only module that issues SQL against the `control` schema
-(spec A5 / #113; the operator package, `app/operator/`, and `app/gateway_provisioning.py` still
-carry their own copies of that SQL until #114 rewires them onto this repository -- see those
-modules).
+(spec A5 / #113, #114). The operator commands (`app/operator/`) and `app/gateway_provisioning.py`
+are compositions over this repository now: `create`, `erase`, `suspend`/`unsuspend`, `list`, and
+gateway provisioning/revocation call the functions below rather than carrying any SQL of their
+own against `control.*`. `tests/test_control_schema_single_path.py` greps for it (parsing every
+`text(...)` call under `app/`/`scripts/` with `ast`, not a text grep) and exempts only this file
+and, pre-existing and unrelated to spec A5, `app/repositories/agent_identities.py` (see that
+test's own docstring).
 
 Two sides, two session kinds:
 
@@ -19,16 +23,24 @@ Two sides, two session kinds:
   app-role `control_session()` -- `app` is granted `EXECUTE` on the underlying function by
   migration 0017) as well as from the owner-role side below (the migration runner,
   `scripts/migrate.py`), hence its `AsyncConnection | AsyncSession` parameter.
-- **The owner-role write side** (spec A5 / #113, ADR-0010, ADR-0011): every function below takes
-  an already-open owner-role `AsyncConnection` (the operator CLI's own transaction) and writes or
-  reads `control.tenants` directly rather than through a `SECURITY DEFINER` escape hatch, except
-  `set_suspended`, which already has one (`control.set_tenant_suspended()`, migration 0024).
-  `control.tenants` carries `FORCE ROW LEVEL SECURITY` (migration 0002), which binds the owner
-  role exactly as it binds `app` -- every one of those direct reads/writes must first set
-  `app.tenant_id` to the tenant it is about to touch, even to read or write that tenant's own row.
-  `_set_owner_tenant_context` below is the one private helper that idiom lives in; nothing else in
-  the codebase may contain it after #114 (the operator package and `app/gateway_provisioning.py`
-  are exempt until then).
+- **The owner-role write side** (spec A5 / #113, #114, ADR-0010, ADR-0011): every function below
+  takes an already-open owner-role `AsyncConnection` (the operator CLI's own transaction, or one
+  opened for the duration of a single call by a caller with no transaction of its own -- see
+  `app.gateway_provisioning`) and writes or reads `control.tenants` directly rather than through a
+  `SECURITY DEFINER` escape hatch, except `set_suspended`, which already has one
+  (`control.set_tenant_suspended()`, migration 0024). `control.tenants` carries `FORCE ROW LEVEL
+  SECURITY` (migration 0002), which binds the owner role exactly as it binds `app` -- every one of
+  those direct reads/writes must first set `app.tenant_id` to the tenant it is about to touch,
+  even to read or write that tenant's own row. `_set_owner_tenant_context` below is the one
+  private helper that idiom lives in; nothing else in the codebase may contain it (#114). Not
+  every owner-role write needs it: `control.identities` (`IdentityRepository.upsert`) and the two
+  append-only audit tables (`record_operator_action`, `record_erasure`) carry no `tenant_id`/RLS
+  at all (0003, 0004), so those three write with no forced-RLS context.
+- **`enumerate_tenants`** (Spec 9 / #68, migration 0012/0024): every tenant's lifecycle facts, for
+  the `list` command and the tenant-lookup helper (`app/operator/lookup.py`) alike -- lookup fetches
+  the same full enumeration and filters it in Python rather than adding a second, targeted query,
+  since `control.enumerate_tenants()` is the one `SECURITY DEFINER` function granted for this
+  cross-tenant read and this repository is the only caller of it.
 
 The application never creates, changes, or removes an identity; only the owner-role seed/admin
 path does that.
@@ -100,6 +112,38 @@ class IdentityRepository:
         )
         return Identity.model_validate(dict(row)) if row is not None else None
 
+    async def upsert(
+        self,
+        conn: AsyncConnection,
+        *,
+        id: UUID,
+        issuer: str,
+        subject: str,
+        email: str,
+    ) -> UUID:
+        """The owner-role write side (#114, ADR-0003), unlike the two read methods above: insert
+        `control.identities`' admin identity for a tenant `app.operator.create.create_tenant`
+        provisions, or update-in-place (`ON CONFLICT (issuer, subject)`) if that issuer/subject
+        pair already names one -- the same idempotency key `create_tenant`'s own re-run relies on.
+        Also used, with an already-known `id`, to mirror that same identity row into a dedicated
+        tenant's own database (`app.operator.dedicated_db.ensure_dedicated_admin_membership`):
+        its `memberships.identity_id` foreign key needs a local copy even though identity
+        resolution at request time always reads the pooled database's copy (this repository's
+        app-role side, above). `control.identities` carries no `tenant_id`/RLS (migration 0003),
+        so this needs no forced-RLS context, unlike every other owner-role write in this module.
+        """
+        return (
+            await conn.execute(
+                text(
+                    "INSERT INTO control.identities (id, issuer, subject, display_name, email) "
+                    "VALUES (:id, :issuer, :subject, :email, :email) "
+                    "ON CONFLICT (issuer, subject) DO UPDATE SET issuer = EXCLUDED.issuer "
+                    "RETURNING id"
+                ),
+                {"id": id, "issuer": issuer, "subject": subject, "email": email},
+            )
+        ).scalar_one()
+
 
 class TenantAuthSettingsRepository:
     """Reads a named tenant's configured issuer and suspension state through
@@ -160,12 +204,12 @@ async def _set_owner_tenant_context(conn: AsyncConnection, tenant_id: UUID) -> N
     SECURITY` (migration 0002), which binds the owner role exactly as it binds `app` -- an
     owner-role connection must set `app.tenant_id` to the tenant it is about to read or write
     before every direct call against `control.tenants`, even to touch that tenant's own row. The
-    one place this idiom exists in the codebase; nothing else may set `app.tenant_id` against
-    `control.tenants` directly (the operator package and `app/gateway_provisioning.py` still carry
-    their own copies until #114 rewires them onto this repository). Never used by `set_suspended`
-    below, which goes through `control.set_tenant_suspended()` instead -- a `SECURITY DEFINER`
-    function that manages its own escape-hatch flag internally and needs no `app.tenant_id` at
-    all."""
+    one place this idiom exists in the codebase (#114); nothing else may set `app.tenant_id`
+    against `control.tenants` directly -- the operator package and `app/gateway_provisioning.py`
+    call this repository's own functions instead of setting it themselves. Never used by
+    `set_suspended` below, which goes through `control.set_tenant_suspended()` instead -- a
+    `SECURITY DEFINER` function that manages its own escape-hatch flag internally and needs no
+    `app.tenant_id` at all."""
     await conn.execute(
         text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": str(tenant_id)}
     )
@@ -184,6 +228,23 @@ class RoutingState:
 
     isolation_tier: str | None
     database_alias: str | None
+    suspended_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class TenantSummary:
+    """One tenant's lifecycle facts, exactly as `control.enumerate_tenants()` (migration
+    0012/0024) reports them -- backs both the `list` command (`app/operator/listing.py`) and the
+    tenant-lookup helper (`app/operator/lookup.py`, #114), which filters this same enumeration by
+    id or name in Python rather than adding a second, targeted query against a function granted
+    for exactly this one cross-tenant read."""
+
+    tenant_id: UUID
+    name: str
+    isolation_tier: str
+    residency: str | None
+    database_alias: str | None
+    suspended: bool
     suspended_at: datetime | None
 
 
@@ -280,10 +341,9 @@ class ControlRepository:
     ) -> None:
         """Writes a brand-new tenant's `tenants` row and its `control.tenants` row, atomically on
         the caller's own owner-role transaction -- the same two `INSERT`s
-        `app.operator.create.create_tenant` performs today for a fresh tenant (#70/#71), now
-        behind this repository's one forced-RLS helper instead of that function's own inline
-        `set_config` call. `create_tenant` itself is not yet rewired onto this function -- #114
-        does that; this ticket adds it and tests it directly, with two tenants."""
+        `app.operator.create.create_tenant` performs for a fresh tenant (#70/#71), now behind
+        this repository's one forced-RLS helper instead of that function's own inline
+        `set_config` call (#114)."""
         await _set_owner_tenant_context(conn, tenant_id)
         await conn.execute(
             text(
@@ -379,8 +439,8 @@ class ControlRepository:
         """The owner-role counterpart of `get_tenant_record` (#104): the same full `TenantRecord`
         -- control-plane facts plus tenant-editable settings -- read on the caller's own
         already-open owner-role connection (the operator CLI's transaction) instead of a fresh
-        `tenant_record_session(tenant_id)`. `create`/`erase`'s own reconciliation reads are exactly
-        this shape today, written inline; #114 rewires them onto this function."""
+        `tenant_record_session(tenant_id)`. `create`'s existing-tenant reconciliation and `erase`'s
+        own suspension/tier read (#114) are both exactly this shape."""
         await _set_owner_tenant_context(conn, tenant_id)
         row = (
             (await conn.execute(text(_TENANT_RECORD_QUERY), {"tid": str(tenant_id)}))
@@ -389,3 +449,63 @@ class ControlRepository:
         )
         settings = await TenantSettingsRepository().get_for_tenant(conn, tenant_id=tenant_id)
         return _record_from_row(tenant_id, row, settings)
+
+    async def enumerate_tenants(self, conn: AsyncConnection) -> list[TenantSummary]:
+        """Every tenant's lifecycle facts (#114), for the `list` command
+        (`app/operator/listing.py`) and the tenant-lookup helper (`app/operator/lookup.py`) alike
+        -- see `TenantSummary`'s own docstring for why lookup reuses this rather than a second,
+        targeted query. Calls `control.enumerate_tenants()` (migration 0012/0024), the same
+        narrow, `current_user`-gated, `SECURITY DEFINER` cross-tenant read the retired per-module
+        SQL issued directly; needs no `app.tenant_id` at all, exactly like
+        `enumerate_referenced_aliases` -- the function manages its own escape-hatch flag
+        internally."""
+        rows = (
+            await conn.execute(text("SELECT * FROM control.enumerate_tenants() ORDER BY name"))
+        ).all()
+        return [
+            TenantSummary(
+                tenant_id=row.tenant_id,
+                name=row.name,
+                isolation_tier=row.isolation_tier,
+                residency=row.residency,
+                database_alias=row.database_alias,
+                suspended=row.suspended,
+                suspended_at=row.suspended_at,
+            )
+            for row in rows
+        ]
+
+    async def record_operator_action(
+        self, conn: AsyncConnection, *, tenant_id: UUID, action: str, details_json: str
+    ) -> None:
+        """Writes one row to `control.operator_actions` (migration 0004, #114) -- the owner-role
+        counterpart of `app.operator.audit.record_action`, which builds `details_json` (the
+        redacted-argument, timing, and outcome payload) and calls this. No `app.tenant_id` needed:
+        this table carries no RLS at all, only the append-only-by-grant restriction migration
+        0004 puts on `INSERT` (see CLAUDE.md's "Do not touch" list) -- `tenant_id` here is a plain
+        column, not a value RLS filters by."""
+        await conn.execute(
+            text(
+                "INSERT INTO control.operator_actions (tenant_id, action, details) "
+                "VALUES (:tenant_id, :action, CAST(:details AS jsonb))"
+            ),
+            {"tenant_id": str(tenant_id), "action": action, "details": details_json},
+        )
+
+    async def record_erasure(
+        self, conn: AsyncConnection, *, tenant_id: UUID, details_json: str
+    ) -> None:
+        """Writes one row to `control.tenant_erasures` (migration 0004, #114) -- the owner-role
+        counterpart of `app.operator.erase.record_erasure`, which builds `details_json`
+        (`EraseResult.as_details()`) and calls this. Deliberately takes `tenant_id` as a plain
+        value, not a foreign key, and needs no `app.tenant_id`: this row must document and outlive
+        the tenant row `erase_tenant` may have just deleted, exactly as migration 0004 requires,
+        and carries no RLS at all -- only the same append-only-by-grant restriction as
+        `record_operator_action` above."""
+        await conn.execute(
+            text(
+                "INSERT INTO control.tenant_erasures (tenant_id, details) "
+                "VALUES (:tenant_id, CAST(:details AS jsonb))"
+            ),
+            {"tenant_id": str(tenant_id), "details": details_json},
+        )

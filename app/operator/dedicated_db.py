@@ -1,5 +1,5 @@
 """Provision a dedicated tenant's own physical database, idempotently (#71, ADR-0002, ADR-0010,
-ADR-0011).
+ADR-0011, #114).
 
 `app.operator.create.create_tenant` calls the two functions here when `isolation_tier="dedicated"`.
 They are kept separate from `create_tenant`'s own single owner-role transaction (a `CREATE
@@ -34,10 +34,14 @@ membership *into that dedicated database* -- unlike a pooled tenant, whose membe
 the same database as the control plane, a dedicated tenant's membership can only ever live in its
 own database (`tests/test_tenant_session_routing_integration.py` proves a dedicated tenant's data
 is physically absent from the pooled database). It also mirrors the admin identity row into the
-dedicated database's own (otherwise unused) `control.identities` table: `memberships.identity_id`
-foreign-keys to it in every database migrations create it in, even though identity resolution at
-request time always reads the pooled database's copy (`app/repositories/control.py`) -- the
-dedicated database's copy exists only to satisfy that per-database foreign key.
+dedicated database's own (otherwise unused) `control.identities` table, through
+`app.repositories.control.IdentityRepository.upsert` (#114) rather than SQL of its own:
+`memberships.identity_id` foreign-keys to it in every database migrations create it in, even
+though identity resolution at request time always reads the pooled database's copy
+(`app/repositories/control.py`) -- the dedicated database's copy exists only to satisfy that
+per-database foreign key. The `tenants`/`memberships` rows themselves stay this module's own raw
+SQL: they are not the control schema, and the repository has no owner-side membership function
+for them (see `ensure_dedicated_admin_membership`'s own docstring).
 """
 
 from __future__ import annotations
@@ -51,10 +55,11 @@ from uuid import UUID
 
 from sqlalchemy import text
 from sqlalchemy.engine import URL, make_url
-from sqlalchemy.ext.asyncio import create_async_engine
 
 import scripts.migrate as migrate_module
 import scripts.provision_roles as provision_roles_module
+from app.db.lifecycle import owner_engine
+from app.repositories.control import IdentityRepository
 
 # Mirrors app/db/engine_registry.py's own default exactly -- this is the first code path that
 # *writes* to that directory rather than only reading it.
@@ -175,8 +180,7 @@ async def ensure_dedicated_database(
 
     # CREATE DATABASE cannot run inside a transaction block -- AUTOCOMMIT, exactly like
     # docker/postgres/01-init.sh's own separate psql invocation for the gateway database.
-    admin_engine = create_async_engine(admin_dsn, isolation_level="AUTOCOMMIT")
-    try:
+    async with owner_engine(admin_dsn, isolation_level="AUTOCOMMIT") as admin_engine:
         async with admin_engine.connect() as conn:
             exists = (
                 await conn.execute(
@@ -185,8 +189,6 @@ async def ensure_dedicated_database(
             ).first()
             if exists is None:
                 await conn.execute(text(f"CREATE DATABASE {quoted_db}"))
-    finally:
-        await admin_engine.dispose()
 
     new_db_admin_dsn = _render_dsn(admin, database=db_name)
     await provision_roles_module.provision(new_db_admin_dsn)
@@ -250,12 +252,11 @@ async def drop_dedicated_database(*, alias: str, admin_url: str | None) -> str:
 
     # DROP DATABASE cannot run inside a transaction block either -- AUTOCOMMIT, same as
     # `ensure_dedicated_database`'s own CREATE DATABASE.
-    admin_engine = create_async_engine(admin_dsn, isolation_level="AUTOCOMMIT")
-    try:
+    async with owner_engine(admin_dsn, isolation_level="AUTOCOMMIT") as admin_engine:
         async with admin_engine.connect() as conn:
-            # DROP DATABASE fails outright while any session remains connected to it -- terminate
-            # any that are (this process's own prior connections to it, a lingering test fixture,
-            # etc.) before attempting the drop.
+            # DROP DATABASE fails outright while any session remains connected to it --
+            # terminate any that are (this process's own prior connections to it, a lingering
+            # test fixture, etc.) before attempting the drop.
             await conn.execute(
                 text(
                     "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
@@ -264,8 +265,6 @@ async def drop_dedicated_database(*, alias: str, admin_url: str | None) -> str:
                 {"n": alias},
             )
             await conn.execute(text(f"DROP DATABASE IF EXISTS {quoted_db}"))
-    finally:
-        await admin_engine.dispose()
 
     migrations_path.unlink(missing_ok=True)
     app_path.unlink(missing_ok=True)
@@ -285,51 +284,47 @@ async def ensure_dedicated_admin_membership(
 ) -> str:
     """Write the tenant's bookkeeping stub row and first admin membership into its own dedicated
     database (idempotent). Returns `"created"` or `"already exists"` for the membership, matching
-    `create_tenant`'s own pooled-path vocabulary."""
-    engine = create_async_engine(owner_dsn)
-    try:
-        async with engine.begin() as conn:
+    `create_tenant`'s own pooled-path vocabulary.
+
+    The `tenants`/`memberships` rows below are this dedicated database's *own* copies, not the
+    control schema (`app.repositories.control.ControlRepository` has no owner-side membership
+    function, and this insert is against a different physical database than the control plane
+    lives in besides) -- #114 leaves them as this module's own raw SQL, per spec #95's own
+    decision. Only the `control.identities` mirror row goes through
+    `IdentityRepository.upsert`."""
+    async with owner_engine(owner_dsn) as engine, engine.begin() as conn:
+        await conn.execute(
+            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": str(tenant_id)}
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO tenants (id, name, settings) "
+                "VALUES (:id, :name, CAST(:settings AS jsonb)) "
+                "ON CONFLICT (id) DO NOTHING"
+            ),
+            {"id": tenant_id, "name": tenant_name, "settings": tenant_settings_json},
+        )
+        # Mirrors the same identity only to satisfy this database's own
+        # memberships->control.identities foreign key -- never read back from here (identity
+        # resolution always reads the pooled database's copy, app/repositories/control.py).
+        await IdentityRepository().upsert(
+            conn, id=identity_id, issuer=issuer, subject=subject, email=admin_email
+        )
+        existing_membership = (
             await conn.execute(
-                text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": str(tenant_id)}
+                text("SELECT id FROM memberships WHERE tenant_id = :tid AND identity_id = :iid"),
+                {"tid": tenant_id, "iid": identity_id},
             )
+        ).first()
+        if existing_membership is None:
             await conn.execute(
                 text(
-                    "INSERT INTO tenants (id, name, settings) "
-                    "VALUES (:id, :name, CAST(:settings AS jsonb)) "
-                    "ON CONFLICT (id) DO NOTHING"
+                    "INSERT INTO memberships (tenant_id, identity_id, role) "
+                    "VALUES (:tid, :iid, 'admin')"
                 ),
-                {"id": tenant_id, "name": tenant_name, "settings": tenant_settings_json},
+                {"tid": tenant_id, "iid": identity_id},
             )
-            # Mirrors the same identity only to satisfy this database's own
-            # memberships->control.identities foreign key -- never read back from here (identity
-            # resolution always reads the pooled database's copy, app/repositories/control.py).
-            await conn.execute(
-                text(
-                    "INSERT INTO control.identities (id, issuer, subject, display_name, email) "
-                    "VALUES (:id, :issuer, :subject, :email, :email) "
-                    "ON CONFLICT (issuer, subject) DO UPDATE SET issuer = EXCLUDED.issuer"
-                ),
-                {"id": identity_id, "issuer": issuer, "subject": subject, "email": admin_email},
-            )
-            existing_membership = (
-                await conn.execute(
-                    text(
-                        "SELECT id FROM memberships WHERE tenant_id = :tid AND identity_id = :iid"
-                    ),
-                    {"tid": tenant_id, "iid": identity_id},
-                )
-            ).first()
-            if existing_membership is None:
-                await conn.execute(
-                    text(
-                        "INSERT INTO memberships (tenant_id, identity_id, role) "
-                        "VALUES (:tid, :iid, 'admin')"
-                    ),
-                    {"tid": tenant_id, "iid": identity_id},
-                )
-                outcome = "created"
-            else:
-                outcome = "already exists"
-    finally:
-        await engine.dispose()
+            outcome = "created"
+        else:
+            outcome = "already exists"
     return outcome

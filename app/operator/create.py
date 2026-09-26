@@ -1,25 +1,26 @@
-"""The `create` command (Spec 9 / #70 pooled, #71 dedicated, ADR-0010): provisions a tenant --
-pooled or dedicated -- in one idempotent run, replacing `scripts/seed.py`.
+"""The `create` command (Spec 9 / #70 pooled, #71 dedicated, ADR-0010, #114): provisions a tenant
+-- pooled or dedicated -- in one idempotent run, replacing `scripts/seed.py`.
 
-`create_tenant` performs, in order, against the one `AsyncConnection` the operator CLI's `_run`
-already opened (owner role, `app.migration_settings`): (1) the control-plane record (isolation
-tier defaults to `'pooled'`, per migration 0005; for `isolation_tier="dedicated"` a fresh alias
-is minted and recorded), (2) the admin identity (ADR-0003) -- always here, in the pooled/control
-database, since identity resolution always reads that copy
-(`app/repositories/control.py`) regardless of a tenant's own isolation tier, (3) a minted gateway
-credential written to a secret file and recorded by alias (ADR-0009, ADR-0011) -- also unaffected
-by isolation tier. Deliberately everything above happens on that single connection/transaction
-rather than by calling `app.gateway_provisioning.provision_gateway_credential` (which opens its
-own engine and transaction to stay usable standalone, e.g. by a future `rotate` command): sharing
-one transaction is what makes a `create` run atomic end to end for the control-plane pieces -- a
+`create_tenant` is a composition over `app.repositories.control.ControlRepository` and
+`app.gateway_provisioning.provision_gateway_credential`, against the one `AsyncConnection` the
+operator CLI's `_run` already opened (owner role, `app.migration_settings`): (1) the
+control-plane record (isolation tier defaults to `'pooled'`, per migration 0005; for
+`isolation_tier="dedicated"` a fresh alias is minted and recorded, via
+`ControlRepository.create_tenant_record`), (2) the admin identity (ADR-0003, via
+`IdentityRepository.upsert`) -- always here, in the pooled/control database, since identity
+resolution always reads that copy (`app/repositories/control.py`) regardless of a tenant's own
+isolation tier, (3) a minted gateway credential written to a secret file and recorded by alias
+(ADR-0009, ADR-0011), via `provision_gateway_credential(..., conn=conn)` -- also unaffected by
+isolation tier. Passing this function's own `conn` into `provision_gateway_credential` (rather
+than leaving it to open its own engine/transaction, its default when called with neither `conn`
+nor `owner_engine`) is what keeps `create` atomic end to end for the control-plane pieces: a
 failure at any step, including the gateway call, rolls every DB write for this invocation back
-together, and only the credential-issuance primitives (`GatewayAdminClient`,
-`GatewayCredentialLimits`, `generate_gateway_credential_alias`, `write_gateway_credential_file`,
-`build_admin_client`) are reused, not that function's own engine-per-call orchestration. The
-minted credential's usable models come from `settings.residency_allow_list.model_aliases(residency)`
-(`app.residency.ResidencyAllowList`, spec A4 / #85 / #111) -- the same object
-`_validate_model` below checks the tenant's own model choice against, so a credential is never
-minted for a model the allow-list itself would reject.
+together. The minted credential's usable models come from
+`settings.residency_allow_list.model_aliases(residency)` (`app.residency.ResidencyAllowList`,
+spec A4 / #85 / #111) -- the same object `_validate_model` below checks the tenant's own model
+choice against, so a credential is never minted for a model the allow-list itself would reject;
+`provision_gateway_credential` itself raises if that list is empty, so this function does not
+re-check it.
 
 Where the two tiers diverge is the admin membership (#71, ADR-0002): a pooled tenant's first
 admin membership is written to this same pooled connection, exactly as before; a dedicated
@@ -64,10 +65,8 @@ from app.config import Settings, get_settings
 from app.gateway_provisioning import (
     GatewayAdminClient,
     GatewayCredentialLimits,
-    GatewayProvisioningError,
     build_admin_client,
-    generate_gateway_credential_alias,
-    write_gateway_credential_file,
+    provision_gateway_credential,
 )
 from app.operator.dedicated_db import (
     ensure_dedicated_admin_membership,
@@ -75,6 +74,7 @@ from app.operator.dedicated_db import (
     generate_database_alias,
 )
 from app.operator.lookup import TenantNotFoundError, resolve_tenant
+from app.repositories.control import ControlRepository, IdentityRepository
 from app.residency import ResidencyUnresolved
 from app.tenant_settings import TenantSettings
 
@@ -153,6 +153,30 @@ def _validate_isolation_tier(isolation_tier: str) -> None:
         )
 
 
+async def _ensure_pooled_admin_membership(
+    conn: AsyncConnection, tenant_id: UUID, identity_id: UUID
+) -> str:
+    """A pooled tenant's first admin membership lives on this same pooled connection (#71,
+    ADR-0002) -- unlike a dedicated tenant's, which `ensure_dedicated_admin_membership` writes
+    against that tenant's own database instead. `memberships` is not the control schema (no
+    repository function covers it, and none is needed: RLS already scopes it, and this insert
+    needs no forced-RLS workaround), so it stays this module's own small helper rather than a
+    repository method."""
+    existing = (
+        await conn.execute(
+            text("SELECT id FROM memberships WHERE tenant_id = :tid AND identity_id = :iid"),
+            {"tid": tenant_id, "iid": identity_id},
+        )
+    ).first()
+    if existing is not None:
+        return "already exists"
+    await conn.execute(
+        text("INSERT INTO memberships (tenant_id, identity_id, role) VALUES (:tid, :iid, 'admin')"),
+        {"tid": tenant_id, "iid": identity_id},
+    )
+    return "created"
+
+
 async def create_tenant(
     conn: AsyncConnection,
     *,
@@ -175,6 +199,7 @@ async def create_tenant(
     already been provisioned (see `app.operator.dedicated_db.ensure_dedicated_database`).
     """
     settings = settings or get_settings()
+    repo = ControlRepository()
 
     # Validated before any write, in this order, per acceptance criteria: an unrecognized
     # residency, model-allow-list, or isolation-tier selection must reject before the
@@ -198,85 +223,43 @@ async def create_tenant(
 
     if existing is not None:
         tenant_id = existing.tenant_id
-        # Needed even to *read* control.tenants below: FORCE ROW LEVEL SECURITY applies to
-        # app_owner too, and this may be a fresh connection/transaction (e.g. a re-run in a new
-        # process) that never set this transaction-local setting.
-        await conn.execute(
-            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": str(tenant_id)}
-        )
-        row = (
-            (
-                await conn.execute(
-                    text(
-                        "SELECT residency, isolation_tier, database_alias FROM control.tenants "
-                        "WHERE tenant_id = :tid"
-                    ),
-                    {"tid": tenant_id},
-                )
-            )
-            .mappings()
-            .one()
-        )
-        if row["residency"] != residency:
+        record = await repo.get_record(conn, tenant_id)
+        if record.residency != residency:
             raise TenantConflictError(
-                f"tenant {tenant_name!r} already exists with residency {row['residency']!r}; "
+                f"tenant {tenant_name!r} already exists with residency {record.residency!r}; "
                 f"cannot reconcile it with the requested residency {residency!r}"
             )
-        if row["isolation_tier"] != isolation_tier:
+        if record.isolation_tier != isolation_tier:
             raise TenantConflictError(
                 f"tenant {tenant_name!r} already exists with isolation tier "
-                f"{row['isolation_tier']!r}; cannot reconcile it with the requested isolation "
+                f"{record.isolation_tier!r}; cannot reconcile it with the requested isolation "
                 f"tier {isolation_tier!r}"
             )
         control_plane_outcome = "already exists"
-        database_alias = row["database_alias"]
+        database_alias = record.database_alias
+        existing_alias = record.gateway_credential_alias
     else:
         tenant_id = uuid.uuid4()
         database_alias = (
             generate_database_alias(tenant_id) if isolation_tier == "dedicated" else None
         )
-        # Satisfies FORCE ROW LEVEL SECURITY on `tenants`/`control.tenants` even for the owner
-        # role, exactly as the retired seed script had to.
-        await conn.execute(
-            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": str(tenant_id)}
-        )
-        await conn.execute(
-            text(
-                "INSERT INTO tenants (id, name, settings) "
-                "VALUES (:id, :name, CAST(:settings AS jsonb))"
-            ),
-            {"id": tenant_id, "name": tenant_name, "settings": tenant_settings_json},
-        )
-        await conn.execute(
-            text(
-                "INSERT INTO control.tenants (tenant_id, residency, isolation_tier, "
-                "database_alias) VALUES (:tid, :residency, :tier, :alias)"
-            ),
-            {
-                "tid": tenant_id,
-                "residency": residency,
-                "tier": isolation_tier,
-                "alias": database_alias,
-            },
+        await repo.create_tenant_record(
+            conn,
+            tenant_id,
+            name=tenant_name,
+            residency=residency,
+            isolation_tier=isolation_tier,
+            database_alias=database_alias,
+            settings_json=tenant_settings_json,
         )
         control_plane_outcome = "created"
-
-    # `app.tenant_id` is already set on `conn` on both paths above -- the existing-tenant branch
-    # sets it to read `control.tenants`, the fresh-tenant branch to write it.
+        existing_alias = None
 
     # Admin identity + first membership (ADR-0003). `control.identities` has no tenant_id/RLS
     # (0003) -- the upsert needs no tenant context, only the membership insert below does.
-    identity_id = (
-        await conn.execute(
-            text(
-                "INSERT INTO control.identities (id, issuer, subject, display_name, email) "
-                "VALUES (:id, :issuer, :subject, :email, :email) "
-                "ON CONFLICT (issuer, subject) DO UPDATE SET issuer = EXCLUDED.issuer "
-                "RETURNING id"
-            ),
-            {"id": uuid.uuid4(), "issuer": issuer, "subject": subject, "email": admin_email},
-        )
-    ).scalar_one()
+    identity_id = await IdentityRepository().upsert(
+        conn, id=uuid.uuid4(), issuer=issuer, subject=subject, email=admin_email
+    )
 
     dedicated_database_outcome: str | None = None
     if isolation_tier == "dedicated":
@@ -299,66 +282,30 @@ async def create_tenant(
             admin_email=admin_email,
         )
     else:
-        existing_membership = (
-            await conn.execute(
-                text("SELECT id FROM memberships WHERE tenant_id = :tid AND identity_id = :iid"),
-                {"tid": tenant_id, "iid": identity_id},
-            )
-        ).first()
-        if existing_membership is None:
-            await conn.execute(
-                text(
-                    "INSERT INTO memberships (tenant_id, identity_id, role) "
-                    "VALUES (:tid, :iid, 'admin')"
-                ),
-                {"tid": tenant_id, "iid": identity_id},
-            )
-            membership_outcome = "created"
-        else:
-            membership_outcome = "already exists"
+        membership_outcome = await _ensure_pooled_admin_membership(conn, tenant_id, identity_id)
 
-    # Gateway credential (Spec 7 / #53, ADR-0009, ADR-0011).
-    alias_row = (
-        await conn.execute(
-            text("SELECT gateway_credential_alias FROM control.tenants WHERE tenant_id = :tid"),
-            {"tid": tenant_id},
-        )
-    ).first()
-    existing_alias = alias_row[0] if alias_row and alias_row[0] else None
-
+    # Gateway credential (Spec 7 / #53, ADR-0009, ADR-0011): minted, written to a secret file, and
+    # recorded by alias in one call -- `provision_gateway_credential` itself raises if the
+    # residency's model allow-list is empty, so this never re-checks that.
     if existing_alias is not None:
         gateway_outcome = "already provisioned"
         alias = existing_alias
     else:
-        allow_list = settings.residency_allow_list
-        assert allow_list is not None  # set by Settings construction
-        models = allow_list.model_aliases(residency)
-        if not models:
-            raise GatewayProvisioningError(
-                f"no gateway model aliases configured for residency {residency!r} "
-                f"(see settings.residency_allow_list)"
-            )
         owns_admin_client = admin_client is None
         admin_client = admin_client or build_admin_client(settings)
         try:
-            credential = await admin_client.mint_key(
-                tenant_id=tenant_id,
+            alias = await provision_gateway_credential(
+                tenant_id,
+                residency=residency,
                 limits=GatewayCredentialLimits(
                     spend_ceiling_usd=settings.gateway_default_spend_ceiling_usd,
                     budget_reset_period=settings.gateway_default_budget_reset_period,
                     requests_per_minute=settings.gateway_default_requests_per_minute,
                     tokens_per_minute=settings.gateway_default_tokens_per_minute,
                 ),
-                models=models,
-            )
-            alias = generate_gateway_credential_alias(tenant_id)
-            write_gateway_credential_file(alias, credential, settings=settings)
-            await conn.execute(
-                text(
-                    "UPDATE control.tenants SET gateway_credential_alias = :alias "
-                    "WHERE tenant_id = :tid"
-                ),
-                {"alias": alias, "tid": tenant_id},
+                settings=settings,
+                admin_client=admin_client,
+                conn=conn,
             )
             gateway_outcome = "provisioned"
         finally:
