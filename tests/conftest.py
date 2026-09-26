@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import os
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -36,9 +37,13 @@ os.environ.setdefault("LITELLM_BASE_URL", "http://litellm:4000")
 os.environ.setdefault("ENVIRONMENT", "dev")
 os.environ.setdefault("AUTH_MODE", "dev-headers")
 
-from app.agents import assistant as assistant_module
-from app.agents.assistant import AssistantDeps, chat_assistant, one_shot_assistant
-from app.api import chat as chat_module
+from app.agents.run import (
+    ModelResolver,
+    PreparedRun,
+    RunCollaborators,
+    prepare_run,
+    set_run_collaborators_for_tests,
+)
 from app.context import RequestContext
 from app.repositories.control import Identity, TenantAuthSettings
 from app.repositories.documents import DocumentHit
@@ -212,21 +217,67 @@ def fake_save(save_calls):
 
 
 @pytest.fixture
-def deps(ctx, fake_search, fake_history, fake_save) -> AssistantDeps:
-    return AssistantDeps(ctx=ctx, search=fake_search, load_history=fake_history, save_run=fake_save)
+def run_ctx(ctx) -> RequestContext:
+    """`ctx` carrying its own tenant record -- what context resolution attaches to every request
+    (#104), and what `prepare_run` requires. The pooled default record: no residency (so a run
+    goes untraced and the *real* model resolver fails closed), not suspended."""
+    return dataclasses.replace(ctx, tenant_record=TenantRecord.pooled_default(ctx.tenant_id))
+
+
+def returning(model) -> ModelResolver:
+    """A `prepare_run` model resolver that ignores the record and always returns `model` -- a
+    `TestModel`/`FunctionModel`, so no real gateway, credential file, or network is involved."""
+
+    def _resolve(record: TenantRecord, *, settings=None):
+        return model
+
+    return _resolve
+
+
+@pytest.fixture
+async def prepared_run(run_ctx, fake_search, fake_history, fake_save) -> PreparedRun:
+    """A run prepared (`app.agents.run.prepare_run`) with a `TestModel` that calls
+    `search_documents` once, and the recording fakes for search, history, and persistence --
+    everything injected through preparation's own collaborators, nothing patched."""
+    return await prepare_run(
+        run_ctx,
+        model_resolver=returning(TestModel(call_tools=["search_documents"])),
+        search=fake_search,
+        load_history=fake_history,
+        save_run=fake_save,
+    )
+
+
+@pytest.fixture
+def route_run(fake_search, fake_history, fake_save) -> Callable[..., RunCollaborators]:
+    """For a test that drives a route over ASGI (the route calls `prepare_run(ctx)` itself):
+    installs run collaborators through `app.agents.run.set_run_collaborators_for_tests` -- the
+    one test hook -- and removes them again at teardown. Patches nothing on any module.
+
+    Call it as `route_run(model)` for a model every run answers with, or
+    `route_run(model_resolver=...)` for a per-record resolver; `search`/`load_history`/`save_run`
+    default to this suite's recording fakes (`calls`/`contexts`, `history_calls`, `save_calls`).
+    A second call replaces only the fields it passes (`None` = the real collaborator) and keeps
+    the rest, so two fixtures can each contribute one collaborator."""
+    installed = RunCollaborators(search=fake_search, load_history=fake_history, save_run=fake_save)
+
+    def _install(model=None, **fields) -> RunCollaborators:
+        nonlocal installed
+        if model is not None:
+            fields["model_resolver"] = returning(model)
+        installed = dataclasses.replace(installed, **fields)
+        set_run_collaborators_for_tests(installed)
+        return installed
+
+    yield _install
+    set_run_collaborators_for_tests(None)
 
 
 def resolve_to_model(model):
-    """Wraps `model` as a fake `resolve_chat_model` (Spec 8 / #61): the per-tenant, residency-
-    routed model resolver `app.agents.assistant.run_assistant`/`stream_assistant` and
-    `app.api.chat.chat` now call in place of the removed, deployment-wide
-    `app.llm.get_model()` (ai-app-starter#7).
-    Ignores `deps` entirely and always returns `model` — the test seam every ASGI test in this
-    suite uses to inject a `TestModel`/`FunctionModel` without a real database or gateway
-    credential file on disk. Patch both `app.agents.assistant.resolve_chat_model` (used by the
-    one-shot run/stream entry points) and `app.api.chat.resolve_chat_model` (its own
-    `from ... import` binding, a separate name to patch) to cover every entry point a test drives.
-    """
+    """Wraps `model` as a fake of the chat route's own, transitional `resolve_chat_model(deps)`
+    seam (`app/api/chat.py`), which the chat tests and the chat integration tests still patch
+    until #108 moves the chat route onto `app.agents.run` too. The one-shot routes have no such
+    name: a test driving them injects its model with `route_run` (or `prepare_run` directly)."""
 
     async def _resolve(deps):
         return model
@@ -235,26 +286,21 @@ def resolve_to_model(model):
 
 
 @pytest.fixture
-def test_model(monkeypatch):
-    """TestModel calls every named tool once and answers deterministically.
-
-    Overrides both agents (Spec 5 / #36 split) since a test may exercise either the one-shot
-    endpoints or /api/chat without knowing in advance which one it will hit. Restricted to
-    `search_documents` (`call_tools=`, rather than the default `'all'`) so a plain functional test
-    never drives `chat_assistant`'s writing tool, `rename_document` (ADR-0007, #40) -- that tool's
-    own `args_validator` needs a real tenant-bound database session (it writes a pending action),
-    which a test using this fixture is not set up to provide. A test that specifically exercises
-    the writing tool builds its own `TestModel`/`FunctionModel` against a real database instead
-    (see `tests/test_writing_tool_approval_integration.py`). Also patches out per-tenant
-    residency-based model resolution (`resolve_to_model`, above) so no real database connection is
-    attempted before the override even takes effect.
+def test_model(route_run):
+    """TestModel calls every named tool once and answers deterministically -- installed as every
+    run's model through `route_run` (so the one-shot routes and, through its transitional seam,
+    the chat route both answer with it), while search, history, and persistence stay whatever a
+    test sets up itself. Restricted to `search_documents` (`call_tools=`, rather than the default
+    `'all'`) so a plain functional test never drives `chat_assistant`'s writing tool,
+    `rename_document` (ADR-0007, #40) -- that tool's own `args_validator` needs a real
+    tenant-bound database session (it writes a pending action), which a test using this fixture
+    is not set up to provide. A test that specifically exercises the writing tool builds its own
+    `TestModel`/`FunctionModel` against a real database instead (see
+    `tests/test_writing_tool_approval_integration.py`).
     """
     tm = TestModel(call_tools=["search_documents"])
-    resolver = resolve_to_model(tm)
-    monkeypatch.setattr(assistant_module, "resolve_chat_model", resolver)
-    monkeypatch.setattr(chat_module, "resolve_chat_model", resolver)
-    with one_shot_assistant.override(model=tm), chat_assistant.override(model=tm):
-        yield tm
+    route_run(tm, search=None, load_history=None, save_run=None)
+    return tm
 
 
 def looping_tool_calls(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:

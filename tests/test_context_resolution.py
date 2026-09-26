@@ -20,11 +20,11 @@ import jwt
 import pytest
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from pydantic_ai.models.test import TestModel
 
 import app.context_resolution as context_resolution_module
 import app.deps as deps_module
 from app import observability
-from app.agents import assistant as assistant_module
 from app.config import Settings, get_settings
 from app.context import Means
 from app.context_resolution import ContextRejection, RejectionReason, RejectionStatus
@@ -87,9 +87,9 @@ async def _post_run(tenant_id: uuid.UUID, headers: dict[str, str]) -> httpx.Resp
 
 
 @pytest.fixture
-def run_route(monkeypatch, fake_search, test_model):
+def run_route(route_run):
     """The one-shot run route with a fake search tool that records the context it received."""
-    monkeypatch.setattr(assistant_module.document_tools, "search_documents", fake_search)
+    route_run(TestModel(call_tools=["search_documents"]))
 
 
 # --- Delegation proof: each adapter renders whatever the module returns, no second copy ---
@@ -144,6 +144,8 @@ async def test_dev_headers_adapter_hands_on_the_context_the_module_returned(
         ResolvedIdentity(
             identity_id=identity_id, role="support", issuer="agent", credential_public_id="c-1"
         ),
+        # The real module always attaches the tenant record it read (#104); a run needs it.
+        tenant_record=TenantRecord.pooled_default(tenant_id),
     )
     _substitute_resolution(monkeypatch, substituted)
 

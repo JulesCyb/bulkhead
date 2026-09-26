@@ -15,9 +15,9 @@ import httpx
 import pytest
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from pydantic_ai.models.test import TestModel
 
 from app import observability
-from app.agents import assistant as assistant_module
 from app.main import app
 from app.repositories.documents import DocumentHit
 from app.tenant_record import TenantRecord
@@ -38,7 +38,7 @@ def _reset_tracer_providers():
 
 
 @pytest.fixture
-def content_search(monkeypatch):
+def content_search():
     """A fake search tool whose result carries content a test can grep captured spans for —
     exactly the kind of document content ADR-0008 says must never appear unless the tenant has
     opted in."""
@@ -48,12 +48,12 @@ def content_search(monkeypatch):
             DocumentHit(id=uuid.uuid4(), title=DOCUMENT_TITLE, snippet=DOCUMENT_SNIPPET, score=0.9)
         ]
 
-    monkeypatch.setattr(assistant_module.document_tools, "search_documents", _search)
     return _search
 
 
 @pytest.fixture
-def client(content_search, test_model):
+def client(route_run, content_search):
+    route_run(TestModel(call_tools=["search_documents"]), search=content_search)
     transport = httpx.ASGITransport(app=app)
     return httpx.AsyncClient(transport=transport, base_url="http://test")
 

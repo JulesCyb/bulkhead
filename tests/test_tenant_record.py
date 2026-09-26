@@ -14,9 +14,9 @@ from datetime import UTC, datetime
 import httpx
 import jwt
 import pytest
+from pydantic_ai.models.test import TestModel
 
 import app.deps as deps_module
-from app.agents import assistant as assistant_module
 from app.config import Settings
 from app.context import RequestContext
 from app.context_resolution import (
@@ -66,9 +66,7 @@ async def test_a_suspended_record_is_answered_with_the_generic_403_and_nothing_e
     assert response.json() == {"detail": deps_module.FORBIDDEN_DETAIL}
 
 
-async def test_the_tool_receives_the_record_the_context_was_resolved_with(
-    monkeypatch, fake_search, test_model, contexts
-):
+async def test_the_tool_receives_the_record_the_context_was_resolved_with(route_run, contexts):
     tenant_id = uuid.uuid4()
     record = TenantRecord(
         tenant_id=tenant_id,
@@ -77,7 +75,7 @@ async def test_the_tool_receives_the_record_the_context_was_resolved_with(
         settings=TenantSettings(retention_days=30),
     )
     set_default_adapter_for_tests(FakeControlPlaneReads(records={tenant_id: record}))
-    monkeypatch.setattr(assistant_module.document_tools, "search_documents", fake_search)
+    route_run(TestModel(call_tools=["search_documents"]))
 
     response = await _post_run(tenant_id, uuid.uuid4())
 

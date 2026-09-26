@@ -15,10 +15,10 @@ import httpx
 import pytest
 from pydantic_ai.models.test import TestModel
 
-from app.agents import assistant as assistant_module
 from app.api import chat as chat_module
 from app.context import RequestContext
 from app.main import app
+from app.tools import conversations as conversation_tools
 
 HEADER = "X-Request-Id"
 
@@ -29,12 +29,12 @@ def captured_ctx() -> list[RequestContext]:
 
 
 @pytest.fixture
-def client(monkeypatch, captured_ctx, test_model):
+def client(captured_ctx, route_run):
     async def _search(ctx: RequestContext, query: str, limit: int):
         captured_ctx.append(ctx)
         return []
 
-    monkeypatch.setattr(assistant_module.document_tools, "search_documents", _search)
+    route_run(TestModel(call_tools=["search_documents"]), search=_search)
     transport = httpx.ASGITransport(app=app)
     return httpx.AsyncClient(transport=transport, base_url="http://test")
 
@@ -81,9 +81,8 @@ async def test_chat_endpoint_carries_request_id_header(monkeypatch, fake_history
         "resolve_chat_model",
         resolve_to_model(TestModel(call_tools=["search_documents"])),
     )
-    monkeypatch.setattr(
-        assistant_module.conversation_tools, "load_conversation_history", fake_history
-    )
+    # The chat route still builds its own tool dependencies until #108.
+    monkeypatch.setattr(conversation_tools, "load_conversation_history", fake_history)
     transport = httpx.ASGITransport(app=app)
     body = {
         "id": "conv-1",

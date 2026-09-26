@@ -11,7 +11,7 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
-from app.api.agents import _sse
+from app.agents.run_errors import sse
 from app.config import Settings
 from app.main import check_auth_mode
 from app.residency import ResidencyAllowList
@@ -22,11 +22,11 @@ _VALID_KWARGS = {"embedding_provider": "openai", "embedding_model": "text-embedd
 
 
 def test_sse_framing_preserves_newlines():
-    assert _sse("hello") == "data: hello\n\n"
+    assert sse("hello") == "data: hello\n\n"
     # A delta containing newlines must become multiple data: lines (the client
     # reassembles them), never a raw line without the data: prefix.
-    assert _sse("line one\nline two") == "data: line one\ndata: line two\n\n"
-    assert _sse("") == "data: \n\n"
+    assert sse("line one\nline two") == "data: line one\ndata: line two\n\n"
+    assert sse("") == "data: \n\n"
 
 
 def test_dev_headers_refused_outside_dev():

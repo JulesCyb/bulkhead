@@ -9,11 +9,12 @@ import uuid
 
 import httpx
 import pytest
+from pydantic_ai.models.test import TestModel
 
 from app import config
-from app.agents import assistant as assistant_module
 from app.main import app
 from app.request_limit import RequestLimiter, RequestLimitExceeded, _limiter_for
+from app.tools import conversations as conversation_tools
 
 # --- Unit tests: the limiter itself, no HTTP, no settings ---------------------------------
 
@@ -71,11 +72,11 @@ def low_limit(monkeypatch):
 
 
 @pytest.fixture
-def client(monkeypatch, fake_search, fake_history, test_model, low_limit):
-    monkeypatch.setattr(assistant_module.document_tools, "search_documents", fake_search)
-    monkeypatch.setattr(
-        assistant_module.conversation_tools, "load_conversation_history", fake_history
-    )
+def client(monkeypatch, route_run, fake_history, low_limit):
+    route_run(TestModel(call_tools=["search_documents"]))
+    # The chat route still builds its own tool dependencies until #108 moves it onto
+    # `app.agents.run`: its history loader is the real module's, replaced here.
+    monkeypatch.setattr(conversation_tools, "load_conversation_history", fake_history)
     transport = httpx.ASGITransport(app=app)
     return httpx.AsyncClient(transport=transport, base_url="http://test")
 

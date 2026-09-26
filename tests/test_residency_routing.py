@@ -11,12 +11,13 @@ resolvers and use whatever they return -- for two tenants of different residenci
 tenant with no resolvable residency -- rather than reaching the removed, deployment-wide
 `app.llm.get_model()` or `app.embeddings.embed()` defaults.
 
-No real database, no real model/provider call: `resolve_chat_model`
-(`app.agents.assistant`/`app.api.chat`) and `resolve_tenant_embedding_client`
-(`app.tools.documents`) are patched per tenant id, mirroring `tests/conftest.py`'s
-`resolve_to_model` seam -- except in the #105 section, where the real resolver runs from the
-tenant record the request's context carries (`FakeControlPlaneReads.records`) and only client
-construction is replaced, to observe which model name the run actually used.
+No real database, no real model/provider call: the run's model resolver is installed per tenant
+id through `tests/conftest.py`'s `route_run` (the run module's own test hook,
+`app.agents.run.set_run_collaborators_for_tests`), and `resolve_tenant_embedding_client`
+(`app.tools.documents`) is patched per tenant id -- except in the #105 section, where the real
+resolver runs from the tenant record the request's context carries
+(`FakeControlPlaneReads.records`) and only client construction is replaced, to observe which model
+name the run actually used.
 """
 
 from __future__ import annotations
@@ -29,8 +30,7 @@ import pytest
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from app.agents import assistant as assistant_module
-from app.api import chat as chat_module
+from app.agents.run import prepare_run
 from app.config import get_settings
 from app.context import RequestContext
 from app.gateway_credentials import GatewayCredentialUnavailable
@@ -40,6 +40,7 @@ from app.residency import ResidencyAllowList, ResidencyUnresolved
 from app.tenant_record import TenantRecord
 from app.tenant_settings import TenantSettings
 from app.token_verifier import set_default_adapter_for_tests
+from app.tools import conversations as conversation_tools
 from app.tools import documents as document_tools
 from tests.conftest import FakeControlPlaneReads
 
@@ -80,18 +81,18 @@ def asgi_client() -> httpx.AsyncClient:
 
 
 async def test_run_endpoint_uses_the_model_resolved_for_each_tenants_residency(
-    asgi_client, monkeypatch
+    asgi_client, route_run
 ):
     """Two tenants, two residencies, two distinct model routes -- the one-shot `/run` endpoint
-    actually answers through whichever model `resolve_chat_model` resolved for that request's own
-    tenant, never a shared deployment-wide default."""
+    actually answers through whichever model the run's resolver resolved for that request's own
+    tenant record, never a shared deployment-wide default."""
     tenant_eu, tenant_us = uuid.uuid4(), uuid.uuid4()
     routes = {tenant_eu: _model_answering("eu-route"), tenant_us: _model_answering("us-route")}
 
-    async def _fake_resolve(deps):
-        return routes[deps.ctx.tenant_id]
+    def _fake_resolve(record, *, settings=None):
+        return routes[record.tenant_id]
 
-    monkeypatch.setattr(assistant_module, "resolve_chat_model", _fake_resolve)
+    route_run(model_resolver=_fake_resolve)
 
     async with asgi_client:
         response_eu = await asgi_client.post(
@@ -112,23 +113,22 @@ async def test_run_endpoint_uses_the_model_resolved_for_each_tenants_residency(
 
 
 async def test_chat_endpoint_uses_the_model_resolved_for_each_tenants_residency(
-    asgi_client, monkeypatch
+    asgi_client, monkeypatch, route_run
 ):
     """The same claim, driven through `/api/chat` (the Vercel AI SDK adapter) instead of the
     one-shot endpoint."""
     tenant_eu, tenant_us = uuid.uuid4(), uuid.uuid4()
     routes = {tenant_eu: _model_answering("eu-route"), tenant_us: _model_answering("us-route")}
 
-    async def _fake_resolve(deps):
-        return routes[deps.ctx.tenant_id]
+    def _fake_resolve(record, *, settings=None):
+        return routes[record.tenant_id]
 
     async def _fake_load_history(ctx, conversation_id):
         return []
 
-    monkeypatch.setattr(chat_module, "resolve_chat_model", _fake_resolve)
-    monkeypatch.setattr(
-        assistant_module.conversation_tools, "load_conversation_history", _fake_load_history
-    )
+    route_run(model_resolver=_fake_resolve)
+    # The chat route still builds its own tool dependencies until #108.
+    monkeypatch.setattr(conversation_tools, "load_conversation_history", _fake_load_history)
 
     async with asgi_client:
         response_eu = await asgi_client.post(
@@ -157,11 +157,11 @@ async def test_chat_endpoint_uses_the_model_resolved_for_each_tenants_residency(
         GatewayCredentialUnavailable("no gateway credential recorded"),
     ],
 )
-async def test_run_gets_a_clear_failure_not_a_default_route(asgi_client, monkeypatch, raised):
-    async def _fake_resolve(deps):
+async def test_run_gets_a_clear_failure_not_a_default_route(asgi_client, route_run, raised):
+    def _fake_resolve(record, *, settings=None):
         raise raised
 
-    monkeypatch.setattr(assistant_module, "resolve_chat_model", _fake_resolve)
+    route_run(model_resolver=_fake_resolve)
 
     async with asgi_client:
         response = await asgi_client.post(
@@ -175,16 +175,16 @@ async def test_run_gets_a_clear_failure_not_a_default_route(asgi_client, monkeyp
 
 
 async def test_stream_gets_a_clear_failure_as_a_mapped_sse_error_not_a_default_route(
-    asgi_client, monkeypatch
+    asgi_client, route_run
 ):
     """Model resolution happens before the stream opens, but by the time this generator runs the
     ASGI response has already started (status 200) -- so the failure must surface as a mapped
     `event: error`, not a raw exception on an already-started stream (see `app/api/agents.py`)."""
 
-    async def _fake_resolve(deps):
+    def _fake_resolve(record, *, settings=None):
         raise ResidencyUnresolved("tenant has no usable residency")
 
-    monkeypatch.setattr(assistant_module, "resolve_chat_model", _fake_resolve)
+    route_run(model_resolver=_fake_resolve)
 
     async with asgi_client:
         response = await asgi_client.post(
@@ -198,11 +198,11 @@ async def test_stream_gets_a_clear_failure_as_a_mapped_sse_error_not_a_default_r
     assert "content_routing_unavailable" in response.text
 
 
-async def test_chat_gets_a_clear_failure_not_a_default_route(asgi_client, monkeypatch):
-    async def _fake_resolve(deps):
+async def test_chat_gets_a_clear_failure_not_a_default_route(asgi_client, route_run):
+    def _fake_resolve(record, *, settings=None):
         raise ResidencyUnresolved("tenant has no usable residency")
 
-    monkeypatch.setattr(chat_module, "resolve_chat_model", _fake_resolve)
+    route_run(model_resolver=_fake_resolve)
 
     async with asgi_client:
         response = await asgi_client.post(
@@ -214,7 +214,7 @@ async def test_chat_gets_a_clear_failure_not_a_default_route(asgi_client, monkey
 
 
 # --- #105: the tenant's own `model` setting is the model its run uses ---------------------------
-# Real `resolve_chat_model` -> `resolve_tenant_chat_model` from the record the request's context
+# The real resolver, `resolve_tenant_chat_model`, from the record the request's context
 # carries (dev-headers reads it through the installed `FakeControlPlaneReads.records`), a real
 # gateway credential file; only client construction (`app.llm.build_tenant_chat_model`, the
 # network boundary) is swapped for a `FunctionModel` that records the bare model name it was
@@ -272,9 +272,7 @@ def ran_with(monkeypatch, tmp_path) -> list[str]:
     async def _no_history(ctx, conversation_id):
         return []
 
-    monkeypatch.setattr(
-        assistant_module.conversation_tools, "load_conversation_history", _no_history
-    )
+    monkeypatch.setattr(conversation_tools, "load_conversation_history", _no_history)
     return seen
 
 
@@ -366,14 +364,12 @@ async def test_a_record_without_a_residency_is_a_503_routing_error(asgi_client, 
     assert ran_with == []
 
 
-async def test_resolve_chat_model_fails_closed_for_a_context_without_a_record():
-    """A job or test context carries no record: model resolution refuses it rather than reading
+async def test_run_preparation_fails_closed_for_a_context_without_a_record():
+    """A job or test context carries no record: preparing a run refuses it rather than reading
     the control plane again or falling back to the deployment's residency (#105)."""
-    deps = assistant_module.AssistantDeps(
-        ctx=RequestContext(tenant_id=uuid.uuid4(), identity_id=uuid.uuid4())
-    )
+    ctx = RequestContext(tenant_id=uuid.uuid4(), identity_id=uuid.uuid4())
     with pytest.raises(ResidencyUnresolved):
-        await assistant_module.resolve_chat_model(deps)
+        await prepare_run(ctx)
 
 
 # --- AC2 + AC4: document search embeds against the endpoint resolved for the tenant's own ------

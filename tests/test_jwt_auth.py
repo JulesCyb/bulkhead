@@ -16,7 +16,6 @@ import pytest
 
 import app.deps as deps_module
 from app.config import Settings, get_settings
-from app.context import RequestContext
 from app.main import app
 from app.token_verifier import set_default_adapter_for_tests
 from tests.conftest import FakeControlPlaneReads
@@ -279,11 +278,11 @@ async def test_a_change_fed_only_into_the_shared_module_is_observed_at_the_http_
 
 
 async def test_valid_token_succeeds_and_roles_come_from_the_membership_row(
-    jwt_client, monkeypatch, fake_search, test_model
+    jwt_client, route_run, contexts
 ):
-    import app.agents.assistant as assistant_module
+    from pydantic_ai.models.test import TestModel
 
-    monkeypatch.setattr(assistant_module.document_tools, "search_documents", fake_search)
+    route_run(TestModel(call_tools=["search_documents"]))
 
     tenant_id = uuid.uuid4()
     identity_id = uuid.uuid4()
@@ -293,20 +292,11 @@ async def test_valid_token_succeeds_and_roles_come_from_the_membership_row(
         memberships={(tenant_id, identity_id): "support"},
     )
 
-    captured_contexts: list[RequestContext] = []
-    original_run_assistant = assistant_module.run_assistant
-
-    async def _capturing_run_assistant(prompt, deps):
-        captured_contexts.append(deps.ctx)
-        return await original_run_assistant(prompt, deps)
-
-    monkeypatch.setattr("app.api.agents.run_assistant", _capturing_run_assistant)
-
     token = _make_token(audience=str(tenant_id))
     response = await _post_run(tenant_id, token)
     assert response.status_code == 200, response.text
-    assert captured_contexts, "run_assistant should have been called with a context"
-    ctx = captured_contexts[0]
+    assert contexts, "the run's search tool should have been called with a context"
+    ctx = contexts[0]
     assert ctx.tenant_id == tenant_id
     assert ctx.identity_id == identity_id
     assert ctx.roles == frozenset({"support"})

@@ -1,35 +1,31 @@
-"""Unit tests proving the agent-run entry points (`run_assistant`/`stream_assistant`,
-`app/agents/assistant.py`) carry no suspension check of their own (#106, ADR-0010): suspension has
-exactly two enforcement points project-wide (`app/db/session.py`'s module docstring) -- context
-resolution, for a request whose `RequestContext` therefore never reaches this module suspended in
-the first place, and `tenant_session()`'s own routing read, for a record-less context (a job, a
-test, or any caller context resolution never built). This file exercises the second one directly:
-a record-less `ctx` (the shared `ctx` fixture) whose tool opens a real `tenant_session()`, with
-`app.db.session._resolve_tenant_alias` made to behave exactly as it would against a suspended
-tenant's own control-plane row -- no real database, no ASGI request, unlike `tests/test_api.py`'s
-HTTP-level coverage of the same two endpoints and `tests/test_tenant_suspension_asgi.py`'s coverage
-of the first enforcement point.
+"""Unit tests proving a prepared run (`app.agents.run`: preparation, `answer`, `stream_text`)
+carries no suspension check of its own (#106, ADR-0010): suspension has exactly two enforcement
+points project-wide (`app/db/session.py`'s module docstring) -- context resolution, which refuses a
+suspended tenant's record before a `RequestContext` for it is ever built, and `tenant_session()`
+itself, which refuses a record that says suspended (or, for a record-less context, its own routing
+read). This file exercises the second one directly: a context whose record says suspended, whose
+tool opens a real `tenant_session()` -- no real database, no ASGI request, unlike
+`tests/test_api.py`'s HTTP-level coverage of the same two endpoints and
+`tests/test_tenant_suspension_asgi.py`'s coverage of the first enforcement point. A record-less
+context never reaches a run at all: preparation refuses it (`tests/test_run.py`).
 """
 
 from __future__ import annotations
 
+import dataclasses
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+
 import pytest
+from pydantic_ai.models.test import TestModel
 
-import app.db.session as session_module
-from app.agents.assistant import AssistantDeps, run_assistant, stream_assistant
+from app.agents.run import prepare_run
 from app.db.session import TenantSuspendedError, tenant_session
+from tests.conftest import returning
 
 
-def _fail_the_session_routing_read(monkeypatch: pytest.MonkeyPatch, tenant_id) -> None:
-    """Stands in for `_resolve_tenant_alias`'s real behaviour against a suspended tenant's own
-    `control.tenants_view` row -- raising before `tenant_session()` ever opens a session against
-    the tenant's actual data, exactly like the real routing read (`app/db/session.py`)."""
-
-    async def _raise(ctx):
-        assert ctx.tenant_id == tenant_id
-        raise TenantSuspendedError(ctx.tenant_id)
-
-    monkeypatch.setattr(session_module, "_resolve_tenant_alias", _raise)
+async def _collect(stream: AsyncIterator[str]) -> str:
+    return "".join([delta async for delta in stream])
 
 
 async def _search_opens_a_session(ctx, query, limit):
@@ -40,42 +36,48 @@ async def _search_opens_a_session(ctx, query, limit):
     return []  # pragma: no cover -- unreachable; tenant_session raises before yielding
 
 
-async def test_run_assistant_has_no_suspension_check_of_its_own_and_the_session_layer_raises(
-    ctx, monkeypatch, test_model
+@pytest.fixture
+def suspended_ctx(run_ctx):
+    record = dataclasses.replace(
+        run_ctx.tenant_record, suspended_at=datetime(2026, 1, 1, tzinfo=UTC)
+    )
+    return dataclasses.replace(run_ctx, tenant_record=record)
+
+
+@pytest.mark.parametrize("execute", ["answer", "stream_text"])
+async def test_the_run_has_no_suspension_check_of_its_own_and_the_session_layer_raises(
+    suspended_ctx, execute
 ):
-    """`run_assistant` no longer checks suspension itself (#106): a `TenantSuspendedError` raised
-    deep inside a tool's own `tenant_session()` call -- the record-less context's one enforcement
-    point -- propagates out of `run_assistant` untouched, not caught or duplicated by a check of
-    its own. `test_model` (`tests/conftest.py`) drives the one-shot agent through exactly one call
-    to `search_documents`, and patches `resolve_chat_model` so model resolution never depends on
-    the record-less `ctx` this test is about."""
-    _fail_the_session_routing_read(monkeypatch, ctx.tenant_id)
+    """Suspension has exactly two enforcement points (`app/db/session.py`'s module docstring):
+    context resolution, and `tenant_session()` itself. Preparation and execution add none -- a
+    record that says suspended is prepared without complaint, and the `TenantSuspendedError` a
+    tool's own `tenant_session()` raises propagates out of the execution untouched."""
+    prepared = await prepare_run(
+        suspended_ctx,
+        model_resolver=returning(TestModel(call_tools=["search_documents"])),
+        search=_search_opens_a_session,
+    )
 
     with pytest.raises(TenantSuspendedError) as exc_info:
-        await run_assistant("hi", AssistantDeps(ctx=ctx, search=_search_opens_a_session))
-    assert exc_info.value.tenant_id == ctx.tenant_id
+        if execute == "answer":
+            await prepared.answer("hi")
+        else:
+            await _collect(prepared.stream_text("hi"))
+    assert exc_info.value.tenant_id == suspended_ctx.tenant_id
 
 
-async def test_stream_assistant_has_no_suspension_check_of_its_own_and_the_session_layer_raises(
-    ctx, monkeypatch, test_model
-):
-    """Same proof for the streaming entry point."""
-    _fail_the_session_routing_read(monkeypatch, ctx.tenant_id)
-
-    with pytest.raises(TenantSuspendedError) as exc_info:
-        async with stream_assistant("hi", AssistantDeps(ctx=ctx, search=_search_opens_a_session)):
-            pytest.fail("the stream must never open once a tool call raises")
-    assert exc_info.value.tenant_id == ctx.tenant_id
-
-
-async def test_run_assistant_reaches_the_tool_when_nothing_is_suspended(ctx, test_model, calls):
-    """Negative control: with no suspension anywhere, `run_assistant` actually reaches the
-    injected `search` -- proving the failure the two tests above rely on comes from inside the
-    tool call, not from some other, earlier check this rewrite forgot to remove."""
+async def test_the_run_reaches_the_tool_when_nothing_is_suspended(run_ctx, calls):
+    """Negative control for the test above: the failure there comes from inside the tool call,
+    not from an earlier check."""
 
     async def _search_records_it_ran(ctx, query, limit):
         calls.append((ctx.tenant_id, query, limit))
         return []
 
-    await run_assistant("hi", AssistantDeps(ctx=ctx, search=_search_records_it_ran))
-    assert calls and calls[0][0] == ctx.tenant_id
+    prepared = await prepare_run(
+        run_ctx,
+        model_resolver=returning(TestModel(call_tools=["search_documents"])),
+        search=_search_records_it_ran,
+    )
+    await prepared.answer("hi")
+    assert calls and calls[0][0] == run_ctx.tenant_id
