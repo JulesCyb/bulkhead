@@ -7,35 +7,22 @@ before any tool runs, independently of whatever HTTP-layer check (`app/deps.py`)
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
-from types import SimpleNamespace
-
 import pytest
 
-import app.tenant_suspension as tenant_suspension_module
 from app.agents.assistant import AssistantDeps, run_assistant, stream_assistant
 from app.tenant_suspension import TenantSuspendedError
+from app.token_verifier import set_default_adapter_for_tests
+from tests.conftest import FakeControlPlaneReads
 
 
-def _suspend(monkeypatch) -> None:
-    @asynccontextmanager
-    async def _fake_control_session():
-        yield None
-
-    class _FakeTenantAuthSettingsRepository:
-        async def get(self, session, *, tenant_id, default_issuer=None):
-            return SimpleNamespace(issuer=default_issuer, suspended=True)
-
-    monkeypatch.setattr(tenant_suspension_module, "control_session", _fake_control_session)
-    monkeypatch.setattr(
-        tenant_suspension_module,
-        "TenantAuthSettingsRepository",
-        _FakeTenantAuthSettingsRepository,
+def _suspend(ctx) -> None:
+    set_default_adapter_for_tests(
+        FakeControlPlaneReads(auth_settings={ctx.tenant_id: (None, True)})
     )
 
 
-async def test_run_assistant_rejects_a_suspended_tenant_before_any_tool_runs(monkeypatch, ctx):
-    _suspend(monkeypatch)
+async def test_run_assistant_rejects_a_suspended_tenant_before_any_tool_runs(ctx):
+    _suspend(ctx)
 
     async def _boom(ctx, query, limit):
         pytest.fail("no tool must run for a suspended tenant")
@@ -44,10 +31,8 @@ async def test_run_assistant_rejects_a_suspended_tenant_before_any_tool_runs(mon
         await run_assistant("hi", AssistantDeps(ctx=ctx, search=_boom))
 
 
-async def test_stream_assistant_rejects_a_suspended_tenant_before_opening_the_stream(
-    monkeypatch, ctx
-):
-    _suspend(monkeypatch)
+async def test_stream_assistant_rejects_a_suspended_tenant_before_opening_the_stream(ctx):
+    _suspend(ctx)
 
     async def _boom(ctx, query, limit):
         pytest.fail("no tool must run for a suspended tenant")

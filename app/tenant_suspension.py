@@ -15,25 +15,33 @@ Takes a bare `tenant_id`, not a `RequestContext`: the AUTH_MODE=jwt branch has a
 the URL path) before it has resolved an identity or a role, so a full context isn't always
 available yet at the point suspension needs checking.
 
-Uses the same narrow, cross-tenant-free control-plane read the AUTH_MODE=jwt path already made
-before #44's refactor (`control.tenant_auth_settings()` via `TenantAuthSettingsRepository`, over
-`control_session()`, which sets no `app.tenant_id` at all) -- never a second mechanism. A tenant
-with no control-plane row at all is not suspended (ADR-0002's pooled default).
+Reaches the same narrow, cross-tenant-free control-plane read the AUTH_MODE=jwt path already made
+before #44's refactor -- `control.tenant_auth_settings()` -- through the one injectable adapter
+`app.token_verifier.ControlPlaneReads` also uses for its own reads (#100): this module no longer
+imports `control_session`/`TenantAuthSettingsRepository` itself, only `app.token_verifier`'s
+`default_adapter()` (the real repositories, unless a test has installed an override via
+`app.token_verifier.set_default_adapter_for_tests`). A tenant with no control-plane row at all is
+not suspended (ADR-0002's pooled default).
 """
 
 from __future__ import annotations
 
 from uuid import UUID
 
-from app.db.session import TenantSuspendedError, control_session
-from app.repositories.control import TenantAuthSettingsRepository
+from app.db.session import TenantSuspendedError
+from app.token_verifier import ControlPlaneReads, default_adapter
 
 __all__ = ["TenantSuspendedError", "ensure_tenant_not_suspended"]
 
 
-async def ensure_tenant_not_suspended(tenant_id: UUID) -> None:
-    """Raises `TenantSuspendedError` if `tenant_id` is currently suspended."""
-    async with control_session() as session:
-        auth_settings = await TenantAuthSettingsRepository().get(session, tenant_id=tenant_id)
+async def ensure_tenant_not_suspended(
+    tenant_id: UUID, *, adapter: ControlPlaneReads | None = None
+) -> None:
+    """Raises `TenantSuspendedError` if `tenant_id` is currently suspended.
+
+    `adapter` defaults to `app.token_verifier.default_adapter()` -- a caller never needs to pass
+    it explicitly outside a test."""
+    adapter = adapter if adapter is not None else default_adapter()
+    auth_settings = await adapter.get_tenant_auth_settings(tenant_id=tenant_id)
     if auth_settings is not None and auth_settings.suspended:
         raise TenantSuspendedError(tenant_id)

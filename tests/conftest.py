@@ -6,7 +6,7 @@ import asyncio
 import os
 import uuid
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 
 import pytest
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
@@ -39,7 +39,9 @@ from app.agents import assistant as assistant_module
 from app.agents.assistant import AssistantDeps, chat_assistant, one_shot_assistant
 from app.api import chat as chat_module
 from app.context import RequestContext
+from app.repositories.control import Identity, TenantAuthSettings
 from app.repositories.documents import DocumentHit
+from app.token_verifier import set_default_adapter_for_tests
 
 
 @pytest.fixture
@@ -49,33 +51,77 @@ def ctx() -> RequestContext:
     )
 
 
-@pytest.fixture(autouse=True)
-def not_suspended(monkeypatch):
-    """Default fake for `app.tenant_suspension.ensure_tenant_not_suspended`'s one control-plane
-    read (Spec 9 / #69): no test in this file-free suite has a real database, so by default every
-    tenant looks unsuspended -- mirroring the real repository's own "no control-plane row -> not
-    suspended" default (ADR-0002). Every caller (app/deps.py's dev-headers branch,
-    app/mcp/server.py, app/agents/assistant.py, app/api/chat.py) shares this one seam, so patching
-    it here once is enough for the whole ASGI/MCP/agent-run test suite; a test that wants a
-    suspended tenant re-patches `TenantAuthSettingsRepository.get` (or `control_session`) itself,
-    after this fixture runs, to report one before making its request.
+@dataclass
+class FakeControlPlaneReads:
+    """The one shared fake of `app.token_verifier.ControlPlaneReads` (#100): replaces every
+    hand-written per-repository fake (tenant auth settings, memberships, identities) that used to
+    be monkeypatched directly onto `app.token_verifier` or `app.tenant_suspension`. Installed as
+    the process-wide default via
+    `app.token_verifier.set_default_adapter_for_tests` (the `not_suspended` fixture below does
+    this for every test by default); a test that needs specific identities, memberships, or
+    auth settings installs its own instance the same way, or constructs one and passes it as
+    `verify_tenant_token`'s own `adapter=` keyword directly (`tests/test_token_verifier.py`'s
+    pattern).
+
+    `identities`: {(issuer, subject): identity_id}.
+    `memberships`: {(tenant_id, identity_id): role}.
+    `auth_settings`: {tenant_id: (issuer, suspended)} -- a missing key means no control-plane row
+    at all, mirroring the real repository's own "no row -> not suspended, fall back to the
+    caller's default_issuer" behaviour (ADR-0002).
+    `explode`: names of `ControlPlaneReads` methods that must never be called at all -- raises
+    `AssertionError` if one of them is, for the tests proving an agent-issued token never
+    consults the tenant's own auth settings.
     """
-    import app.tenant_suspension as tenant_suspension_module
 
-    @asynccontextmanager
-    async def _fake_control_session():
-        yield None
+    identities: dict[tuple[str, str], uuid.UUID] = field(default_factory=dict)
+    memberships: dict[tuple[uuid.UUID, uuid.UUID], str] = field(default_factory=dict)
+    auth_settings: dict[uuid.UUID, tuple[str | None, bool]] = field(default_factory=dict)
+    explode: frozenset[str] = frozenset()
 
-    class _FakeTenantAuthSettingsRepository:
-        async def get(self, session, *, tenant_id, default_issuer=None):
+    def _forbid(self, name: str) -> None:
+        if name in self.explode:
+            raise AssertionError(f"{name} must not be called")
+
+    async def find_identity_by_issuer_and_subject(
+        self, *, issuer: str, subject: str
+    ) -> Identity | None:
+        self._forbid("find_identity_by_issuer_and_subject")
+        identity_id = self.identities.get((issuer, subject))
+        if identity_id is None:
             return None
+        return Identity(id=identity_id, issuer=issuer, subject=subject)
 
-    monkeypatch.setattr(tenant_suspension_module, "control_session", _fake_control_session)
-    monkeypatch.setattr(
-        tenant_suspension_module,
-        "TenantAuthSettingsRepository",
-        _FakeTenantAuthSettingsRepository,
-    )
+    async def get_tenant_auth_settings(
+        self, *, tenant_id: uuid.UUID, default_issuer: str | None = None
+    ) -> TenantAuthSettings | None:
+        self._forbid("get_tenant_auth_settings")
+        if tenant_id not in self.auth_settings:
+            return None
+        issuer, suspended = self.auth_settings[tenant_id]
+        return TenantAuthSettings(issuer=issuer or default_issuer, suspended=suspended)
+
+    async def get_membership_role(
+        self, *, tenant_id: uuid.UUID, identity_id: uuid.UUID
+    ) -> str | None:
+        self._forbid("get_membership_role")
+        return self.memberships.get((tenant_id, identity_id))
+
+
+@pytest.fixture(autouse=True)
+def not_suspended():
+    """Default fake control-plane-reads adapter (Spec 9 / #69, and #100's adapter seam): no test
+    in this file-free suite has a real database, so by default every tenant looks unsuspended --
+    mirroring the real repository's own "no control-plane row -> not suspended" default
+    (ADR-0002), and every identity/membership lookup returns nothing. Installed once, process-wide,
+    via `app.token_verifier.set_default_adapter_for_tests` -- the one seam
+    `app.tenant_suspension.ensure_tenant_not_suspended` and `app.token_verifier.verify_tenant_token`
+    both fall back to (app/deps.py's dev-headers branch, app/mcp/server.py, app/agents/assistant.py,
+    app/api/chat.py all share it). A test that wants a suspended tenant, or specific identities/
+    memberships, installs its own `FakeControlPlaneReads` the same way, after this fixture runs.
+    """
+    set_default_adapter_for_tests(FakeControlPlaneReads())
+    yield
+    set_default_adapter_for_tests(None)
 
 
 @pytest.fixture

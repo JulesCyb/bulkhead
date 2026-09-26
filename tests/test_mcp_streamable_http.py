@@ -34,7 +34,6 @@ import json
 import time
 import uuid
 from contextlib import asynccontextmanager
-from types import SimpleNamespace
 
 import httpx
 import jwt
@@ -42,10 +41,10 @@ import pytest
 
 import app.deps as deps_module
 import app.mcp.server as mcp_server
-import app.token_verifier as token_verifier_module
 from app.config import Settings, get_settings
-from app.context import RequestContext
 from app.repositories.documents import DocumentHit
+from app.token_verifier import set_default_adapter_for_tests
+from tests.conftest import FakeControlPlaneReads
 
 HUMAN_SECRET = "mcp-streamable-http-test-human-secret-32-bytes"
 AGENT_SECRET = "mcp-streamable-http-test-agent-secret-32-bytes!"
@@ -74,41 +73,15 @@ def _make_token(
     return jwt.encode(claims, secret, algorithm=algorithm)
 
 
-@asynccontextmanager
-async def _fake_session():
-    yield None
-
-
-def _install_fake_control_plane(monkeypatch, *, auth_settings, identities, memberships):
-    """Mirrors `tests/test_jwt_auth.py`'s own helper -- installed on `app.token_verifier` (the
-    module `app.deps.get_context` and `app.mcp.server.MCPTenantAuthMiddleware` both call into,
-    issue #44)."""
-
-    class FakeTenantAuthSettingsRepository:
-        async def get(self, session, *, tenant_id, default_issuer=None):
-            if tenant_id not in auth_settings:
-                return None
-            issuer, suspended = auth_settings[tenant_id]
-            return SimpleNamespace(issuer=issuer or default_issuer, suspended=suspended)
-
-    class FakeIdentityRepository:
-        async def find_by_issuer_and_subject(self, session, *, issuer, subject):
-            identity_id = identities.get((issuer, subject))
-            if identity_id is None:
-                return None
-            return SimpleNamespace(id=identity_id, issuer=issuer, subject=subject)
-
-    class FakeMembershipRepository:
-        async def get_role(self, session, ctx: RequestContext, *, identity_id):
-            return memberships.get((ctx.tenant_id, identity_id))
-
-    monkeypatch.setattr(token_verifier_module, "control_session", _fake_session)
-    monkeypatch.setattr(token_verifier_module, "tenant_session", lambda ctx: _fake_session())
-    monkeypatch.setattr(
-        token_verifier_module, "TenantAuthSettingsRepository", FakeTenantAuthSettingsRepository
+def _install_fake_control_plane(*, auth_settings, identities, memberships):
+    """Mirrors `tests/test_jwt_auth.py`'s own helper: installs one `FakeControlPlaneReads` (#100)
+    as the default adapter both `app.deps.get_context` and `app.mcp.server.MCPTenantAuthMiddleware`
+    fall back to (both call into `app.token_verifier.verify_tenant_token`, issue #44)."""
+    set_default_adapter_for_tests(
+        FakeControlPlaneReads(
+            auth_settings=auth_settings, identities=identities, memberships=memberships
+        )
     )
-    monkeypatch.setattr(token_verifier_module, "IdentityRepository", FakeIdentityRepository)
-    monkeypatch.setattr(token_verifier_module, "MembershipRepository", FakeMembershipRepository)
 
 
 async def _fake_inner_app(scope, receive, send):
@@ -185,13 +158,12 @@ async def _mcp_request(app, tenant_id: uuid.UUID, token: str | None) -> httpx.Re
 # --- AC1: a connection whose token names a different tenant than its address is refused ---
 
 
-async def test_token_naming_a_different_tenant_is_refused(monkeypatch, mcp_app):
+async def test_token_naming_a_different_tenant_is_refused(mcp_app):
     app, _ = mcp_app
     tenant_id = uuid.uuid4()
     other_tenant = uuid.uuid4()
     identity_id = uuid.uuid4()
     _install_fake_control_plane(
-        monkeypatch,
         auth_settings={tenant_id: (HUMAN_ISSUER, False)},
         identities={(HUMAN_ISSUER, "sub-1"): identity_id},
         memberships={(tenant_id, identity_id): "member"},
@@ -213,12 +185,11 @@ async def test_missing_token_is_unauthorized(mcp_app):
 # --- AC2: a person's token resolves to delegation (actor=person, means=the assistant's tools) ---
 
 
-async def test_persons_token_resolves_to_delegation(monkeypatch, mcp_app):
+async def test_persons_token_resolves_to_delegation(mcp_app):
     app, _ = mcp_app
     tenant_id = uuid.uuid4()
     identity_id = uuid.uuid4()
     _install_fake_control_plane(
-        monkeypatch,
         auth_settings={tenant_id: (HUMAN_ISSUER, False)},
         identities={(HUMAN_ISSUER, "sub-1"): identity_id},
         memberships={(tenant_id, identity_id): "member"},
@@ -237,12 +208,11 @@ async def test_persons_token_resolves_to_delegation(monkeypatch, mcp_app):
 # --- AC3: an agent identity's token resolves to autonomous use (actor=identity, means=cred) ---
 
 
-async def test_agent_identity_token_resolves_to_autonomous_use(monkeypatch, mcp_app):
+async def test_agent_identity_token_resolves_to_autonomous_use(mcp_app):
     app, _ = mcp_app
     tenant_id = uuid.uuid4()
     identity_id = uuid.uuid4()
     _install_fake_control_plane(
-        monkeypatch,
         auth_settings={tenant_id: (HUMAN_ISSUER, False)},
         identities={(mcp_server.AGENT_IDENTITY_ISSUER, "agent-sub-1"): identity_id},
         memberships={(tenant_id, identity_id): "agent"},
@@ -403,7 +373,6 @@ async def test_real_wire_protocol_hands_search_documents_the_verified_persons_co
     tenant_id = uuid.uuid4()
     identity_id = uuid.uuid4()
     _install_fake_control_plane(
-        monkeypatch,
         auth_settings={tenant_id: (HUMAN_ISSUER, False)},
         identities={(HUMAN_ISSUER, "sub-1"): identity_id},
         memberships={(tenant_id, identity_id): "member"},
@@ -451,7 +420,6 @@ async def test_real_wire_protocol_hands_search_documents_the_agent_identitys_con
     tenant_id = uuid.uuid4()
     identity_id = uuid.uuid4()
     _install_fake_control_plane(
-        monkeypatch,
         auth_settings={tenant_id: (HUMAN_ISSUER, False)},
         identities={(mcp_server.AGENT_IDENTITY_ISSUER, "agent-sub-1"): identity_id},
         memberships={(tenant_id, identity_id): "agent"},
@@ -504,7 +472,6 @@ async def test_two_concurrent_connections_each_see_only_their_own_tenant(monkeyp
     tenant_a, tenant_b = uuid.uuid4(), uuid.uuid4()
     identity_a, identity_b = uuid.uuid4(), uuid.uuid4()
     _install_fake_control_plane(
-        monkeypatch,
         auth_settings={tenant_a: (HUMAN_ISSUER, False), tenant_b: (HUMAN_ISSUER, False)},
         identities={
             (HUMAN_ISSUER, "sub-a"): identity_a,

@@ -21,11 +21,11 @@ import jwt
 import pytest
 
 import app.agent_credential_exchange as exchange_module
-import app.token_verifier as token_verifier_module
 from app.config import Settings, get_settings
 from app.context import RequestContext
 from app.main import app
-from app.token_verifier import AGENT_IDENTITY_ISSUER
+from app.token_verifier import AGENT_IDENTITY_ISSUER, verify_tenant_token
+from tests.conftest import FakeControlPlaneReads
 
 SIGNING_KEY = "agent-token-exchange-test-shared-secret-32-bytes"
 # The tenant's own human-IdP issuer -- deliberately distinct from AGENT_IDENTITY_ISSUER below, to
@@ -81,7 +81,12 @@ def _install_fakes(
         async def verify_and_touch(self, *args, **kwargs):
             return await store.verify_and_touch(*args, **kwargs)
 
-    class FakeIdentityRepository:
+    class _FakeExchangeIdentityRepository:
+        """Fakes `app.agent_credential_exchange.IdentityRepository.get_by_id` -- unrelated to (and
+        not migrated by) #100's control-plane-reads adapter, whose `find_identity_by_issuer_and_
+        subject` covers only the different lookup `app.token_verifier` needs to *verify* a
+        presented token; this repository is used to *mint* one instead."""
+
         async def get_by_id(self, session, *, identity_id):
             pair = identities.get(identity_id)
             if pair is None:
@@ -96,7 +101,7 @@ def _install_fakes(
     monkeypatch.setattr(
         exchange_module, "AgentCredentialRepository", FakeAgentCredentialRepository()
     )
-    monkeypatch.setattr(exchange_module, "IdentityRepository", FakeIdentityRepository)
+    monkeypatch.setattr(exchange_module, "IdentityRepository", _FakeExchangeIdentityRepository)
 
 
 def _settings(**overrides) -> Settings:
@@ -331,45 +336,26 @@ async def test_issued_token_round_trips_through_the_shared_verifier(monkeypatch,
 
     # Verify through the exact module Spec 6's MCP transport is meant to reuse (#44), not by
     # re-decoding the JWT by hand -- this is the round trip the acceptance criterion asks for.
+    # `explode={"get_tenant_auth_settings"}` (#100) proves that read is never consulted for an
+    # agent-issuer token (see module docstring in app/token_verifier.py): if it were, it would
+    # return the tenant's own (different) issuer, which would fail signature verification against
+    # SIGNING_KEY under the wrong `iss`.
     def _key_source(issuer: str, kid: str | None) -> str:
         return SIGNING_KEY
 
-    class FakeIdentityRepositoryForVerify:
-        async def find_by_issuer_and_subject(self, session, *, issuer, subject):
-            if (issuer, subject) != (AGENT_IDENTITY_ISSUER, "agent-sub-1"):
-                return None
-            return SimpleNamespace(id=identity_id, issuer=issuer, subject=subject)
-
-    class FakeMembershipRepository:
-        async def get_role(self, session, ctx: RequestContext, *, identity_id):
-            return "agent"
-
-    class FakeTenantAuthSettingsRepositoryForVerify:
-        async def get(self, session, *, tenant_id, default_issuer=None):
-            # Never called for an agent-issuer token (see module docstring in
-            # app/token_verifier.py) -- present only to prove that: if this were consulted, it
-            # would return the tenant's own (different) issuer, which would fail signature
-            # verification against SIGNING_KEY under the wrong `iss`.
-            raise AssertionError("tenant auth settings must not be consulted for an agent token")
-
-    monkeypatch.setattr(token_verifier_module, "control_session", _fake_session)
-    monkeypatch.setattr(token_verifier_module, "tenant_session", lambda ctx: _fake_session())
-    monkeypatch.setattr(
-        token_verifier_module, "IdentityRepository", FakeIdentityRepositoryForVerify
-    )
-    monkeypatch.setattr(token_verifier_module, "MembershipRepository", FakeMembershipRepository)
-    monkeypatch.setattr(
-        token_verifier_module,
-        "TenantAuthSettingsRepository",
-        FakeTenantAuthSettingsRepositoryForVerify,
+    verify_adapter = FakeControlPlaneReads(
+        identities={(AGENT_IDENTITY_ISSUER, "agent-sub-1"): identity_id},
+        memberships={(tenant_id, identity_id): "agent"},
+        explode=frozenset({"get_tenant_auth_settings"}),
     )
 
-    resolved = await token_verifier_module.verify_tenant_token(
+    resolved = await verify_tenant_token(
         token,
         tenant_id=tenant_id,
         key_source=_key_source,
         default_issuer=None,
         algorithm_source=lambda issuer: ("HS256",),
+        adapter=verify_adapter,
     )
 
     assert resolved.identity_id == identity_id
