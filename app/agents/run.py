@@ -124,6 +124,7 @@ from app.agents.assistant import (
     one_shot_assistant,
 )
 from app.agents.writing_tools import writing_tool
+from app.config import get_settings
 from app.context import RequestContext
 from app.llm import resolve_tenant_chat_model
 from app.observability import (
@@ -166,10 +167,21 @@ _test_collaborators: RunCollaborators | None = None
 
 
 def set_run_collaborators_for_tests(collaborators: RunCollaborators | None) -> None:
-    """Test-only hook (#107): installs `collaborators` as what `prepare_run` uses for every
-    collaborator its caller does not pass explicitly -- the seam a test driving a route over ASGI
-    uses (the route calls `prepare_run(ctx)` with none), instead of patching a module attribute.
-    A field left `None` keeps the real collaborator. Call with `None` to restore all of them."""
+    """Test-only hook (#107), for the no-database suite only: installs `collaborators` as what
+    `prepare_run` uses for every collaborator its caller does not pass explicitly -- the seam a
+    test driving a route over ASGI uses (the route calls `prepare_run(ctx)` with none), instead of
+    patching a module attribute. A field left `None` keeps the real collaborator. Call with `None`
+    to restore all of them.
+
+    Fails closed outside development: raises `RuntimeError`, installing nothing, unless
+    `get_settings().environment` is `dev` or `test` at the moment of the call (code review
+    2026-09-26) -- this overrides model resolution for every run of the process."""
+    environment = get_settings().environment
+    if environment not in ("dev", "test"):
+        raise RuntimeError(
+            "set_run_collaborators_for_tests is a test-only hook and is refused in environment "
+            f"{environment!r}; it may only be called with ENVIRONMENT=dev or ENVIRONMENT=test."
+        )
     global _test_collaborators
     _test_collaborators = collaborators
 

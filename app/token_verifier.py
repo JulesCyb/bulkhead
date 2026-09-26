@@ -48,6 +48,7 @@ from uuid import UUID
 
 import jwt as _pyjwt
 
+from app.config import get_settings
 from app.context import RequestContext
 from app.db.session import (
     TenantSuspendedError,
@@ -244,11 +245,22 @@ _test_default_adapter: ControlPlaneReads | None = None
 
 
 def set_default_adapter_for_tests(adapter: ControlPlaneReads | None) -> None:
-    """Test-only hook (#100): installs `adapter` as what `default_adapter()` below returns, for
-    every call to `verify_tenant_token` (and `app.context_resolution`'s own tenant-record read)
-    that doesn't pass its own `adapter=` explicitly -- the one seam `tests/conftest.py`'s autouse
-    `default_control_plane_reads` fixture uses instead of monkeypatching a repository or a session
-    function on this module. Call with `None` to restore the real, repository-backed adapter."""
+    """Test-only hook (#100), for the no-database suite only: installs `adapter` as what
+    `default_adapter()` below returns, for every call to `verify_tenant_token` (and
+    `app.context_resolution`'s own tenant-record read) that doesn't pass its own `adapter=`
+    explicitly -- the one seam `tests/conftest.py`'s autouse `default_control_plane_reads` fixture
+    uses instead of monkeypatching a repository or a session function on this module. Call with
+    `None` to restore the real, repository-backed adapter.
+
+    Fails closed outside development: raises `RuntimeError`, installing nothing, unless
+    `get_settings().environment` is `dev` or `test` at the moment of the call (code review
+    2026-09-26) -- this overrides every auth read of the process."""
+    environment = get_settings().environment
+    if environment not in ("dev", "test"):
+        raise RuntimeError(
+            "set_default_adapter_for_tests is a test-only hook and is refused in environment "
+            f"{environment!r}; it may only be called with ENVIRONMENT=dev or ENVIRONMENT=test."
+        )
     global _test_default_adapter
     _test_default_adapter = adapter
 
