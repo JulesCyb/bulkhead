@@ -21,7 +21,8 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from app.config import RESIDENCY_ALLOW_LIST, Settings
+from app.config import Settings
+from app.residency import ResidencyAllowList
 from app.tenant_settings import TenantSettings
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -367,9 +368,11 @@ def test_residency_doc_claim_names_what_the_code_actually_enforces() -> None:
 
 
 def test_residency_doc_sub_processor_list_matches_the_allow_list_object() -> None:
-    # Every host RESIDENCY_ALLOW_LIST actually contains is named in the doc -- not a hand-copied
+    # Every host the allow-list object actually contains is named in the doc -- not a hand-copied
     # second list that could silently drift from it.
-    for residency, route in RESIDENCY_ALLOW_LIST.items():
+    allow_list = ResidencyAllowList.load()
+    for residency in allow_list.residencies:
+        route = allow_list.route_for(residency)
         assert residency in RESIDENCY_MD, f"residency {residency!r} not named in docs/residency.md"
         assert route.trace_sink_host in RESIDENCY_MD, (
             f"trace sink host {route.trace_sink_host!r} for {residency!r} not named in the doc"

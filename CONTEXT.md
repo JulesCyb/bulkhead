@@ -24,6 +24,15 @@ path that carries content out of the process (model, embeddings, tracing) honour
 data never crosses it.
 _Avoid_: region (as a synonym), data location, hosting, EU flag
 
+**Residency allow-list**:
+Which residencies exist and the endpoints (model/gateway host, embedding endpoint, trace sink)
+and gateway model aliases each one may reach — one `ResidencyAllowList` object
+(`app/residency.py`), built from `config/residency.toml`, that answers every "is this residency
+known, and what is its route" question the deployment or a tenant's own request can ask. Adding a
+residency is a new table in that file, never a code change; a lookup outside the list fails
+closed.
+_Avoid_: region list, allowed models (as a synonym for the whole object), provider allow-list
+
 **Budget**:
 How much model usage a tenant may consume in a period, enforced outside the application at the
 gateway with credentials issued per tenant. An exhausted budget stops that tenant, never the

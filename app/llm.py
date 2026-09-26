@@ -12,7 +12,8 @@ The one entry point that builds a chat client lives here:
 
 - `resolve_tenant_chat_model()` — the per-tenant entry point (Spec 7 / #54, ADR-0009): before a
   chat client is ever built, the tenant's chosen model name is validated against the allow-list
-  for its residency (`RESIDENCY_MODEL_ALLOW_LIST`, app/config.py) and rejected with
+  for its residency (`settings.residency_allow_list`, `app.residency.ResidencyAllowList`) and
+  rejected with
   `ModelNotAllowedForResidency` if it is not on it — before any client is constructed and before
   any network call is attempted. The client that is finally built is constructed from that
   tenant's own gateway credential (`app.gateway_credentials`, #52) and cached per tenant id, so
@@ -41,7 +42,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import RESIDENCY_MODEL_ALLOW_LIST, Settings, get_settings
+from app.config import Settings, get_settings
 from app.context import RequestContext
 from app.gateway_credentials import resolve_gateway_credential
 from app.repositories.control import ControlRepository
@@ -61,7 +62,7 @@ class ModelNotAllowedForResidency(Exception):
         self.residency = residency
         super().__init__(
             f"model {model_name!r} is not on the allow-list for residency {residency!r} "
-            f"(see RESIDENCY_MODEL_ALLOW_LIST in app/config.py)"
+            f"(see settings.residency_allow_list, app.residency.ResidencyAllowList)"
         )
 
 
@@ -70,14 +71,17 @@ def _bare_model_name(name: str) -> str:
     return name.split(":", 1)[1] if ":" in name else name
 
 
-def validate_model_for_residency(model_name: str, residency: str) -> str:
+def validate_model_for_residency(
+    model_name: str, residency: str, *, settings: Settings | None = None
+) -> str:
     """Returns the bare (gateway alias) model name if `model_name` is allow-listed for
-    `residency`; raises `ModelNotAllowedForResidency` otherwise. Pure and synchronous: no client,
-    no network call, no database -- callable directly against configuration and a residency
-    string, before anything else is resolved.
+    `residency`; raises `ModelNotAllowedForResidency` otherwise. Synchronous and side-effect-free
+    beyond reading `settings.residency_allow_list` (`get_settings()` when not given) -- no client,
+    no network call, no database.
     """
+    s = settings or get_settings()
     bare = _bare_model_name(model_name)
-    allowed = RESIDENCY_MODEL_ALLOW_LIST.get(residency, ())
+    allowed = s.residency_allow_list.model_aliases(residency)  # type: ignore[union-attr]
     if bare not in allowed:
         raise ModelNotAllowedForResidency(model_name, residency)
     return bare
@@ -156,7 +160,7 @@ async def resolve_tenant_chat_model(
     if residency is None:
         raise ResidencyUnresolved(f"tenant {ctx.tenant_id} has no residency recorded")
     name = model_name or s.llm_model
-    bare = validate_model_for_residency(name, residency)
+    bare = validate_model_for_residency(name, residency, settings=s)
     credential = await resolve_gateway_credential(session, ctx, settings=s)
     return build_tenant_chat_model(ctx.tenant_id, bare, credential, settings=s)
 
