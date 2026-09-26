@@ -1,13 +1,17 @@
 """Tests for the test support package itself (issue #96 / spec #90, "A6"; dedicated-tier
-seeding is issue #97 / "A6-T2").
+seeding is issue #97 / "A6-T2"; seeding through the operator commands and the shared gateway fake
+is issue #98 / "A6-T3").
 
 Proves the guarantees every later integration test in this suite leans on: that `seed_tenant`
 really isolates two tenants' documents and memberships through the real session layer (not just
 by construction) for both a pooled and a dedicated tenant; that a dedicated tenant's own rows
 are physically absent from the pooled database, not merely policy-hidden; that its NOT-NULL-
 column guard really fires when a table grows a column the seeder does not know about, instead of
-failing with a cryptic constraint violation or silently inserting a wrong default; and that the
-`environment` fixture's secret directories are genuinely temporary.
+failing with a cryptic constraint violation or silently inserting a wrong default; that the
+`environment` fixture's secret directories are genuinely temporary; and (#98) that a seeded
+tenant's gateway credential is real (readable through the real credential reader), that
+suspending a seeded tenant through the fixture is really enforced by the session layer, and that
+the shared gateway fake really recorded what `create_tenant` asked it to mint.
 """
 
 from __future__ import annotations
@@ -21,7 +25,8 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 pgserver = pytest.importorskip("pgserver")
 
-from app.db.session import get_engine, tenant_session  # noqa: E402
+from app.db.session import TenantSuspendedError, get_engine, tenant_session  # noqa: E402
+from app.gateway_credentials import read_gateway_credential  # noqa: E402
 from app.repositories.documents import DocumentRepository  # noqa: E402
 from app.repositories.memberships import MembershipRepository  # noqa: E402
 from tests.support import (  # noqa: E402
@@ -177,3 +182,59 @@ async def test_dedicated_seeding_without_the_environment_fixture_fails_closed(cl
     `app/db/engine_registry.py`/`scripts/migrate.py`'s production secrets paths."""
     with pytest.raises(RuntimeError, match="TENANT_DB_MIGRATIONS_SECRETS_DIR"):
         await seed_tenant(cluster, isolation_tier="dedicated")
+
+
+async def test_pooled_seeding_via_operator_without_the_environment_fixture_fails_closed(cluster):
+    """The same fail-closed guarantee, for `via_operator=True`'s own secrets directory
+    (`GATEWAY_CREDENTIALS_DIR`) -- given the bare `cluster` fixture, seeding must refuse rather
+    than silently write a minted credential's secret file to `app.config.Settings`'s production
+    default (`/run/secrets`)."""
+    with pytest.raises(RuntimeError, match="GATEWAY_CREDENTIALS_DIR"):
+        await seed_tenant(cluster)
+
+
+async def test_seeded_tenants_credential_alias_resolves_to_a_readable_secret_file(environment):
+    """AC (#98): "A seeded tenant's credential alias resolves to a readable secret file through
+    the real credential reader" -- `app.gateway_credentials.read_gateway_credential`, with no
+    settings override, reading whatever `GATEWAY_CREDENTIALS_DIR` the `environment` fixture
+    pointed at."""
+    tenant = await seed_tenant(environment, roles=["admin"])
+
+    assert tenant.gateway_credential_alias is not None
+    credential = read_gateway_credential(tenant.gateway_credential_alias)
+    assert credential.get_secret_value() == tenant.gateway_admin_client.fake.key
+
+
+async def test_suspending_a_seeded_tenant_makes_the_session_router_refuse_it(environment):
+    """AC (#98): "Suspending a seeded tenant makes the session router refuse it" -- through
+    `SeededTenant.suspend()` (`app.operator.suspend.set_tenant_suspended`), observed against the
+    real `tenant_session()`, not by reading back `control.tenants.suspended_at` ourselves."""
+    tenant = await seed_tenant(environment, roles=["admin"])
+
+    async with tenant_session(tenant.ctx("admin")):
+        pass  # not suspended yet -- a real session opens without error
+
+    result = await tenant.suspend()
+    assert result.changed is True
+
+    with pytest.raises(TenantSuspendedError):
+        async with tenant_session(tenant.ctx("admin")):
+            pass
+
+    unsuspend_result = await tenant.unsuspend()
+    assert unsuspend_result.changed is True
+
+    async with tenant_session(tenant.ctx("admin")):
+        pass  # restored -- a real session opens without error again
+
+
+async def test_the_shared_gateway_fake_records_the_mint_requests_models(environment):
+    """AC (#98): "The shared fake records the mint request's models" -- the exact `models` list
+    `create_tenant` asked the gateway to mint the credential for, taken from the tenant's own
+    residency's model allow-list (`config/residency.toml`)."""
+    tenant = await seed_tenant(environment, roles=["admin"], residency="eu")
+
+    fake = tenant.gateway_admin_client.fake
+    assert fake.generate_calls == 1
+    assert fake.generate_requests[-1]["models"] == ["claude-eu", "embeddings"]
+    assert fake.generate_requests[-1]["metadata"]["tenant_id"] == str(tenant.tenant_id)
