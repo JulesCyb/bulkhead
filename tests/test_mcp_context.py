@@ -1,5 +1,6 @@
 """The MCP server's development-only context provider (identity_id naming, env-based), tenant
-suspension's second enforcement point for the `stdio` fallback (#106, ADR-0010), and its startup
+suspension's second refusal point (the session layer's routing read) for the `stdio` fallback
+(#106, ADR-0010), and its startup
 transport guard (issue #48 / ADR-0005)."""
 
 from __future__ import annotations
@@ -63,7 +64,7 @@ async def test_resolve_context_no_longer_checks_suspension_itself(monkeypatch):
 async def test_stdio_fallback_tool_call_is_refused_by_the_session_layer_when_suspended(
     monkeypatch,
 ):
-    """Suspension's second enforcement point (#106, `app/db/session.py`'s module docstring): the
+    """Suspension's second refusal point (#106, `app/db/session.py`'s module docstring): the
     `stdio` transport's env-based context (`_context_from_env`) carries no tenant record, so
     nothing refuses it at `resolve_context()` -- the first tool call that actually opens a
     `tenant_session()` (here, the real `document_tools.search_documents`, reached through the

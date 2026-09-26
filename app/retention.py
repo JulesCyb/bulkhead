@@ -27,10 +27,9 @@ A suspended tenant is skipped outright (#106, ADR-0010): its record is read (the
 every tenant gets), `record.suspended` is checked before anything else, and a suspended tenant
 gets one log line and no `tenant_session()` -- never `TenantSuspendedError` raised mid-sweep, which
 would otherwise abort the whole job's `for` loop at whichever tenant happened to be suspended.
-This is this job's own instance of the same two-enforcement-point rule `app/db/session.py`
-documents: a job is exactly the kind of record-carrying, non-HTTP caller that rule expects to
-decide suspension for itself, right after building the record, rather than letting
-`tenant_session()` raise for it.
+The reason is CONTEXT.md's definition of suspension -- a state in which "nothing is deleted"
+(ADR-0010) -- and it is the one deliberate exception to CLAUDE.md rule 2's "with no exception"
+for retention; `app/db/session.py`'s module docstring lists where suspension itself is refused.
 """
 
 from __future__ import annotations

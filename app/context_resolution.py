@@ -8,7 +8,7 @@ Glossary (`CONTEXT.md`):
 - **Identity** -- a person or agent known by (issuer, subject); a token names one.
 - **Membership** -- the identity's relation to this tenant; its **Role** is the only role the
   resulting context carries (never a client-supplied one, except under `dev-headers`).
-- **Suspension** -- a suspended tenant gets no context at all, from any adapter.
+- **Suspension** -- a suspended tenant gets no context at all, from any adapter (below).
 - **Delegation** -- a person's request runs with the person's membership; the means is the agent
   that handles it (`("agent", "assistant")`).
 - **Agent identity** -- an agent's own identity acting with no person present; the means is the
@@ -30,6 +30,21 @@ What this module does, in order, for a bearer token (`resolve_bearer_context`):
    lookup routes its tenant session by the record, so it reads no control-plane row of its own.
 5. Assigns the means (`actor_context`) and builds the context with a fresh request id, carrying
    the record (`RequestContext.tenant_record`) for `tenant_session` to route by.
+
+**Suspension (ADR-0010) is refused at three points, one per kind of caller** -- the same list
+`app/db/session.py`'s module docstring and CLAUDE.md rule 2 give:
+
+1. A request is refused at context resolution, on the tenant record it reads -- here: the bearer
+   path maps the verifier's `TenantSuspendedAtVerification` to `TENANT_SUSPENDED`, the
+   dev-headers path decides it on the record it reads itself (`_read_tenant_record`). No context
+   is ever built for a suspended tenant.
+2. A caller without a record (the stdio MCP fallback, `resolve_stdio_env_context` below; a test)
+   is refused by `tenant_session()`'s own routing read.
+3. A context that carries a suspended record is refused by `tenant_session()` itself.
+
+The retention job skips a suspended tenant on its record, because CONTEXT.md defines suspension
+as "nothing is deleted" (ADR-0010) -- the one deliberate exception to CLAUDE.md rule 2's "with no
+exception" for retention.
 
 `AUTH_MODE=dev-headers` (local development only) is its own function, `resolve_dev_headers_context`,
 returning the same value type: the identity and roles come from `X-Identity-Id`/`X-Roles`, the
@@ -157,9 +172,13 @@ def key_source_for(settings: Settings) -> KeySource:
     (`iss == AGENT_IDENTITY_ISSUER`, minted by `app/agent_credential_exchange.py`) only ever
     against this application's own agent-token key; every other issuer only ever against the
     identity provider's `jwt_verification_key`. A single process-wide key (ADR-0003's
-    operator-run identity provider), never a network JWKS fetch; a customer-owned identity
-    provider needs a JWKS-backed `KeySource` -- override `app.deps.get_key_source`, never make
-    `app/jwt_verifier.py` reach the network itself."""
+    operator-run identity provider), never a network JWKS fetch. A customer-owned identity
+    provider needs a JWKS-backed `KeySource`: change this function (and `algorithm_source_for`
+    below, if its algorithm differs) -- the one place both adapters read, the HTTP one through
+    `app.deps.get_key_source`/`get_algorithm_source` and the MCP one through
+    `resolve_bearer_context`'s own defaults. Overriding `app.deps.get_key_source` alone would
+    reach only the HTTP adapter, never the MCP transport. Never make `app/jwt_verifier.py` reach
+    the network itself."""
 
     def _source(issuer: str, kid: str | None) -> str:
         if issuer == AGENT_IDENTITY_ISSUER:

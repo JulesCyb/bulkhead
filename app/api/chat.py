@@ -52,7 +52,7 @@ async def chat(request: Request, ctx: Context, _limit: RequestLimit) -> Response
         raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "Request body too large")
     # No suspension check here (#106, ADR-0010): `ctx` already carries the record context
     # resolution read and refused a suspended tenant on -- see `app/db/session.py`'s module
-    # docstring for the two enforcement points that cover every path, this one included.
+    # docstring for the three refusal points that cover every path, this one included.
     try:
         adapter = await chat_adapter_from_request(request)
     except ValidationError as exc:

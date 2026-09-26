@@ -102,6 +102,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator, Coroutine, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
@@ -142,6 +143,8 @@ if TYPE_CHECKING:
     from pydantic_ai.capabilities.instrumentation import Instrumentation
 
     from app.config import Settings
+
+log = logging.getLogger(__name__)
 
 
 class ModelResolver(Protocol):
@@ -264,19 +267,24 @@ def _spawn_background(coro: Coroutine[Any, Any, None]) -> None:
     task.add_done_callback(_background_tasks.discard)
 
 
-async def _drain_into_queue(source: AsyncIterator[str], queue: asyncio.Queue[str | None]) -> None:
+async def _drain_into_queue(
+    source: AsyncIterator[str], queue: asyncio.Queue[str | None], *, conversation_id: str
+) -> None:
     """Pulls every chunk out of `source` -- driving it to exhaustion, including whatever
     `on_complete` callback fires on its last item -- regardless of whether anything is still
     reading the other end of `queue`. Errors already surface as an encoded `error` chunk
     upstream (`_bounded_by_deadline`, the adapter's own `on_error`), so nothing here is expected
-    to raise; the `except` is a last-resort guard against an unretrieved-task-exception warning
-    if one somehow does, not a place that swallows a persistence failure.
+    to raise. If something does -- a persistence failure in `on_complete` included -- it is
+    logged with its traceback and the conversation id (`log.exception`), never swallowed
+    silently; it is not re-raised only because nothing awaits this background task, so a raise
+    would surface as nothing but an unretrieved-task-exception warning. The client's stream ends
+    either way.
     """
     try:
         async for chunk in source:
             await queue.put(chunk)
     except Exception:
-        pass
+        log.exception("chat run stream failed for conversation %r", conversation_id)
     finally:
         await queue.put(None)
 
@@ -286,13 +294,16 @@ async def _queue_iterator(queue: asyncio.Queue[str | None]) -> AsyncIterator[str
         yield item
 
 
-def _decouple_from_client(source: AsyncIterator[str]) -> AsyncIterator[str]:
+def _decouple_from_client(
+    source: AsyncIterator[str], *, conversation_id: str
+) -> AsyncIterator[str]:
     """Returns an iterator fed from a background task that drains `source` on its own, so a
     client that stops reading the response never stalls `source` itself (ADR-0006, #34) -- in
     particular, the `on_complete` persistence hook attached to `source` still runs to completion.
+    `conversation_id` names the run in the log line if draining fails.
     """
     queue: asyncio.Queue[str | None] = asyncio.Queue()
-    _spawn_background(_drain_into_queue(source, queue))
+    _spawn_background(_drain_into_queue(source, queue, conversation_id=conversation_id))
     return _queue_iterator(queue)
 
 
@@ -388,7 +399,8 @@ class PreparedRun:
             )
         )
         response.body_iterator = _decouple_from_client(
-            _bounded_by_deadline(response.body_iterator, self.limits, attributes)
+            _bounded_by_deadline(response.body_iterator, self.limits, attributes),
+            conversation_id=conversation_id,
         )
         return response
 

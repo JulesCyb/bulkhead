@@ -552,16 +552,41 @@ def test_claude_md_retention_bullet_states_the_job_skips_suspended_tenants() -> 
     section = " ".join(CLAUDE_MD[section_start:section_end].split())
 
     assert "skips a suspended tenant" in section
-    assert "two enforcement points" in section
+    # Code review 2026-09-26: the skip is named as rule 2's one deliberate exception, and why.
+    assert "nothing is deleted" in section
+    assert "one deliberate exception" in section
+    assert "refused at three points" in section
 
 
-def test_session_layer_docstring_describes_the_two_suspension_enforcement_points() -> None:
-    """The session layer's own docstring (`app/db/session.py`) is the one place that must state
-    plainly that suspension has exactly two enforcement points -- context resolution for a
-    request, and `tenant_session()`'s own routing read for a caller that carries no record."""
-    assert "one enforcement per path" in SESSION_SOURCE
+CONTEXT_RESOLUTION_SOURCE = (REPO_ROOT / "app" / "context_resolution.py").read_text(
+    encoding="utf-8"
+)
+
+
+def test_session_layer_docstring_describes_the_suspension_refusal_points() -> None:
+    """The session layer's own docstring (`app/db/session.py`) states plainly where suspension is
+    refused -- context resolution for a request, `tenant_session()`'s own routing read for a
+    caller that carries no record, `tenant_session()` itself for a suspended record -- and why the
+    retention job skips instead (code review 2026-09-26)."""
+    assert "refused at three points" in SESSION_SOURCE
     assert "context_resolution" in SESSION_SOURCE
     assert "TenantSuspendedError" in SESSION_SOURCE
+    assert "nothing is\ndeleted" in SESSION_SOURCE or "nothing is deleted" in SESSION_SOURCE
+
+
+def test_suspension_is_described_the_same_way_in_all_three_places() -> None:
+    """Code review 2026-09-26: `app/db/session.py`, `app/context_resolution.py`, and CLAUDE.md
+    rule 2 give the same three refusal points and the same retention exception."""
+    rule_2 = next(line for line in CLAUDE_MD.splitlines() if line.strip().startswith("2. **Every"))
+    section_start = CLAUDE_MD.index(rule_2)
+    rule_2_text = CLAUDE_MD[section_start : CLAUDE_MD.index("\n3. ", section_start)]
+    for source in (SESSION_SOURCE, CONTEXT_RESOLUTION_SOURCE, rule_2_text):
+        flat = " ".join(source.split())
+        assert "refused at three points" in flat
+        assert "refused at context resolution" in flat
+        assert "routing read" in flat
+        assert "nothing is deleted" in flat
+        assert "one deliberate exception" in flat
 
 
 RETIRED_SUSPENSION_CLAIM_PHRASES = [

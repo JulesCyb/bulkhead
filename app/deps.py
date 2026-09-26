@@ -45,8 +45,10 @@ log = logging.getLogger(__name__)
 
 def get_key_source(settings: Annotated[Settings, Depends(get_settings)]) -> KeySource:
     """Thin FastAPI alias of `app.context_resolution.key_source_for` (per-issuer key pinning).
-    Override this dependency (`app.dependency_overrides[get_key_source] = ...`) to inject a
-    JWKS-backed or test key source; never edit `app/jwt_verifier.py` to reach the network."""
+    Overriding this dependency (`app.dependency_overrides[get_key_source] = ...`) reaches the
+    HTTP adapter only -- fine for a test key source; a JWKS-backed one belongs in
+    `key_source_for` itself, the one place the MCP transport reads too. Never edit
+    `app/jwt_verifier.py` to reach the network."""
     return context_resolution.key_source_for(settings)
 
 

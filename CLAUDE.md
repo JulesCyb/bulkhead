@@ -101,25 +101,30 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    `app` role, and must be added to the tenant-table registry (`app/db/tenant_tables.py`).
    Template: `migrations/versions/0001_initial.py`.
    `conversations` and `messages` (migration `0020_conversations_and_messages.py`) are additionally
-   governed, with no exception, by the tenant's own retention period (ADR-0006): a tenant's own
-   `settings["retention_days"]`, or the documented default of `DEFAULT_RETENTION_DAYS` (90 days,
-   `app/tenant_settings.py`) when it has never set one, measured from `last_activity_at`. The
+   governed, with no exception but the one below (suspension), by the tenant's own retention
+   period (ADR-0006): a tenant's own `settings["retention_days"]`, or the documented default of
+   `DEFAULT_RETENTION_DAYS` (90 days, `app/tenant_settings.py`) when it has never set one,
+   measured from `last_activity_at`. The
    retention job (`app/retention.py`, run via `scripts/retention.py`) deletes what that period
    expires, one tenant at a time, through the same `tenant_session(ctx)` every other request uses
    — never a superuser or bypass-RLS statement against either table. It builds each tenant's own
    record first (the same one-per-tenant read rule 1 describes for a request) and skips a
-   suspended tenant outright on it — one log line, no `tenant_session()` opened for it (#106) —
-   rather than letting `tenant_session()`'s own suspension check raise mid-sweep and abort the
-   whole run. Suspension has exactly two enforcement points project-wide (`app/db/session.py`'s
-   module docstring: context resolution for a request, `tenant_session()`'s own routing read for a
-   record-less caller); a job that already holds a record, like this one, decides suspension on it
-   directly rather than adding a third, independent check.
+   suspended tenant on it — one log line, no `tenant_session()` opened for it (#106) — because
+   CONTEXT.md defines suspension as a state in which "nothing is deleted" (ADR-0010). **This is
+   the one deliberate exception to "with no exception" above**: a suspended tenant's expired
+   conversations are kept until it is unsuspended (and swept then) or erased.
+   Suspension itself is refused at three points, one per kind of caller (`app/db/session.py`'s
+   and `app/context_resolution.py`'s module docstrings say the same): a request is refused at
+   context resolution (on the tenant record); a caller without a record is refused by the
+   session layer's routing read (`tenant_session()`'s `_resolve_tenant_alias`); a context with a
+   suspended record is refused by `tenant_session()` itself.
 3. **DB access only through repositories** (`app/repositories/`) with sessions from
    `tenant_session(ctx)`. `tenant_session(ctx)` resolves which engine to use internally, from the
    tenant's isolation tier and database alias in the control plane (ADR-0002) — pooled by
    default — with no change to how callers use it: same signature, same transaction behaviour.
    When `ctx.tenant_record` is present it routes by the record and reads nothing; without one (a
-   job, a test) it reads the control plane itself and enforces suspension there (#104).
+   test, the stdio MCP fallback) it reads the control plane itself and refuses suspension there
+   (#104; rule 2 lists all three refusal points).
    The app connects as `app` (no superuser, `NOBYPASSRLS`); migrations and the operator tool
    (`app/operator/`, `scripts/operator.py`) run as the separate `app_owner` role (no superuser,
    `NOBYPASSRLS`, owns every object) via `DATABASE_URL_MIGRATIONS` — a DSN the API container's

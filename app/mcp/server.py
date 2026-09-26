@@ -20,8 +20,8 @@ guarded at startup by `check_mcp_mode` below the same way `AUTH_MODE=dev-headers
 Every tool resolves its context through `resolve_context()`, never `_connection_context` or
 `_context_from_env` directly (ADR-0010, issue #89): it builds the context (per connection first,
 env fallback only under `stdio`) and returns it -- no suspension check of its own (#106).
-Suspension has exactly two enforcement points project-wide (`app/db/session.py`'s module
-docstring): a per-connection context already carries the record `MCPTenantAuthMiddleware`'s call
+Suspension is refused at three points project-wide (`app/db/session.py`'s module docstring):
+a per-connection context already carries the record `MCPTenantAuthMiddleware`'s call
 to `app.context_resolution.resolve_bearer_context` read and refused a suspended tenant on, before
 `_connection_context` was ever set; the `stdio` fallback's env-based context carries no record at
 all, so the first tool call that opens a `tenant_session()` -- `document_tools.search_documents`,
