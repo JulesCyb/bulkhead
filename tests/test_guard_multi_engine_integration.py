@@ -1,172 +1,103 @@
 """Embedded-Postgres integration tests for the fail-closed guard extended to every referenced
 database engine (Spec 10, ticket #77 / ADR-0011).
 
-Builds on two pieces of prior art rather than inventing a new pattern: the role-bootstrap +
-full-migration fixture from `tests/test_rls_integration.py` (`database_urls`), run here *twice*
-to stand up an independent "pooled" and "dedicated" instance, and the alias/secret-file wiring
-from `tests/test_engine_registry_integration.py` (#74). The property under test is that
-`app.db.guard.run_role_rls_guard` iterates every database alias `control.database_aliases`
-currently references -- not only the pooled one it always checked before -- so a dangling or
-misconfigured *dedicated* database is caught even though no real request has ever been routed to
-it.
+Built on the shared test support package (`tests.support`, issue #96/#97): one pooled tenant and
+one dedicated tenant, both seeded through `seed_tenant`, give the guard "one alias per isolation
+tier" for real, with the dedicated tenant's own database fully migrated by the real runner --
+exactly the shape `app.db.guard.run_role_rls_guard` must iterate over. The property under test is
+that the guard checks every database alias `control.database_aliases` currently references --
+not only the pooled one it always checked before -- so a dangling or misconfigured *dedicated*
+database is caught even though no real request has ever been routed to it.
+
+Unlike the other three files this package serves, this file cannot point `DATABASE_URL` at the
+shared session `cluster`'s own default database: `run_role_rls_guard()` enumerates *every* alias
+the whole control plane it is pointed at currently references, so an earlier test's (or another
+test module's, sharing the same session-scoped cluster) dedicated tenant would still show up with
+no secret file in *this* test's own fresh `TENANT_DB_SECRETS_DIR` to resolve it. `guard_env`
+below gives each test its own fresh, fully migrated database as "the pooled one" instead --
+still on the same embedded cluster (`tests.support.create_database`), just never the cluster's
+own shared default database.
 """
 
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
-import tempfile
+import asyncio
 import uuid
-from urllib.parse import parse_qs, urlparse
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
-
-from app.config import ROLE_STATEMENT_TIMEOUT_MS
 
 pgserver = pytest.importorskip("pgserver")
 
-DEDICATED_ALIAS = "tenant-red"
+import scripts.migrate as migrate_module  # noqa: E402
+from tests.support import (  # noqa: E402
+    cluster,
+    create_database,
+    environment,
+    migration_run_without_disrupting_logging,
+    seed_tenant,
+)
 
-
-def _psql(server, command: str) -> None:
-    """`server.psql` without a shell: pgserver's own version breaks on paths with spaces."""
-    from pgserver.postgres_server import POSTGRES_BIN_PATH
-
-    subprocess.run(
-        [str(POSTGRES_BIN_PATH / "psql"), server.get_uri()],
-        input=command.encode(),
-        check=True,
-        capture_output=True,
-    )
-
-
-def _bootstrap_and_migrate(prefix: str) -> dict[str, object]:
-    """One ephemeral instance, fully bootstrapped and migrated exactly like `database_urls` in
-    `test_rls_integration.py`: `app_owner` runs the migrations, `app` is the unprivileged runtime
-    role, and pgserver's own `postgres` role stands in for a would-be superuser/BYPASSRLS
-    credential."""
-    pgdata = tempfile.mkdtemp(prefix=prefix)
-    server = pgserver.get_server(pgdata, cleanup_mode="delete")
-    sockdir = parse_qs(urlparse(server.get_uri()).query)["host"][0]
-    _psql(
-        server,
-        "CREATE EXTENSION IF NOT EXISTS vector; "
-        "CREATE ROLE app_owner LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE; "
-        "ALTER SCHEMA public OWNER TO app_owner; "
-        "GRANT CREATE ON DATABASE postgres TO app_owner; "
-        "CREATE ROLE app LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE; "
-        "GRANT USAGE ON SCHEMA public TO app; "
-        f"ALTER ROLE app SET statement_timeout = '{ROLE_STATEMENT_TIMEOUT_MS}ms';",
-    )
-    urls = {
-        "migrations": f"postgresql+asyncpg://app_owner@/postgres?host={sockdir}",
-        "app": f"postgresql+asyncpg://app@/postgres?host={sockdir}",
-        "superuser": f"postgresql+asyncpg://postgres@/postgres?host={sockdir}",
-    }
-    env = {**os.environ, "DATABASE_URL_MIGRATIONS": urls["migrations"], "DATABASE_URL": urls["app"]}
-    subprocess.run(
-        [sys.executable, "-m", "alembic", "upgrade", "head"], check=True, env=env, timeout=120
-    )
-    return {"server": server, **urls}
-
-
-@pytest.fixture(scope="module")
-def pooled_instance():
-    info = _bootstrap_and_migrate("pgdata-guard-pooled-")
-    yield info
-    info["server"].cleanup()
-
-
-@pytest.fixture(scope="module")
-def dedicated_instance():
-    info = _bootstrap_and_migrate("pgdata-guard-dedicated-")
-    yield info
-    info["server"].cleanup()
+# `cluster`/`environment` are imported only so pytest can discover them as fixtures from this
+# module's namespace -- referenced only by parameter name in the tests below, never called
+# directly.
+_ = (cluster, environment)
 
 
 @pytest.fixture
-def guard_env(pooled_instance, dedicated_instance, tmp_path, monkeypatch):
-    """Points the application's own engine (`app.db.session.get_engine`, which the guard's
-    pooled alias always resolves to) at `pooled_instance["app"]`, wires
-    `TENANT_DB_SECRETS_DIR` at a fresh per-test directory, and seeds one pooled and one
-    dedicated tenant in the pooled instance's control plane -- exactly the "one alias per
-    isolation tier" shape the acceptance criteria ask for. The dedicated tenant's alias has no
-    secret file yet; individual tests write one pointed at whichever `dedicated_instance` DSN
-    (or a deliberately wrong one) that test wants the guard to find.
+async def guard_env(environment, monkeypatch):
+    """A fresh, fully migrated database, isolated per test, standing in as "the pooled one" for
+    this file's guard tests -- see module docstring for why this file, alone among the four,
+    cannot reuse `environment`'s own shared database directly. `environment` still supplies both
+    temporary secrets directories and the cache-reset dance; only `DATABASE_URL`/
+    `DATABASE_URL_MIGRATIONS` are re-pointed here, on top of it.
     """
     from app import config
     from app.db import engine_registry
     from app.db import session as db_session
 
-    monkeypatch.setenv("DATABASE_URL", pooled_instance["app"])
-    monkeypatch.setenv("DATABASE_URL_MIGRATIONS", pooled_instance["migrations"])
-    secrets_dir = tmp_path / "tenant-db"
-    secrets_dir.mkdir()
-    monkeypatch.setenv("TENANT_DB_SECRETS_DIR", str(secrets_dir))
+    alias = f"guard-pooled-{uuid.uuid4().hex[:8]}"
+    fresh_pooled = await create_database(environment, alias)
+
+    migrations_secret = migrate_module._migrations_secrets_dir() / alias
+    migrations_secret.write_text(fresh_pooled.owner_url)
+    with migration_run_without_disrupting_logging():
+        await asyncio.to_thread(migrate_module.migrate_alias, alias)
+
+    monkeypatch.setenv("DATABASE_URL", fresh_pooled.app_url)
+    monkeypatch.setenv("DATABASE_URL_MIGRATIONS", fresh_pooled.owner_url)
     config.get_settings.cache_clear()
     db_session._engine = None
     db_session._session_factory = None
     engine_registry.reset_registry_for_tests()
 
-    superuser_engine = create_async_engine(pooled_instance["superuser"])
-
-    async def _seed():
-        pooled_tenant, dedicated_tenant = uuid.uuid4(), uuid.uuid4()
-        tenants = ((pooled_tenant, "pooled-co"), (dedicated_tenant, "dedicated-co"))
-        async with superuser_engine.begin() as conn:
-            for tenant_id, name in tenants:
-                await conn.execute(
-                    text("INSERT INTO tenants (id, name) VALUES (:id, :name)"),
-                    {"id": tenant_id, "name": name},
-                )
-            await conn.execute(
-                text(
-                    "INSERT INTO control.tenants (tenant_id, isolation_tier, database_alias) "
-                    "VALUES (:tid, 'pooled', NULL)"
-                ),
-                {"tid": pooled_tenant},
-            )
-            await conn.execute(
-                text(
-                    "INSERT INTO control.tenants (tenant_id, isolation_tier, database_alias) "
-                    "VALUES (:tid, 'dedicated', :alias)"
-                ),
-                {"tid": dedicated_tenant, "alias": DEDICATED_ALIAS},
-            )
-
-    yield {"secrets_dir": secrets_dir, "seed": _seed, "superuser_engine": superuser_engine}
-
-    config.get_settings.cache_clear()
-    db_session._engine = None
-    db_session._session_factory = None
-    engine_registry.reset_registry_for_tests()
+    try:
+        yield fresh_pooled
+    finally:
+        config.get_settings.cache_clear()
+        db_session._engine = None
+        db_session._session_factory = None
+        engine_registry.reset_registry_for_tests()
 
 
-async def _write_alias_secret(guard_env, dedicated_instance, key: str = "app") -> None:
-    (guard_env["secrets_dir"] / DEDICATED_ALIAS).write_text(dedicated_instance[key])
-
-
-async def test_guard_fails_when_dedicated_alias_is_connected_as_a_bypassrls_role(
-    guard_env, dedicated_instance
-):
+async def test_guard_fails_when_dedicated_alias_is_connected_as_a_bypassrls_role(guard_env):
     """Acceptance: the guard fails startup when a dedicated alias's engine is connected as a
-    role with BYPASSRLS (pgserver's own bootstrap `postgres` role), even though the pooled
-    engine -- checked first -- passes."""
+    role with BYPASSRLS (the dedicated database's own bootstrap superuser), even though the
+    pooled engine -- checked first -- passes."""
+    from app.db.engine_registry import _secrets_dir
     from app.db.guard import PrivilegedRoleOrMissingRLSError, run_role_rls_guard
 
-    await guard_env["seed"]()
-    await _write_alias_secret(guard_env, dedicated_instance, key="superuser")
+    await seed_tenant(guard_env, roles=["member"])
+    tenant = await seed_tenant(guard_env, roles=["member"], isolation_tier="dedicated")
+    # Overwrite the correct app-role secret `seed_tenant` already wrote with the dedicated
+    # database's own bootstrap superuser -- BYPASSRLS, standing in for a misconfigured deployment.
+    (_secrets_dir() / tenant.database_alias).write_text(tenant.database.superuser_url)
 
     with pytest.raises(PrivilegedRoleOrMissingRLSError):
         await run_role_rls_guard()
 
 
-async def test_guard_fails_when_dedicated_alias_has_a_table_missing_forced_rls(
-    guard_env, dedicated_instance
-):
+async def test_guard_fails_when_dedicated_alias_has_a_table_missing_forced_rls(guard_env):
     """Acceptance: the guard fails startup when a dedicated alias's engine points at an
     instance with a table missing forced Row-Level Security, even though the pooled instance is
     fully compliant."""
@@ -174,52 +105,53 @@ async def test_guard_fails_when_dedicated_alias_has_a_table_missing_forced_rls(
     from app.db.models import TENANT_ISOLATION_EXCEPTIONS
 
     assert "scratch_unforced" not in TENANT_ISOLATION_EXCEPTIONS
-    await guard_env["seed"]()
-    await _write_alias_secret(guard_env, dedicated_instance, key="app")
+    await seed_tenant(guard_env, roles=["member"])
+    tenant = await seed_tenant(guard_env, roles=["member"], isolation_tier="dedicated")
 
-    owner_engine = create_async_engine(dedicated_instance["migrations"])
-    try:
-        async with owner_engine.begin() as conn:
+    async with tenant.owner_connection() as conn:
+        async with conn.begin():
             await conn.execute(text("CREATE TABLE scratch_unforced (id int)"))
 
+    try:
         with pytest.raises(PrivilegedRoleOrMissingRLSError):
             await run_role_rls_guard()
     finally:
-        async with owner_engine.begin() as conn:
-            await conn.execute(text("DROP TABLE IF EXISTS scratch_unforced"))
-        await owner_engine.dispose()
+        async with tenant.owner_connection() as conn:
+            async with conn.begin():
+                await conn.execute(text("DROP TABLE IF EXISTS scratch_unforced"))
 
 
-async def test_guard_passes_when_every_referenced_alias_is_compliant(guard_env, dedicated_instance):
+async def test_guard_passes_when_every_referenced_alias_is_compliant(guard_env):
     """Acceptance: the guard passes when every currently-referenced alias, pooled and one
     dedicated, is fully compliant."""
     from app.db.guard import run_role_rls_guard
 
-    await guard_env["seed"]()
-    await _write_alias_secret(guard_env, dedicated_instance, key="app")
+    await seed_tenant(guard_env, roles=["member"])
+    await seed_tenant(guard_env, roles=["member"], isolation_tier="dedicated")
 
     await run_role_rls_guard()  # must not raise
 
 
 async def test_guard_iterates_past_a_compliant_pooled_engine_to_a_failing_dedicated_one(
-    guard_env, dedicated_instance, monkeypatch
+    guard_env, monkeypatch
 ):
     """Acceptance: a case where the pooled engine passes but a second, dedicated engine fails
     proves the guard actually iterates every referenced alias rather than stopping after the
     first. Spied via `check_role_and_rls` itself, so the assertion is about which engines were
     actually checked, not just that *some* error was raised."""
     from app.db import guard as guard_module
-    from app.db.engine_registry import POOLED_ALIAS
+    from app.db.engine_registry import POOLED_ALIAS, _secrets_dir
 
-    await guard_env["seed"]()
-    await _write_alias_secret(guard_env, dedicated_instance, key="superuser")
+    await seed_tenant(guard_env, roles=["member"])
+    tenant = await seed_tenant(guard_env, roles=["member"], isolation_tier="dedicated")
+    (_secrets_dir() / tenant.database_alias).write_text(tenant.database.superuser_url)
 
     checked: list[str] = []
     original_check = guard_module.check_role_and_rls
 
     async def spying_check(conn):
         # The pooled engine's own DSN carries no alias, so identify it by which server the
-        # connection belongs to: the pooled instance's app-role DSN.
+        # connection belongs to: `guard_env`'s own app-role DSN.
         checked.append(str(conn.engine.url))
         await original_check(conn)
 
@@ -230,7 +162,7 @@ async def test_guard_iterates_past_a_compliant_pooled_engine_to_a_failing_dedica
 
     # Both engines were reached: the pooled one (which passed, since it isn't in `checked`
     # failing) and then the dedicated one (whose BYPASSRLS connection made the guard raise).
-    # POOLED_ALIAS sorts before DEDICATED_ALIAS ("pooled" < "tenant-red"), so this also proves
-    # the loop did not stop after the first (pooled, compliant) alias.
+    # POOLED_ALIAS ("pooled") sorts before a generated alias (always "tenant-..."), so this also
+    # proves the loop did not stop after the first (pooled, compliant) alias.
     assert len(checked) == 2
-    assert POOLED_ALIAS  # sanity: alias constant imported and used for the docstring's claim
+    assert POOLED_ALIAS < tenant.database_alias

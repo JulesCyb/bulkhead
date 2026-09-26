@@ -19,15 +19,19 @@ PUBLIC` statements are exercised for real, by running the script itself, in
 from __future__ import annotations
 
 import dataclasses
+import logging.config
 import os
 import subprocess
 import sys
 import tempfile
 from collections.abc import Iterator
+from contextlib import contextmanager
 from urllib.parse import parse_qs, urlparse
 
 import pgserver
 import pytest
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.config import ROLE_STATEMENT_TIMEOUT_MS
 
@@ -101,7 +105,16 @@ def environment(cluster: Cluster, monkeypatch: pytest.MonkeyPatch) -> Iterator[C
     caches at `cluster`'s pooled database for the duration of one test, and undoes all of it
     afterwards -- the cache-clear/engine-reset dance every integration file used to repeat.
     Yields `cluster` itself: a test that only needs the environment pointed at the cluster (the
-    common case) requests just this fixture."""
+    common case) requests just this fixture.
+
+    Also points `TENANT_DB_SECRETS_DIR` (read by `app/db/engine_registry.py`, app-role DSNs) and
+    `TENANT_DB_MIGRATIONS_SECRETS_DIR` (read by `scripts/migrate.py`, owner-role DSNs) at fresh
+    temporary directories, removed on teardown -- so `seed_tenant(..., isolation_tier=
+    "dedicated")` (`tests.support.seeding`) has somewhere real to write a dedicated alias's
+    secret files, and so no test -- dedicated or not -- ever reads or writes either directory's
+    production default (`/run/secrets/tenant-db(-migrations)`)."""
+    import shutil
+
     from app import config
     from app.db import engine_registry
     from app.db import session as db_session
@@ -116,8 +129,102 @@ def environment(cluster: Cluster, monkeypatch: pytest.MonkeyPatch) -> Iterator[C
         reset_tenant_chat_model_cache()
         reset_tenant_embedding_client_cache()
 
+    secrets_dir = tempfile.mkdtemp(prefix="tenant-db-secrets-")
+    migrations_secrets_dir = tempfile.mkdtemp(prefix="tenant-db-migrations-secrets-")
+
     monkeypatch.setenv("DATABASE_URL", cluster.app_url)
     monkeypatch.setenv("DATABASE_URL_MIGRATIONS", cluster.owner_url)
+    monkeypatch.setenv("TENANT_DB_SECRETS_DIR", secrets_dir)
+    monkeypatch.setenv("TENANT_DB_MIGRATIONS_SECRETS_DIR", migrations_secrets_dir)
     _point_at_cluster()
-    yield cluster
-    _point_at_cluster()
+    try:
+        yield cluster
+    finally:
+        _point_at_cluster()
+        shutil.rmtree(secrets_dir, ignore_errors=True)
+        shutil.rmtree(migrations_secrets_dir, ignore_errors=True)
+
+
+def _with_database(url: str, database: str) -> str:
+    """The same DSN as `url`, pointed at a different database name on the same server --swaps
+    only the path segment before the query string. Never
+    `sqlalchemy.engine.URL.render_as_string()`/`str(url)`: both percent-encode the unix-socket
+    path carried in `?host=...`, and a literal `%` then breaks `ConfigParser`'s own
+    interpolation the moment `scripts.migrate._upgrade_head` hands the DSN to Alembic (see
+    `app.operator.dedicated_db._render_dsn`'s docstring, which hits the same trap)."""
+    base, _, query = url.partition("?")
+    prefix, _, _old_db = base.rpartition("/")
+    new_base = f"{prefix}/{database}"
+    return f"{new_base}?{query}" if query else new_base
+
+
+async def create_database(cluster: Cluster, name: str) -> Cluster:
+    """Creates a fresh, empty database named `name` on the same server `cluster` already boots,
+    with the same per-database bootstrap `docker/postgres/01-init.sh` performs on its own single
+    database (the `vector` extension, schema ownership, grants) -- everything `CREATE DATABASE`
+    itself does not inherit from `ROLE_BOOTSTRAP_SQL`'s cluster-wide role bootstrap (roles are
+    cluster-wide in Postgres; schema ownership and grants are per-database).
+
+    Deliberately not migrated: the caller decides whether and how.
+    `tests.support.seeding.seed_tenant`'s dedicated-tier path migrates it immediately with the
+    real runner; `tests/test_migrate_alias_integration.py` leaves it exactly as this function
+    returns it, on purpose, to prove the runner itself brings a fresh database to head.
+
+    Returns a new `Cluster` -- same shape, same three roles, pointed at `name` instead of
+    `cluster`'s own default database.
+    """
+    quoted = '"' + name.replace('"', '""') + '"'
+
+    admin_engine = create_async_engine(cluster.superuser_url, isolation_level="AUTOCOMMIT")
+    try:
+        async with admin_engine.connect() as conn:
+            await conn.execute(text(f"CREATE DATABASE {quoted}"))
+    finally:
+        await admin_engine.dispose()
+
+    fresh = Cluster(
+        superuser_url=_with_database(cluster.superuser_url, name),
+        owner_url=_with_database(cluster.owner_url, name),
+        app_url=_with_database(cluster.app_url, name),
+    )
+
+    bootstrap_engine = create_async_engine(fresh.superuser_url)
+    try:
+        async with bootstrap_engine.begin() as conn:
+            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+            await conn.execute(text("ALTER SCHEMA public OWNER TO app_owner"))
+            await conn.execute(text(f"GRANT CREATE ON DATABASE {quoted} TO app_owner"))
+            await conn.execute(text("GRANT USAGE ON SCHEMA public TO app"))
+    finally:
+        await bootstrap_engine.dispose()
+
+    return fresh
+
+
+@contextmanager
+def migration_run_without_disrupting_logging() -> Iterator[None]:
+    """Wrap any in-process call into the real migration runner (`scripts.migrate.migrate_alias`/
+    `migrate_all`, or anything that itself calls `alembic.command.upgrade`) in this, every time.
+
+    `migrations/env.py` calls `logging.config.fileConfig(config.config_file_name)` on every real
+    migration run (`command.upgrade()` re-executes `env.py` fresh each call, not a one-time
+    import, so this fires on every single call, not just the first). By default that disables
+    every logger that already exists at that moment, process-wide -- harmless across a
+    subprocess boundary (every private per-file bootstrap this package replaced shelled out to
+    `alembic upgrade head` as a *subprocess*, exactly to keep this contained, and so does this
+    package's own session-scoped `cluster` fixture above), but running the real migration runner
+    in-process instead (this package's dedicated-tier seeding, deliberately, to exercise the
+    exact code path `app.operator.dedicated_db.ensure_dedicated_database` uses) would otherwise
+    silently disable module-level `log = logging.getLogger(__name__)` objects created once, at
+    import time, and reused for the rest of the pytest session -- breaking every later test in
+    the *same session* that asserts against `caplog` for one of them, with no exception raised
+    anywhere to explain why. `env.py`'s own `from logging.config import fileConfig` re-binds
+    fresh from this attribute on every run, so patching it here, only for the duration of one
+    migration call, is enough -- never touches `migrations/env.py` itself.
+    """
+    original = logging.config.fileConfig
+    logging.config.fileConfig = lambda *args, **kwargs: None
+    try:
+        yield
+    finally:
+        logging.config.fileConfig = original
