@@ -16,17 +16,20 @@ The model is swapped in the same way `tests/test_chat.py` already does --
 `chat_assistant.override(...)`: the chat endpoint always resolves an explicit model
 (`app.agents.assistant.resolve_chat_model`, per-tenant/residency routed, Spec 8 / #61) and passes
 it into `adapter.run_stream(...)`, which shadows an agent-level `.override(model=...)` entirely.
+
+`_rename_model`, `_propose_body`, `_resume_body`, `_headers`, and `_chat_path` are reused directly
+by `tests/test_context_resolution_integration.py` rather than duplicated -- see that file's own
+module docstring for why they stay here instead of moving into `tests/support/` (that package
+unconditionally imports `pgserver`; this file already requires it, so a plain module-to-module
+import costs nothing this file doesn't already pay). Seeding itself (a tenant, a conversation, a
+titled document) goes straight through `tests.support`'s `seed_tenant`/`seed_conversation`/
+`seed_document` -- that caller does the same.
 """
 
 from __future__ import annotations
 
 import json
-import os
-import subprocess
-import sys
-import tempfile
 import uuid
-from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
@@ -36,142 +39,25 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.api import chat as chat_module
-from app.db.guard import ROLE_STATEMENT_TIMEOUT_MS
 from app.main import app
 from tests.conftest import resolve_to_model
 
 pgserver = pytest.importorskip("pgserver")
 
+from tests.support import (  # noqa: E402
+    cluster,
+    environment,
+    seed_conversation,
+    seed_document,
+    seed_tenant,
+)
+
+_ = (cluster, environment)
+
 CONVERSATION_ID = "conv-1"
 TOOL_CALL_ID = "call-rename-1"
 ORIGINAL_TITLE = "Original Title"
 NEW_TITLE = "Renamed Title"
-
-
-def _psql(server, command: str) -> None:
-    """`server.psql` without a shell: pgserver's own version breaks on paths with spaces."""
-    from pgserver.postgres_server import POSTGRES_BIN_PATH
-
-    subprocess.run(
-        [str(POSTGRES_BIN_PATH / "psql"), server.get_uri()],
-        input=command.encode(),
-        check=True,
-        capture_output=True,
-    )
-
-
-@pytest.fixture(scope="module")
-def database_urls():
-    """Mirrors `tests/test_standing_grants_integration.py`'s own fixture: app_owner/app roles,
-    migrated to head with the real Alembic chain (including #40's own
-    0038_pending_action_tool_call_id)."""
-    pgdata = tempfile.mkdtemp(prefix="pgdata-")
-    server = pgserver.get_server(pgdata, cleanup_mode="delete")
-    sockdir = parse_qs(urlparse(server.get_uri()).query)["host"][0]
-    _psql(
-        server,
-        "CREATE EXTENSION IF NOT EXISTS vector; "
-        "CREATE ROLE app_owner LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE; "
-        "ALTER SCHEMA public OWNER TO app_owner; "
-        "GRANT CREATE ON DATABASE postgres TO app_owner; "
-        "CREATE ROLE app LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE; "
-        "GRANT USAGE ON SCHEMA public TO app; "
-        f"ALTER ROLE app SET statement_timeout = '{ROLE_STATEMENT_TIMEOUT_MS}ms';",
-    )
-    urls = {
-        "migrations": f"postgresql+asyncpg://app_owner@/postgres?host={sockdir}",
-        "app": f"postgresql+asyncpg://app@/postgres?host={sockdir}",
-        "superuser": f"postgresql+asyncpg://postgres@/postgres?host={sockdir}",
-    }
-    env = {**os.environ, "DATABASE_URL_MIGRATIONS": urls["migrations"], "DATABASE_URL": urls["app"]}
-    subprocess.run(
-        [sys.executable, "-m", "alembic", "upgrade", "head"], check=True, env=env, timeout=120
-    )
-    yield urls
-    server.cleanup()
-
-
-@pytest.fixture
-def app_settings(database_urls, monkeypatch):
-    from app import config
-    from app.db import session as db_session
-
-    monkeypatch.setenv("DATABASE_URL", database_urls["app"])
-    monkeypatch.setenv("DATABASE_URL_MIGRATIONS", database_urls["migrations"])
-    monkeypatch.setenv("PENDING_ACTION_EXPIRY_SECONDS", "300")
-    config.get_settings.cache_clear()
-    db_session._engine = None
-    db_session._session_factory = None
-    yield
-    config.get_settings.cache_clear()
-    db_session._engine = None
-    db_session._session_factory = None
-
-
-async def _seed_tenant(url: str) -> uuid.UUID:
-    engine = create_async_engine(url)
-    tenant_id = uuid.uuid4()
-    async with engine.begin() as conn:
-        await conn.execute(
-            text("INSERT INTO tenants (id, name) VALUES (:id, 'Acme')"), {"id": tenant_id}
-        )
-    await engine.dispose()
-    return tenant_id
-
-
-async def _seed_membership(
-    url: str, *, tenant_id: uuid.UUID, role: str
-) -> tuple[uuid.UUID, uuid.UUID]:
-    """A global identity plus its membership of `role` in `tenant_id`. Returns
-    (identity_id, membership_id)."""
-    engine = create_async_engine(url)
-    identity_id = uuid.uuid4()
-    async with engine.begin() as conn:
-        await conn.execute(
-            text("INSERT INTO control.identities (id, issuer, subject) VALUES (:id, 'seed', :sub)"),
-            {"id": identity_id, "sub": str(identity_id)},
-        )
-        membership_id = (
-            await conn.execute(
-                text(
-                    "INSERT INTO memberships (tenant_id, identity_id, role) "
-                    "VALUES (:tid, :iid, :role) RETURNING id"
-                ),
-                {"tid": tenant_id, "iid": identity_id, "role": role},
-            )
-        ).scalar_one()
-    await engine.dispose()
-    return identity_id, membership_id
-
-
-async def _seed_conversation(url: str, *, tenant_id: uuid.UUID, identity_id: uuid.UUID) -> None:
-    engine = create_async_engine(url)
-    async with engine.begin() as conn:
-        await conn.execute(
-            text(
-                "INSERT INTO conversations (tenant_id, conversation_id, created_by) "
-                "VALUES (:tid, :cid, :creator)"
-            ),
-            {"tid": tenant_id, "cid": CONVERSATION_ID, "creator": identity_id},
-        )
-    await engine.dispose()
-
-
-async def _seed_document(
-    url: str, *, tenant_id: uuid.UUID, identity_id: uuid.UUID, title: str = ORIGINAL_TITLE
-) -> uuid.UUID:
-    engine = create_async_engine(url)
-    document_id = uuid.uuid4()
-    async with engine.begin() as conn:
-        await conn.execute(
-            text(
-                "INSERT INTO documents (id, tenant_id, title, content, created_by, updated_by) "
-                "VALUES (:id, :tid, :title, 'content', :who, :who)"
-            ),
-            {"id": document_id, "tid": tenant_id, "title": title, "who": identity_id},
-        )
-    await engine.dispose()
-    return document_id
 
 
 async def _document_title(url: str, *, document_id: uuid.UUID) -> str:
@@ -424,7 +310,7 @@ def client() -> httpx.AsyncClient:
 
 
 async def test_pending_action_exists_before_the_deferred_approval_reaches_the_client(
-    app_settings, database_urls, client, monkeypatch
+    environment, client, monkeypatch
 ):
     """AC1: the pending action behind a deferred approval is already committed to storage before
     the response naming it reaches the client -- proven by streaming the response and checking
@@ -433,15 +319,16 @@ async def test_pending_action_exists_before_the_deferred_approval_reaches_the_cl
     that chunk once the whole run has completed (`pydantic_ai.ui.vercel_ai._event_stream`), and the
     validator's own commit happens strictly earlier in the same coroutine chain -- this test proves
     that holds through the real ASGI/streaming plumbing, not just by inspection of the source."""
-    tenant_id = await _seed_tenant(database_urls["superuser"])
-    identity_id, _ = await _seed_membership(
-        database_urls["superuser"], tenant_id=tenant_id, role="member"
+    tenant = await seed_tenant(environment, roles=["member"], via_operator=False)
+    identity_id = tenant.identities["member"]
+    await seed_conversation(
+        environment,
+        tenant_id=tenant.tenant_id,
+        identity_id=identity_id,
+        conversation_id=CONVERSATION_ID,
     )
-    await _seed_conversation(
-        database_urls["superuser"], tenant_id=tenant_id, identity_id=identity_id
-    )
-    document_id = await _seed_document(
-        database_urls["superuser"], tenant_id=tenant_id, identity_id=identity_id
+    document_id = await seed_document(
+        environment, tenant_id=tenant.tenant_id, identity_id=identity_id, title=ORIGINAL_TITLE
     )
 
     model = _rename_model(document_id=document_id, title=NEW_TITLE)
@@ -450,7 +337,10 @@ async def test_pending_action_exists_before_the_deferred_approval_reaches_the_cl
     async with client:
         seen_chunk = False
         async with client.stream(
-            "POST", _chat_path(tenant_id), json=_propose_body(), headers=_headers(identity_id)
+            "POST",
+            _chat_path(tenant.tenant_id),
+            json=_propose_body(),
+            headers=_headers(identity_id),
         ) as response:
             assert response.status_code == 200
             async for line in response.aiter_lines():
@@ -459,7 +349,7 @@ async def test_pending_action_exists_before_the_deferred_approval_reaches_the_cl
                     # The row must already be there -- checked from a second, independent
                     # connection, right after seeing the chunk that announces it.
                     rows = await _pending_action_rows(
-                        database_urls["superuser"], tenant_id=tenant_id
+                        environment.superuser_url, tenant_id=tenant.tenant_id
                     )
                     assert len(rows) == 1
                     assert rows[0]["status"] == "pending"
@@ -469,62 +359,69 @@ async def test_pending_action_exists_before_the_deferred_approval_reaches_the_cl
 
 
 async def test_approving_executes_exactly_once_and_response_reflects_the_change(
-    app_settings, database_urls, client, monkeypatch
+    environment, client, monkeypatch
 ):
     """AC2 (approve half): resuming with an approval executes the tool exactly once, and the
     document's title is actually changed through the repository layer."""
-    tenant_id = await _seed_tenant(database_urls["superuser"])
-    identity_id, _ = await _seed_membership(
-        database_urls["superuser"], tenant_id=tenant_id, role="member"
+    tenant = await seed_tenant(environment, roles=["member"], via_operator=False)
+    identity_id = tenant.identities["member"]
+    await seed_conversation(
+        environment,
+        tenant_id=tenant.tenant_id,
+        identity_id=identity_id,
+        conversation_id=CONVERSATION_ID,
     )
-    await _seed_conversation(
-        database_urls["superuser"], tenant_id=tenant_id, identity_id=identity_id
-    )
-    document_id = await _seed_document(
-        database_urls["superuser"], tenant_id=tenant_id, identity_id=identity_id
+    document_id = await seed_document(
+        environment, tenant_id=tenant.tenant_id, identity_id=identity_id, title=ORIGINAL_TITLE
     )
 
     model = _rename_model(document_id=document_id, title=NEW_TITLE)
     monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(model))
 
     async with client:
-        await _propose(client, tenant_id, identity_id)
+        await _propose(client, tenant.tenant_id, identity_id)
         resumed = await _resume(
-            client, tenant_id, identity_id, document_id=document_id, title=NEW_TITLE, approved=True
+            client,
+            tenant.tenant_id,
+            identity_id,
+            document_id=document_id,
+            title=NEW_TITLE,
+            approved=True,
         )
 
     assert "Renamed document" in resumed.text
-    title = await _document_title(database_urls["superuser"], document_id=document_id)
+    title = await _document_title(environment.superuser_url, document_id=document_id)
     assert title == NEW_TITLE
 
-    kinds = await _audit_kinds_for_tenant(database_urls["superuser"], tenant_id=tenant_id)
+    kinds = await _audit_kinds_for_tenant(environment.superuser_url, tenant_id=tenant.tenant_id)
     assert kinds == ["requested", "approved", "executed"]
 
 
 async def test_refusing_never_executes_and_the_conversation_continues(
-    app_settings, database_urls, client, monkeypatch
+    environment, client, monkeypatch
 ):
     """AC2 (refuse half): resuming with a refusal leaves the tool never executed, and the
     conversation still produces a normal reply."""
-    tenant_id = await _seed_tenant(database_urls["superuser"])
-    identity_id, _ = await _seed_membership(
-        database_urls["superuser"], tenant_id=tenant_id, role="member"
+    tenant = await seed_tenant(environment, roles=["member"], via_operator=False)
+    identity_id = tenant.identities["member"]
+    await seed_conversation(
+        environment,
+        tenant_id=tenant.tenant_id,
+        identity_id=identity_id,
+        conversation_id=CONVERSATION_ID,
     )
-    await _seed_conversation(
-        database_urls["superuser"], tenant_id=tenant_id, identity_id=identity_id
-    )
-    document_id = await _seed_document(
-        database_urls["superuser"], tenant_id=tenant_id, identity_id=identity_id
+    document_id = await seed_document(
+        environment, tenant_id=tenant.tenant_id, identity_id=identity_id, title=ORIGINAL_TITLE
     )
 
     model = _rename_model(document_id=document_id, title=NEW_TITLE)
     monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(model))
 
     async with client:
-        await _propose(client, tenant_id, identity_id)
+        await _propose(client, tenant.tenant_id, identity_id)
         resumed = await _resume(
             client,
-            tenant_id,
+            tenant.tenant_id,
             identity_id,
             document_id=document_id,
             title=NEW_TITLE,
@@ -535,48 +432,49 @@ async def test_refusing_never_executes_and_the_conversation_continues(
     assert resumed.status_code == 200
     assert '"type":"error"' not in resumed.text
 
-    title = await _document_title(database_urls["superuser"], document_id=document_id)
+    title = await _document_title(environment.superuser_url, document_id=document_id)
     assert title == ORIGINAL_TITLE  # never executed
 
-    kinds = await _audit_kinds_for_tenant(database_urls["superuser"], tenant_id=tenant_id)
+    kinds = await _audit_kinds_for_tenant(environment.superuser_url, tenant_id=tenant.tenant_id)
     assert kinds == ["requested", "refused"]
 
 
 async def test_tampered_arguments_on_approval_are_refused_nothing_executed(
-    app_settings, database_urls, client, monkeypatch
+    environment, client, monkeypatch
 ):
     """AC3: an approval whose arguments differ from what was originally proposed is refused, with
     nothing executed. A real client cannot change a deferred call's own arguments through the
     approval protocol (they are fixed, from the first run's own `ToolCallPart`, not re-supplied by
     the model on resume) -- this simulates the equivalent tampering directly on the stored,
     trusted history, and proves `PendingActionRepository.verify()`'s hash check catches it."""
-    tenant_id = await _seed_tenant(database_urls["superuser"])
-    identity_id, _ = await _seed_membership(
-        database_urls["superuser"], tenant_id=tenant_id, role="member"
+    tenant = await seed_tenant(environment, roles=["member"], via_operator=False)
+    identity_id = tenant.identities["member"]
+    await seed_conversation(
+        environment,
+        tenant_id=tenant.tenant_id,
+        identity_id=identity_id,
+        conversation_id=CONVERSATION_ID,
     )
-    await _seed_conversation(
-        database_urls["superuser"], tenant_id=tenant_id, identity_id=identity_id
-    )
-    document_id = await _seed_document(
-        database_urls["superuser"], tenant_id=tenant_id, identity_id=identity_id
+    document_id = await seed_document(
+        environment, tenant_id=tenant.tenant_id, identity_id=identity_id, title=ORIGINAL_TITLE
     )
 
     model = _rename_model(document_id=document_id, title=NEW_TITLE)
     monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(model))
 
     async with client:
-        await _propose(client, tenant_id, identity_id)
+        await _propose(client, tenant.tenant_id, identity_id)
 
         await _tamper_stored_tool_call_args(
-            database_urls["superuser"],
-            tenant_id=tenant_id,
+            environment.superuser_url,
+            tenant_id=tenant.tenant_id,
             tool_call_id=TOOL_CALL_ID,
             new_args={"document_id": str(document_id), "title": "TAMPERED TITLE"},
         )
 
         resumed = await _resume(
             client,
-            tenant_id,
+            tenant.tenant_id,
             identity_id,
             document_id=document_id,
             title=NEW_TITLE,
@@ -584,95 +482,106 @@ async def test_tampered_arguments_on_approval_are_refused_nothing_executed(
         )
 
     assert resumed.status_code == 200
-    title = await _document_title(database_urls["superuser"], document_id=document_id)
+    title = await _document_title(environment.superuser_url, document_id=document_id)
     assert title == ORIGINAL_TITLE  # nothing executed
 
-    kinds = await _audit_kinds_for_tenant(database_urls["superuser"], tenant_id=tenant_id)
+    kinds = await _audit_kinds_for_tenant(environment.superuser_url, tenant_id=tenant.tenant_id)
     assert kinds == ["requested", "approved", "failed_to_execute"]
 
 
 async def test_role_downgraded_between_request_and_resume_is_refused(
-    app_settings, database_urls, client, monkeypatch
+    environment, client, monkeypatch
 ):
     """AC4: a membership whose role is downgraded between the initial request and the resumed
     approval causes the tool's own execution-time check to refuse -- distinct from, and in
     addition to, the check already made when the write was first proposed (the proposal itself
     succeeded while the membership was still `member`)."""
-    tenant_id = await _seed_tenant(database_urls["superuser"])
-    identity_id, membership_id = await _seed_membership(
-        database_urls["superuser"], tenant_id=tenant_id, role="member"
+    tenant = await seed_tenant(environment, roles=["member"], via_operator=False)
+    identity_id = tenant.identities["member"]
+    membership_id = tenant.memberships["member"]
+    await seed_conversation(
+        environment,
+        tenant_id=tenant.tenant_id,
+        identity_id=identity_id,
+        conversation_id=CONVERSATION_ID,
     )
-    await _seed_conversation(
-        database_urls["superuser"], tenant_id=tenant_id, identity_id=identity_id
-    )
-    document_id = await _seed_document(
-        database_urls["superuser"], tenant_id=tenant_id, identity_id=identity_id
+    document_id = await seed_document(
+        environment, tenant_id=tenant.tenant_id, identity_id=identity_id, title=ORIGINAL_TITLE
     )
 
     model = _rename_model(document_id=document_id, title=NEW_TITLE)
     monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(model))
 
     async with client:
-        await _propose(client, tenant_id, identity_id)
+        await _propose(client, tenant.tenant_id, identity_id)
 
         await _set_membership_role(
-            database_urls["superuser"], membership_id=membership_id, role="support"
+            environment.superuser_url, membership_id=membership_id, role="support"
         )
 
         resumed = await _resume(
-            client, tenant_id, identity_id, document_id=document_id, title=NEW_TITLE, approved=True
+            client,
+            tenant.tenant_id,
+            identity_id,
+            document_id=document_id,
+            title=NEW_TITLE,
+            approved=True,
         )
 
     assert resumed.status_code == 200
-    title = await _document_title(database_urls["superuser"], document_id=document_id)
+    title = await _document_title(environment.superuser_url, document_id=document_id)
     assert title == ORIGINAL_TITLE  # nothing executed
 
-    kinds = await _audit_kinds_for_tenant(database_urls["superuser"], tenant_id=tenant_id)
+    kinds = await _audit_kinds_for_tenant(environment.superuser_url, tenant_id=tenant.tenant_id)
     assert kinds == ["requested", "approved", "failed_to_execute"]
 
 
-async def test_expired_approval_is_refused_and_marked_expired(
-    app_settings, database_urls, client, monkeypatch
-):
+async def test_expired_approval_is_refused_and_marked_expired(environment, client, monkeypatch):
     """AC5: an approval answered after the configured expiry window is refused, and the resulting
     audit record marks it `expired` -- exercised against the real wall clock (the pending action's
     `expires_at` is moved into the past directly, the same fail-closed check
     `PendingActionRepository.verify()` already uses for `tests/test_rls_integration.py`)."""
-    tenant_id = await _seed_tenant(database_urls["superuser"])
-    identity_id, _ = await _seed_membership(
-        database_urls["superuser"], tenant_id=tenant_id, role="member"
+    tenant = await seed_tenant(environment, roles=["member"], via_operator=False)
+    identity_id = tenant.identities["member"]
+    await seed_conversation(
+        environment,
+        tenant_id=tenant.tenant_id,
+        identity_id=identity_id,
+        conversation_id=CONVERSATION_ID,
     )
-    await _seed_conversation(
-        database_urls["superuser"], tenant_id=tenant_id, identity_id=identity_id
-    )
-    document_id = await _seed_document(
-        database_urls["superuser"], tenant_id=tenant_id, identity_id=identity_id
+    document_id = await seed_document(
+        environment, tenant_id=tenant.tenant_id, identity_id=identity_id, title=ORIGINAL_TITLE
     )
 
     model = _rename_model(document_id=document_id, title=NEW_TITLE)
     monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(model))
 
     async with client:
-        await _propose(client, tenant_id, identity_id)
+        await _propose(client, tenant.tenant_id, identity_id)
 
         await _set_pending_action_expiry_in_the_past(
-            database_urls["superuser"], tenant_id=tenant_id
+            environment.superuser_url, tenant_id=tenant.tenant_id
         )
 
         resumed = await _resume(
-            client, tenant_id, identity_id, document_id=document_id, title=NEW_TITLE, approved=True
+            client,
+            tenant.tenant_id,
+            identity_id,
+            document_id=document_id,
+            title=NEW_TITLE,
+            approved=True,
         )
 
     assert resumed.status_code == 200
-    title = await _document_title(database_urls["superuser"], document_id=document_id)
+    title = await _document_title(environment.superuser_url, document_id=document_id)
     assert title == ORIGINAL_TITLE
 
-    kinds = await _audit_kinds_for_tenant(database_urls["superuser"], tenant_id=tenant_id)
+    kinds = await _audit_kinds_for_tenant(environment.superuser_url, tenant_id=tenant.tenant_id)
     assert kinds == ["requested", "approved", "expired"]
 
 
 async def test_writing_tool_goes_through_the_shared_repository_layer(
-    app_settings, database_urls, client, monkeypatch
+    environment, client, monkeypatch
 ):
     """AC7: the example writing tool's data access is the same repository layer a reading tool
     uses -- proven the same way `search_documents` is: the change is visible directly at the
@@ -680,27 +589,33 @@ async def test_writing_tool_goes_through_the_shared_repository_layer(
     own. `updated_by` is refreshed by the same `documents_set_update_audit` trigger (migration
     0010) every other write to `documents` goes through -- a bespoke connection bypassing the
     repository would not trigger it."""
-    tenant_id = await _seed_tenant(database_urls["superuser"])
-    identity_id, _ = await _seed_membership(
-        database_urls["superuser"], tenant_id=tenant_id, role="admin"
+    tenant = await seed_tenant(environment, roles=["admin"], via_operator=False)
+    identity_id = tenant.identities["admin"]
+    await seed_conversation(
+        environment,
+        tenant_id=tenant.tenant_id,
+        identity_id=identity_id,
+        conversation_id=CONVERSATION_ID,
     )
-    await _seed_conversation(
-        database_urls["superuser"], tenant_id=tenant_id, identity_id=identity_id
-    )
-    document_id = await _seed_document(
-        database_urls["superuser"], tenant_id=tenant_id, identity_id=identity_id
+    document_id = await seed_document(
+        environment, tenant_id=tenant.tenant_id, identity_id=identity_id, title=ORIGINAL_TITLE
     )
 
     model = _rename_model(document_id=document_id, title=NEW_TITLE)
     monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(model))
 
     async with client:
-        await _propose(client, tenant_id, identity_id)
+        await _propose(client, tenant.tenant_id, identity_id)
         await _resume(
-            client, tenant_id, identity_id, document_id=document_id, title=NEW_TITLE, approved=True
+            client,
+            tenant.tenant_id,
+            identity_id,
+            document_id=document_id,
+            title=NEW_TITLE,
+            approved=True,
         )
 
-    engine = create_async_engine(database_urls["superuser"])
+    engine = create_async_engine(environment.superuser_url)
     async with engine.connect() as conn:
         row = (
             await conn.execute(

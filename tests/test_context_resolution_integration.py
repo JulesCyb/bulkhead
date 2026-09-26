@@ -13,12 +13,15 @@ Wire-protocol helpers are reused, not duplicated, from `tests/test_mcp_streamabl
 (`_initialize_session`, `_call_search_documents`, `_running_app`, `_mcp_request`, `_fixed_hit`,
 `_MCP_ACCEPT`) and the writing-tool approval round-trip is reused from
 `tests/test_writing_tool_approval_integration.py` (`_rename_model`, `_propose_body`,
-`_resume_body`, `_seed_conversation`, `_headers`, `_chat_path`). Deliberately *not* relocated into
-`tests/support/` (as the ticket allows, "if that avoids duplication"): `tests/support/__init__.py`
-imports `pgserver` unconditionally, and `tests/test_mcp_streamable_http.py`'s whole point is that
-most of it runs with no real database at all -- moving these helpers there would make importing
-them, and therefore collecting that file, require `pgserver` too. A plain module-to-module import
-(this file already needs `pgserver` for its own fixtures) avoids that regression.
+`_resume_body`, `_headers`, `_chat_path`). Deliberately *not* relocated into `tests/support/` (as
+the ticket allows, "if that avoids duplication"): `tests/support/__init__.py` imports `pgserver`
+unconditionally, and `tests/test_mcp_streamable_http.py`'s whole point is that most of it runs
+with no real database at all -- moving these helpers there would make importing them, and
+therefore collecting that file, require `pgserver` too. A plain module-to-module import (this
+file already needs `pgserver` for its own fixtures) avoids that regression. Seeding a
+conversation directly (the one seeding step below that isn't just `seed_tenant`) goes straight
+through `tests.support.seed_conversation`, exactly like the file it borrows the rest of the
+round-trip from.
 
 **#117's caveat, which applies to every test below that touches an audit table:**
 `approval_audit_events` (the only audit table `app/repositories/approval_audit.py` writes)
@@ -58,7 +61,13 @@ from app.repositories.agent_credentials import AgentCredentialRepository  # noqa
 from app.repositories.agent_identities import AgentIdentityRepository  # noqa: E402
 from app.token_verifier import set_default_adapter_for_tests  # noqa: E402
 from tests.conftest import resolve_to_model  # noqa: E402
-from tests.support import SeededTenant, cluster, environment, seed_tenant  # noqa: E402
+from tests.support import (  # noqa: E402
+    SeededTenant,
+    cluster,
+    environment,
+    seed_conversation,
+    seed_tenant,
+)
 from tests.test_mcp_streamable_http import (  # noqa: E402
     _MCP_ACCEPT,
     _call_search_documents,
@@ -68,6 +77,7 @@ from tests.test_mcp_streamable_http import (  # noqa: E402
     _running_app,
 )
 from tests.test_writing_tool_approval_integration import (  # noqa: E402
+    CONVERSATION_ID,
     NEW_TITLE,
     TOOL_CALL_ID,
     _chat_path,
@@ -75,7 +85,6 @@ from tests.test_writing_tool_approval_integration import (  # noqa: E402
     _propose_body,
     _rename_model,
     _resume_body,
-    _seed_conversation,
 )
 
 _ = (cluster, environment)
@@ -328,8 +337,11 @@ async def test_writing_tool_approval_audit_row_names_the_acting_membership(
     membership_id = tenant.memberships["member"]
     document_id = tenant.document_ids[0]
 
-    await _seed_conversation(
-        tenant.cluster.superuser_url, tenant_id=tenant.tenant_id, identity_id=identity_id
+    await seed_conversation(
+        tenant.cluster,
+        tenant_id=tenant.tenant_id,
+        identity_id=identity_id,
+        conversation_id=CONVERSATION_ID,
     )
 
     model = _rename_model(document_id=document_id, title=NEW_TITLE)

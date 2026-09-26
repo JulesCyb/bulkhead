@@ -13,7 +13,10 @@ It is a reduced mirror, not the script itself: no passwords (pgserver's default 
 none), pgserver's single default database rather than a named `${POSTGRES_DB}`, and no `gateway`
 role or database -- the script's own `CREATE DATABASE`/`GATEWAY_DB_PASSWORD`/`REVOKE CONNECT FROM
 PUBLIC` statements are exercised for real, by running the script itself, in
-`tests/test_gateway_bootstrap_integration.py`.
+`tests/test_gateway_bootstrap_integration.py`. It does carry the `app` role's own
+`CONNECTION LIMIT` (`ROLE_CONNECTION_LIMIT`) alongside its statement timeout -- both are
+role-level settings `tests/test_db_limits_integration.py` (issue #99) asserts against directly,
+so both need to be real on this shared cluster, not just the timeout.
 """
 
 from __future__ import annotations
@@ -33,14 +36,15 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from app.db.guard import ROLE_STATEMENT_TIMEOUT_MS
+from app.db.guard import ROLE_CONNECTION_LIMIT, ROLE_STATEMENT_TIMEOUT_MS
 
 ROLE_BOOTSTRAP_SQL = (
     "CREATE EXTENSION IF NOT EXISTS vector; "
     "CREATE ROLE app_owner LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE; "
     "ALTER SCHEMA public OWNER TO app_owner; "
     "GRANT CREATE ON DATABASE postgres TO app_owner; "
-    "CREATE ROLE app LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE; "
+    "CREATE ROLE app LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE "
+    f"CONNECTION LIMIT {ROLE_CONNECTION_LIMIT}; "
     "GRANT USAGE ON SCHEMA public TO app; "
     f"ALTER ROLE app SET statement_timeout = '{ROLE_STATEMENT_TIMEOUT_MS}ms';"
 )

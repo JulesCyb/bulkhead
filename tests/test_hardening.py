@@ -438,3 +438,46 @@ def test_settings_reads_secret_from_secrets_dir(tmp_path):
         embedding_model="text-embedding-3-small",
     )
     assert settings.database_url.get_secret_value() == dsn
+
+
+# --- Retired per-file integration-test scaffolding stays retired (issue #99 / spec #90 "A6-T4") -
+
+# Before #99, seventeen integration files each hand-wrote their own embedded-cluster boot, role
+# bootstrap `psql` runner, settings/engine-reset fixture, and tenant/identity/document seed
+# helpers; #96-#99 replaced every one of them with `tests.support`'s shared `cluster`/
+# `environment` fixtures and `seed_tenant`/`seed_membership`/`seed_conversation`/`seed_document`.
+# Checked by parsing each file's own top-level (and nested) function names, not by grepping for
+# the retired names as literal text -- so this test's own source can name them in prose (as it
+# does two paragraphs down) without tripping the exact check it implements. `tests.support`
+# itself is exempt (it *is* the shared package; its own functions are named
+# `seed_tenant`/`seed_membership`/etc -- no leading underscore, so none of these ever match it
+# anyway).
+_RETIRED_NAME_PREFIXES = ("_seed", "_insert_", "_create_tenant")
+_RETIRED_EXACT_NAMES = frozenset({"_psql", "database_urls", "app_settings"})
+
+# One deliberate exception, named in its own module docstring: test_operator_erase_integration.py
+# proves `erase_tenant` wipes every registered tenant table -- that command's own contract, not
+# generic seeding -- so its table-by-table seeder stays put.
+_RETIRED_TEST_SEED_HELPER_EXCEPTIONS = frozenset({"test_operator_erase_integration.py"})
+
+
+def test_no_retired_integration_test_bootstrap_or_seed_helpers_remain() -> None:
+    """Issue #99 (spec #90 "A6-T4"): every integration test file seeds through `tests.support`
+    now -- no file defines its own cluster/bootstrap, `psql` runner, settings-reset fixture, or
+    ad-hoc tenant/identity/document seed helper. Parses every test file's function definitions so
+    the retired names cannot come back, whatever they are nested inside."""
+    import ast
+
+    tests_dir = REPO_ROOT / "tests"
+    offenders = []
+    for path in sorted(tests_dir.glob("test_*.py")):
+        if path.name in _RETIRED_TEST_SEED_HELPER_EXCEPTIONS:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            name = node.name
+            if name in _RETIRED_EXACT_NAMES or name.startswith(_RETIRED_NAME_PREFIXES):
+                offenders.append(f"{path.relative_to(REPO_ROOT)}:{node.lineno}: {name!r}")
+    assert offenders == [], offenders

@@ -50,6 +50,7 @@ from collections import defaultdict
 from collections.abc import AsyncIterator, Iterable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from sqlalchemy import text
@@ -247,14 +248,25 @@ async def _connection(url: str) -> AsyncIterator[AsyncConnection]:
 
 
 async def seed_membership(
-    cluster: Cluster, *, tenant_id: uuid.UUID, role: Role
+    cluster: Cluster,
+    *,
+    tenant_id: uuid.UUID,
+    role: Role,
+    issuer: str = "seed",
+    subject: str | None = None,
 ) -> tuple[uuid.UUID, uuid.UUID]:
     """A global identity plus its membership of `role` in `tenant_id`, as the owner role.
     Returns `(identity_id, membership_id)`. The seam a test reaches for when it needs a
     membership `seed_tenant`'s own `roles=` argument does not cover -- a second membership of a
     role already requested, for example. Writes as the cluster's own superuser -- same reason as
     `seed_tenant` above. Pass the tenant's own dedicated `Cluster` (`SeededTenant.database`), not
-    the pooled one, to add a membership to a dedicated tenant -- its memberships live there."""
+    the pooled one, to add a membership to a dedicated tenant -- its memberships live there.
+
+    `issuer`/`subject` default to the same `'seed'`/the identity's own generated id every other
+    seeded identity in this module carries; pass them explicitly for a test that needs an
+    identity resolvable under a *specific* issuer (e.g. a tenant's own configured human-IdP
+    issuer, distinct from the agent-identity issuer) -- see
+    `tests/test_agent_identity_end_to_end_integration.py`, this module's own worked example."""
     engine = create_async_engine(cluster.superuser_url)
     identity_id = uuid.uuid4()
     try:
@@ -262,9 +274,9 @@ async def seed_membership(
             await conn.execute(
                 text(
                     "INSERT INTO control.identities (id, issuer, subject) "
-                    "VALUES (:id, 'seed', :sub)"
+                    "VALUES (:id, :issuer, :sub)"
                 ),
-                {"id": identity_id, "sub": str(identity_id)},
+                {"id": identity_id, "issuer": issuer, "sub": subject or str(identity_id)},
             )
             membership_id = (
                 await conn.execute(
@@ -278,6 +290,152 @@ async def seed_membership(
     finally:
         await engine.dispose()
     return identity_id, membership_id
+
+
+async def seed_document(
+    cluster: Cluster,
+    *,
+    tenant_id: uuid.UUID,
+    identity_id: uuid.UUID,
+    title: str,
+    content: str = "content",
+    embedding: str | None = None,
+) -> uuid.UUID:
+    """One `documents` row with a specific `title` (and, optionally, a specific `embedding`
+    literal -- see `vector_literal`) -- the seam for a test that needs a document whose title or
+    search ranking the test itself asserts on, distinct from `seed_tenant(documents=...)`'s own
+    generic, numbered titles and deterministic embeddings. Writes as the cluster's own
+    superuser, exactly like `seed_membership`; `created_by`/`updated_by` are both `identity_id`,
+    matching how a real `tenant_session()` write attributes a document (migration 0010)."""
+    engine = create_async_engine(cluster.superuser_url)
+    document_id = uuid.uuid4()
+    try:
+        async with engine.begin() as conn:
+            if embedding is not None:
+                await conn.execute(
+                    text(
+                        "INSERT INTO documents "
+                        "(id, tenant_id, title, content, embedding, created_by, updated_by) "
+                        "VALUES (:id, :tid, :title, :content, CAST(:emb AS vector), :who, :who)"
+                    ),
+                    {
+                        "id": document_id,
+                        "tid": tenant_id,
+                        "title": title,
+                        "content": content,
+                        "emb": embedding,
+                        "who": identity_id,
+                    },
+                )
+            else:
+                await conn.execute(
+                    text(
+                        "INSERT INTO documents (id, tenant_id, title, content, created_by, "
+                        "updated_by) VALUES (:id, :tid, :title, :content, :who, :who)"
+                    ),
+                    {
+                        "id": document_id,
+                        "tid": tenant_id,
+                        "title": title,
+                        "content": content,
+                        "who": identity_id,
+                    },
+                )
+    finally:
+        await engine.dispose()
+    return document_id
+
+
+async def seed_conversation(
+    cluster: Cluster,
+    *,
+    tenant_id: uuid.UUID,
+    identity_id: uuid.UUID,
+    conversation_id: str,
+    last_activity_at: datetime | None = None,
+    with_message: bool = False,
+) -> None:
+    """One `conversations` row -- backdated to `last_activity_at` (ADR-0006) when given, else
+    left to the table's own defaults -- and, when `with_message`, one `messages` row alongside
+    it. Writes as the cluster's own superuser, exactly like `seed_membership`; a test seeding a
+    conversation directly (rather than through a real chat turn) needs full control over both
+    `created_by` and, for a retention test, exactly how old it is."""
+    engine = create_async_engine(cluster.superuser_url)
+    try:
+        async with engine.begin() as conn:
+            if last_activity_at is not None:
+                await conn.execute(
+                    text(
+                        "INSERT INTO conversations "
+                        "(tenant_id, conversation_id, created_by, created_at, last_activity_at) "
+                        "VALUES (:tid, :cid, :iid, :ts, :ts)"
+                    ),
+                    {
+                        "tid": tenant_id,
+                        "cid": conversation_id,
+                        "iid": identity_id,
+                        "ts": last_activity_at,
+                    },
+                )
+            else:
+                await conn.execute(
+                    text(
+                        "INSERT INTO conversations (tenant_id, conversation_id, created_by) "
+                        "VALUES (:tid, :cid, :iid)"
+                    ),
+                    {"tid": tenant_id, "cid": conversation_id, "iid": identity_id},
+                )
+            if with_message:
+                await conn.execute(
+                    text(
+                        "INSERT INTO messages (tenant_id, conversation_id, sequence, payload, "
+                        "created_by) VALUES (:tid, :cid, 1, '{}'::jsonb, :iid)"
+                    ),
+                    {"tid": tenant_id, "cid": conversation_id, "iid": identity_id},
+                )
+    finally:
+        await engine.dispose()
+
+
+async def set_tenant_retention_days(cluster: Cluster, tenant_id: uuid.UUID, days: int) -> None:
+    """Sets this tenant's own `tenants.settings['retention_days']` (ADR-0006) directly, as the
+    cluster's own superuser -- no operator command exposes a way to set it, and `tenants`' own
+    self-only RLS policy would otherwise block the update with no `app.tenant_id` context in
+    scope. For a test proving a tenant's own (shorter) retention period is honored over the
+    documented default (`app/tenant_settings.py`)."""
+    engine = create_async_engine(cluster.superuser_url)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "UPDATE tenants SET settings = jsonb_set(settings, '{retention_days}', "
+                    "to_jsonb(CAST(:days AS integer))) WHERE id = :id"
+                ),
+                {"days": days, "id": tenant_id},
+            )
+    finally:
+        await engine.dispose()
+
+
+async def set_tenant_identity_issuer(cluster: Cluster, tenant_id: uuid.UUID, issuer: str) -> None:
+    """Sets this tenant's own `control.tenants.identity_issuer` (migration 0003) directly, as the
+    cluster's own superuser -- no operator command exposes a way to set it. Needed only by a test
+    proving a tenant's own configured human-IdP issuer never leaks into an unrelated code path
+    (e.g. agent-identity token verification, #49) -- see
+    `tests/test_agent_identity_end_to_end_integration.py`."""
+    engine = create_async_engine(cluster.superuser_url)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO control.tenants (tenant_id, identity_issuer) "
+                    "VALUES (:id, :issuer) ON CONFLICT (tenant_id) DO UPDATE "
+                    "SET identity_issuer = EXCLUDED.identity_issuer"
+                ),
+                {"id": tenant_id, "issuer": issuer},
+            )
+    finally:
+        await engine.dispose()
 
 
 def _require_secrets_dir(env_var: str) -> Path:
@@ -770,3 +928,30 @@ async def seed_tenant(
         documents=documents,
         isolation_tier=isolation_tier,
     )
+
+
+async def seed_dedicated_control_row(cluster: Cluster, *, alias: str) -> uuid.UUID:
+    """One `tenants` + `control.tenants` row marking a tenant dedicated to `alias`, with no real
+    second database behind it. Enough for anything that only reads the alias column -- the
+    control repository's alias enumeration and the migration runner's alias discovery -- without
+    the cost of provisioning a database (`seed_tenant(isolation_tier="dedicated")` does that, and
+    always migrates the database it creates, which is exactly what a test of the *unmigrated*
+    state must avoid)."""
+    tenant_id = uuid.uuid4()
+    engine = create_async_engine(cluster.superuser_url)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("INSERT INTO tenants (id, name) VALUES (:id, :name)"),
+                {"id": tenant_id, "name": f"dedicated-{alias}"},
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO control.tenants (tenant_id, isolation_tier, database_alias) "
+                    "VALUES (:tid, 'dedicated', :alias)"
+                ),
+                {"tid": tenant_id, "alias": alias},
+            )
+    finally:
+        await engine.dispose()
+    return tenant_id

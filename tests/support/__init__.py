@@ -37,8 +37,13 @@ from tests.support.seeding import (  # noqa: E402
     SeededTenant,
     UnknownNotNullColumnError,
     assert_known_not_null_columns,
+    seed_conversation,
+    seed_dedicated_control_row,
+    seed_document,
     seed_membership,
     seed_tenant,
+    set_tenant_identity_issuer,
+    set_tenant_retention_days,
     vector_literal,
 )
 
@@ -54,7 +59,12 @@ __all__ = [
     "environment",
     "fake_gateway_admin_client",
     "migration_run_without_disrupting_logging",
+    "seed_conversation",
+    "seed_dedicated_control_row",
+    "seed_document",
     "seed_membership",
     "seed_tenant",
+    "set_tenant_identity_issuer",
+    "set_tenant_retention_days",
     "vector_literal",
 ]

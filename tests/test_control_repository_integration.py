@@ -22,7 +22,12 @@ pgserver = pytest.importorskip("pgserver")
 
 from app.db.session import control_session  # noqa: E402
 from app.repositories.control import ControlRepository  # noqa: E402
-from tests.support import cluster, environment, seed_tenant  # noqa: E402
+from tests.support import (  # noqa: E402
+    cluster,
+    environment,
+    seed_dedicated_control_row,
+    seed_tenant,
+)
 
 # `cluster`/`environment` are imported only so pytest can discover them as fixtures from this
 # module's namespace -- referenced only by parameter name in the tests below, never called
@@ -228,34 +233,9 @@ async def test_gateway_credential_alias_read_and_write_is_isolated_per_tenant(en
     assert still_b is None
 
 
-async def _insert_dedicated_control_row(environment, *, alias: str) -> uuid.UUID:
-    """A `tenants` + `control.tenants` row marking a tenant dedicated to `alias`, with no real
-    second database behind it -- `enumerate_referenced_aliases` only ever reads the alias
-    column, so this is enough to prove it reports a dedicated alias without the cost of actually
-    provisioning one (that is `tests/test_guard_multi_engine_integration.py`'s job)."""
-    tenant_id = uuid.uuid4()
-    engine = create_async_engine(environment.superuser_url)
-    try:
-        async with engine.begin() as conn:
-            await conn.execute(
-                text("INSERT INTO tenants (id, name) VALUES (:id, :name)"),
-                {"id": tenant_id, "name": f"dedicated-{alias}"},
-            )
-            await conn.execute(
-                text(
-                    "INSERT INTO control.tenants (tenant_id, isolation_tier, database_alias) "
-                    "VALUES (:tid, 'dedicated', :alias)"
-                ),
-                {"tid": tenant_id, "alias": alias},
-            )
-    finally:
-        await engine.dispose()
-    return tenant_id
-
-
 async def test_enumerate_referenced_aliases_reports_pooled_and_every_dedicated_alias(environment):
     await seed_tenant(environment, name="Pooled Only", via_operator=False)
-    await _insert_dedicated_control_row(environment, alias="tenant-fake-alias")
+    await seed_dedicated_control_row(environment, alias="tenant-fake-alias")
 
     engine = create_async_engine(environment.owner_url)
     try:
@@ -271,7 +251,7 @@ async def test_enumerate_referenced_aliases_also_works_from_an_app_role_session(
     """The same method, called from an app-role session with no tenant context (exactly how
     `app/db/guard.py`'s `_referenced_aliases` calls it) rather than an owner-role connection --
     proving the `AsyncConnection | AsyncSession` parameter really does serve both call sites."""
-    await _insert_dedicated_control_row(environment, alias="tenant-app-role-alias")
+    await seed_dedicated_control_row(environment, alias="tenant-app-role-alias")
 
     async with control_session() as session:
         aliases = await ControlRepository().enumerate_referenced_aliases(session)

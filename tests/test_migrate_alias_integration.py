@@ -22,7 +22,7 @@ from app.db.engine_registry import POOLED_ALIAS
 pgserver = pytest.importorskip("pgserver")
 
 import scripts.migrate as migrate_module  # noqa: E402
-from tests.support import cluster, create_database  # noqa: E402
+from tests.support import cluster, create_database, seed_dedicated_control_row  # noqa: E402
 
 # `cluster` is imported only so pytest can discover it as a fixture from this module's
 # namespace -- referenced only by parameter name below, never called directly.
@@ -91,28 +91,6 @@ async def _alembic_version(url: str) -> str | None:
         await engine.dispose()
 
 
-async def _insert_dedicated_tenant(superuser_url: str, alias: str) -> None:
-    """Seeds one control-plane tenant row on an *already-migrated* pooled database, marking it
-    dedicated with the given alias -- exactly what `control.database_aliases` enumerates."""
-    tenant_id = uuid.uuid4()
-    engine = create_async_engine(superuser_url)
-    try:
-        async with engine.begin() as conn:
-            await conn.execute(
-                text("INSERT INTO tenants (id, name) VALUES (:id, :name)"),
-                {"id": tenant_id, "name": f"dedicated-{alias}"},
-            )
-            await conn.execute(
-                text(
-                    "INSERT INTO control.tenants (tenant_id, isolation_tier, database_alias) "
-                    "VALUES (:tid, 'dedicated', :alias)"
-                ),
-                {"tid": tenant_id, "alias": alias},
-            )
-    finally:
-        await engine.dispose()
-
-
 def test_migrate_all_brings_pooled_alias_to_head_with_no_dedicated_tenant(migrate_env):
     """(#76) With no dedicated tenant recorded, `migrate_all()` (no argument at the CLI) brings
     exactly the pooled default to head."""
@@ -148,7 +126,7 @@ def test_migrate_all_discovers_and_migrates_a_dedicated_alias_from_the_control_p
     invoking the runner with no argument migrates it too -- not only the pooled default."""
     pooled = migrate_env["pooled"]
     migrate_module.migrate_all()
-    migrate_module.asyncio.run(_insert_dedicated_tenant(pooled.superuser_url, "tenant-green"))
+    migrate_module.asyncio.run(seed_dedicated_control_row(pooled, alias="tenant-green"))
 
     secret_path = migrate_env["secrets_dir"] / "tenant-green"
     secret_path.write_text(dedicated.owner_url)
@@ -165,9 +143,7 @@ def test_alias_in_control_plane_without_secret_file_fails_loudly(migrate_env):
     through `migrate_all()`."""
     pooled = migrate_env["pooled"]
     migrate_module.migrate_all()
-    migrate_module.asyncio.run(
-        _insert_dedicated_tenant(pooled.superuser_url, "tenant-missing-secret")
-    )
+    migrate_module.asyncio.run(seed_dedicated_control_row(pooled, alias="tenant-missing-secret"))
 
     with pytest.raises(migrate_module.MissingMigrationSecretError) as excinfo:
         migrate_module.migrate_alias("tenant-missing-secret")

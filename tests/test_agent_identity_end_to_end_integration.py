@@ -22,23 +22,13 @@ Pattern: `tests/test_agent_identities_integration.py` /
 
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
-import tempfile
-import uuid
-from urllib.parse import parse_qs, urlparse
-
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.agent_credential_exchange import exchange_agent_credential
 from app.config import Settings
 from app.context import RequestContext
-from app.db.guard import ROLE_STATEMENT_TIMEOUT_MS
 from app.db.session import tenant_session
 from app.deps import get_algorithm_source, get_key_source
 from app.jwt_verifier import mint_token
@@ -52,6 +42,11 @@ from app.token_verifier import (
 )
 
 pgserver = pytest.importorskip("pgserver")
+
+from tests.support import cluster, environment, seed_membership, seed_tenant  # noqa: E402
+from tests.support.seeding import set_tenant_identity_issuer  # noqa: E402
+
+_ = (cluster, environment)
 
 
 @pytest.fixture(autouse=True)
@@ -94,93 +89,6 @@ HUMAN_RSA_PUBLIC_KEY_PEM = (
 )
 
 
-def _psql(server, command: str) -> None:
-    from pgserver.postgres_server import POSTGRES_BIN_PATH
-
-    subprocess.run(
-        [str(POSTGRES_BIN_PATH / "psql"), server.get_uri()],
-        input=command.encode(),
-        check=True,
-        capture_output=True,
-    )
-
-
-@pytest.fixture(scope="module")
-def database_urls():
-    pgdata = tempfile.mkdtemp(prefix="pgdata-")
-    server = pgserver.get_server(pgdata, cleanup_mode="delete")
-    sockdir = parse_qs(urlparse(server.get_uri()).query)["host"][0]
-    _psql(
-        server,
-        "CREATE EXTENSION IF NOT EXISTS vector; "
-        "CREATE ROLE app_owner LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE; "
-        "ALTER SCHEMA public OWNER TO app_owner; "
-        "GRANT CREATE ON DATABASE postgres TO app_owner; "
-        "CREATE ROLE app LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE; "
-        "GRANT USAGE ON SCHEMA public TO app; "
-        f"ALTER ROLE app SET statement_timeout = '{ROLE_STATEMENT_TIMEOUT_MS}ms';",
-    )
-    urls = {
-        "migrations": f"postgresql+asyncpg://app_owner@/postgres?host={sockdir}",
-        "app": f"postgresql+asyncpg://app@/postgres?host={sockdir}",
-        "superuser": f"postgresql+asyncpg://postgres@/postgres?host={sockdir}",
-    }
-    env = {**os.environ, "DATABASE_URL_MIGRATIONS": urls["migrations"], "DATABASE_URL": urls["app"]}
-    subprocess.run(
-        [sys.executable, "-m", "alembic", "upgrade", "head"], check=True, env=env, timeout=120
-    )
-    yield urls
-    server.cleanup()
-
-
-@pytest.fixture
-def app_settings(database_urls, monkeypatch):
-    from app import config
-    from app.db import session as db_session
-
-    monkeypatch.setenv("DATABASE_URL", database_urls["app"])
-    monkeypatch.setenv("DATABASE_URL_MIGRATIONS", database_urls["migrations"])
-    config.get_settings.cache_clear()
-    db_session._engine = None
-    db_session._session_factory = None
-    yield
-    config.get_settings.cache_clear()
-    db_session._engine = None
-    db_session._session_factory = None
-
-
-async def _seed_tenant_and_admin(url: str) -> tuple[uuid.UUID, uuid.UUID]:
-    """A tenant with its own (deliberately unrelated) human-IdP issuer configured, plus a person
-    identity as the admin creating the agent identity -- proving the tenant's own issuer/key never
-    enters the agent path even when it is configured."""
-    engine = create_async_engine(url)
-    tenant_id, admin_id = uuid.uuid4(), uuid.uuid4()
-    async with engine.begin() as conn:
-        await conn.execute(
-            text("INSERT INTO tenants (id, name) VALUES (:id, 'Acme')"), {"id": tenant_id}
-        )
-        await conn.execute(
-            text("INSERT INTO control.tenants (tenant_id, identity_issuer) VALUES (:id, :issuer)"),
-            {"id": tenant_id, "issuer": HUMAN_ISSUER},
-        )
-        await conn.execute(
-            text(
-                "INSERT INTO control.identities (id, issuer, subject, kind) "
-                "VALUES (:id, :issuer, :sub, 'person')"
-            ),
-            {"id": admin_id, "issuer": HUMAN_ISSUER, "sub": str(admin_id)},
-        )
-        await conn.execute(
-            text(
-                "INSERT INTO memberships (tenant_id, identity_id, role) "
-                "VALUES (:tid, :iid, 'admin')"
-            ),
-            {"tid": tenant_id, "iid": admin_id},
-        )
-    await engine.dispose()
-    return tenant_id, admin_id
-
-
 def _key_source(issuer: str, kid: str | None) -> str:
     """The same issuer-aware routing `app/deps.py::get_key_source` and the MCP transport (#49)
     both implement, minimal here since only one caller needs it."""
@@ -189,14 +97,24 @@ def _key_source(issuer: str, kid: str | None) -> str:
     return HUMAN_KEY
 
 
-async def test_agent_identity_credential_exchange_and_verification_round_trips(
-    app_settings, database_urls
-):
+async def _tenant_and_admin(environment):
+    """A tenant with its own (deliberately unrelated) human-IdP issuer configured, plus a person
+    identity as the admin creating the agent identity -- proving the tenant's own issuer/key never
+    enters the agent path even when it is configured."""
+    tenant = await seed_tenant(environment, via_operator=False)
+    await set_tenant_identity_issuer(environment, tenant.tenant_id, HUMAN_ISSUER)
+    admin_id, _ = await seed_membership(
+        environment, tenant_id=tenant.tenant_id, role="admin", issuer=HUMAN_ISSUER
+    )
+    return tenant.tenant_id, admin_id
+
+
+async def test_agent_identity_credential_exchange_and_verification_round_trips(environment):
     """The gap, closed: create an agent identity, issue it a credential, exchange the credential
     for a token, and verify that token through the shared module -- resolving back to the same
     agent identity, in the same tenant, with role `agent`. Also proves the tenant's own,
     unrelated human-IdP issuer/key (HUMAN_ISSUER/HUMAN_KEY) never enters the agent path at all."""
-    tenant_id, admin_id = await _seed_tenant_and_admin(database_urls["superuser"])
+    tenant_id, admin_id = await _tenant_and_admin(environment)
     admin_ctx = RequestContext(tenant_id=tenant_id, identity_id=admin_id)
 
     async with tenant_session(admin_ctx) as session:
@@ -236,8 +154,8 @@ async def test_agent_identity_credential_exchange_and_verification_round_trips(
     assert resolved.credential_public_id == issued.public_id
 
 
-async def test_a_revoked_credentials_token_exchange_fails_closed(app_settings, database_urls):
-    tenant_id, admin_id = await _seed_tenant_and_admin(database_urls["superuser"])
+async def test_a_revoked_credentials_token_exchange_fails_closed(environment):
+    tenant_id, admin_id = await _tenant_and_admin(environment)
     admin_ctx = RequestContext(tenant_id=tenant_id, identity_id=admin_id)
 
     async with tenant_session(admin_ctx) as session:
@@ -292,14 +210,14 @@ def _realistic_settings() -> Settings:
 
 
 async def test_rs256_human_token_and_hs256_agent_token_both_verify_in_the_same_process(
-    app_settings, database_urls
+    environment,
 ):
     """The fix, proven end to end with the real per-issuer key/algorithm pinning
     (`app.deps.get_key_source` / `get_algorithm_source`): a human token signed RS256 by a real IdP
     and an agent token signed HS256 by this application's own exchange both verify correctly
     against one shared Settings object -- the exact production configuration (a real, asymmetric
     IdP algorithm) that used to make every agent token unverifiable."""
-    tenant_id, admin_id = await _seed_tenant_and_admin(database_urls["superuser"])
+    tenant_id, admin_id = await _tenant_and_admin(environment)
     admin_ctx = RequestContext(tenant_id=tenant_id, identity_id=admin_id)
 
     async with tenant_session(admin_ctx) as session:
@@ -346,14 +264,12 @@ async def test_rs256_human_token_and_hs256_agent_token_both_verify_in_the_same_p
     assert resolved_agent.issuer == AGENT_IDENTITY_ISSUER
 
 
-async def test_agent_token_resigned_with_the_human_algorithm_and_key_is_rejected(
-    app_settings, database_urls
-):
+async def test_agent_token_resigned_with_the_human_algorithm_and_key_is_rejected(environment):
     """Algorithm-confusion guard: a token claiming the agent issuer but signed RS256 with the
     human IdP's private key must not verify -- `get_key_source`/`get_algorithm_source` pin the
     agent issuer to the agent secret/HS256 unconditionally, so this token's real (RS256) signature
     can never match what it is checked against."""
-    tenant_id, _ = await _seed_tenant_and_admin(database_urls["superuser"])
+    tenant_id, _ = await _tenant_and_admin(environment)
     settings = _realistic_settings()
 
     forged = mint_token(
@@ -374,14 +290,12 @@ async def test_agent_token_resigned_with_the_human_algorithm_and_key_is_rejected
         )
 
 
-async def test_human_issuer_token_signed_with_the_agent_secret_is_rejected(
-    app_settings, database_urls
-):
+async def test_human_issuer_token_signed_with_the_agent_secret_is_rejected(environment):
     """Algorithm-confusion guard, the other direction: a token claiming the tenant's own human
     issuer but signed HS256 with the agent secret must not verify -- the human issuer is pinned to
     JWT_VERIFICATION_KEY/RS256 regardless of what algorithm the token itself was actually signed
     with."""
-    tenant_id, _ = await _seed_tenant_and_admin(database_urls["superuser"])
+    tenant_id, _ = await _tenant_and_admin(environment)
     settings = _realistic_settings()
 
     forged = mint_token(
@@ -402,13 +316,13 @@ async def test_human_issuer_token_signed_with_the_agent_secret_is_rejected(
         )
 
 
-async def test_alg_none_token_is_rejected(app_settings, database_urls):
+async def test_alg_none_token_is_rejected(environment):
     """`alg=none` (an unsigned token) must never verify, for either issuer -- PyJWT is never
     told to accept it (the `algorithms` allow-list `get_algorithm_source` resolves is always an
     explicit, non-"none" list, see app/config.py's supported-algorithm guard)."""
     import jwt as _pyjwt
 
-    tenant_id, _ = await _seed_tenant_and_admin(database_urls["superuser"])
+    tenant_id, _ = await _tenant_and_admin(environment)
     settings = _realistic_settings()
 
     unsigned = _pyjwt.encode(
