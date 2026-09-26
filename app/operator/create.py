@@ -14,9 +14,12 @@ own engine and transaction to stay usable standalone, e.g. by a future `rotate` 
 one transaction is what makes a `create` run atomic end to end for the control-plane pieces -- a
 failure at any step, including the gateway call, rolls every DB write for this invocation back
 together, and only the credential-issuance primitives (`GatewayAdminClient`,
-`GatewayCredentialLimits`, `GATEWAY_MODEL_ALIASES_BY_RESIDENCY`,
-`generate_gateway_credential_alias`, `write_gateway_credential_file`, `build_admin_client`) are
-reused, not that function's own engine-per-call orchestration.
+`GatewayCredentialLimits`, `generate_gateway_credential_alias`, `write_gateway_credential_file`,
+`build_admin_client`) are reused, not that function's own engine-per-call orchestration. The
+minted credential's usable models come from `settings.residency_allow_list.model_aliases(residency)`
+(`app.residency.ResidencyAllowList`, spec A4 / #85 / #111) -- the same object
+`_validate_model` below checks the tenant's own model choice against, so a credential is never
+minted for a model the allow-list itself would reject.
 
 Where the two tiers diverge is the admin membership (#71, ADR-0002): a pooled tenant's first
 admin membership is written to this same pooled connection, exactly as before; a dedicated
@@ -59,7 +62,6 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from app.config import Settings, get_settings
 from app.gateway_provisioning import (
-    GATEWAY_MODEL_ALIASES_BY_RESIDENCY,
     GatewayAdminClient,
     GatewayCredentialLimits,
     GatewayProvisioningError,
@@ -73,6 +75,7 @@ from app.operator.dedicated_db import (
     generate_database_alias,
 )
 from app.operator.lookup import TenantNotFoundError, resolve_tenant
+from app.residency import ResidencyUnresolved
 from app.tenant_settings import TenantSettings
 
 ISOLATION_TIERS = ("pooled", "dedicated")
@@ -111,26 +114,36 @@ class CreateTenantResult:
 
 
 def _validate_residency(residency: str, settings: Settings) -> None:
+    """Rejects an unrecognized residency before any write, via `route_for` (spec A4 / #111) --
+    the operator tool's own `UnrecognizedResidencyError` (a `ValueError`, what the CLI's
+    user-facing error handling expects) wraps `app.residency.ResidencyUnresolved` rather than
+    re-implementing the lookup against `allow_list.residencies` itself.
+    """
     allow_list = settings.residency_allow_list
     assert allow_list is not None  # set by Settings construction
-    if residency not in allow_list.residencies:
+    try:
+        allow_list.route_for(residency)
+    except ResidencyUnresolved as exc:
         raise UnrecognizedResidencyError(
             f"unrecognized residency {residency!r}; known residencies: "
             f"{sorted(allow_list.residencies)} (see settings.residency_allow_list)"
-        )
+        ) from exc
 
 
 def _validate_model(model: str | None, residency: str, settings: Settings) -> None:
+    """Rejects a model outside `residency`'s allow-list before any write, via `alias_for` (spec
+    A4 / #111) -- same reasoning as `_validate_residency` above."""
     if model is None:
         return
     allow_list = settings.residency_allow_list
     assert allow_list is not None  # set by Settings construction
-    allowed = allow_list.model_aliases(residency)
-    if model not in allowed:
+    try:
+        allow_list.alias_for(residency, model)
+    except ResidencyUnresolved as exc:
         raise UnrecognizedModelError(
             f"unrecognized model {model!r} for residency {residency!r}; allowed models: "
-            f"{sorted(allowed)} (see settings.residency_allow_list)"
-        )
+            f"{sorted(allow_list.model_aliases(residency))} (see settings.residency_allow_list)"
+        ) from exc
 
 
 def _validate_isolation_tier(isolation_tier: str) -> None:
@@ -317,11 +330,13 @@ async def create_tenant(
         gateway_outcome = "already provisioned"
         alias = existing_alias
     else:
-        models = GATEWAY_MODEL_ALIASES_BY_RESIDENCY.get(residency)
-        if models is None:
+        allow_list = settings.residency_allow_list
+        assert allow_list is not None  # set by Settings construction
+        models = allow_list.model_aliases(residency)
+        if not models:
             raise GatewayProvisioningError(
                 f"no gateway model aliases configured for residency {residency!r} "
-                f"(known: {sorted(GATEWAY_MODEL_ALIASES_BY_RESIDENCY)})"
+                f"(see settings.residency_allow_list)"
             )
         owns_admin_client = admin_client is None
         admin_client = admin_client or build_admin_client(settings)

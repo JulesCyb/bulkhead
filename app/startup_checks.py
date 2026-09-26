@@ -11,9 +11,11 @@ residency, in one pass; see its docstring for the exact checks.
 
 `ResidencyConfigurationError` is kept here as a subclass of `app.residency.ResidencyUnresolved`
 (itself raised by `check_deployment`) purely for callers/tests that still name this module's own
-type -- unifying the two names is ticket #111's job. Every failure names both the offending
-residency and the offending endpoint, so an operator can fix the deployment's configuration
-without reading source.
+type (spec A4 / #111 decision: `docs/residency.md` and `tests/test_startup_checks.py` both name
+it, so it stays as a documented subclass in the one `ResidencyUnresolved` hierarchy rather than
+being retired) -- a caller that only wants to fail closed still catches the one base type. Every
+failure names both the offending residency and the offending endpoint, so an operator can fix the
+deployment's configuration without reading source.
 
 This never touches a tenant's own `control.tenants.residency` (that is resolved per request by
 `app.residency.resolve_residency_route`, fails closed there with `ResidencyUnresolved`) -- this

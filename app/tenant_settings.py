@@ -38,15 +38,15 @@ than left to whichever module happens to read it first.
 
 - **`residency`** -- home: `control.tenants.residency` (operator-owned, migration
   `0013_control_plane_residency.py`). Shape: `text`, nullable. Validation: a `CHECK` constraint
-  restricting it to a key of `RESIDENCY_ALLOW_LIST` (`app/config.py`); a tenant's own request can
-  never write it (no `UPDATE` grant on `control.tenants`). Default: **no default** -- a tenant
-  without one fails closed (`app.residency.ResidencyUnresolved`), never inherits another
-  jurisdiction's route.
+  restricting it to one of `Settings.residency_allow_list.residencies`
+  (`app.residency.ResidencyAllowList`); a tenant's own request can never write it (no `UPDATE`
+  grant on `control.tenants`). Default: **no default** -- a tenant without one fails closed
+  (`app.residency.ResidencyUnresolved`), never inherits another jurisdiction's route.
 - **`model`** -- home: `public.tenants.settings["model"]` (tenant-editable, this module). Shape:
-  `str` or `None`. Validation: validated against
-  `RESIDENCY_MODEL_ALLOW_LIST[<tenant's own residency>]` at the point a chat model is resolved
-  (`app.llm.resolve_tenant_chat_model`), not by this model itself. Default: `None` (the
-  deployment default `Settings.llm_model` applies).
+  `str` or `None`. Validation: validated against `Settings.residency_allow_list.alias_for` for
+  the tenant's own residency, at the point a chat model is resolved
+  (`app.llm.resolve_tenant_chat_model`/`validate_model_for_residency`), not by this model itself.
+  Default: `None` (the deployment default `Settings.llm_model` applies).
 - **`content_tracing_opt_in`** -- home: `public.tenants.settings["content_tracing_opt_in"]`
   (tenant-editable, this module). Shape: `bool`. Validation: plain Pydantic bool coercion, no
   allow-list -- any tenant admin may flip its own tenant's flag. Default: `False` -- content-free

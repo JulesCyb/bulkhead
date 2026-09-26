@@ -18,11 +18,11 @@ trace):
    (`app.residency.resolve_residency_route` raises `ResidencyUnresolved`).
 2. **A startup allow-list check refuses to let the process start misconfigured.**
    `app.startup_checks.run_startup_checks` — called from both the HTTP API's startup path and the
-   MCP server's own `main()` — walks every endpoint this deployment is actually configured to
-   reach (the model/gateway host, the embedding endpoint, the trace sink) against
-   `RESIDENCY_ALLOW_LIST` (`app/config.py`) for the deployment's own residency, and raises
-   `ResidencyConfigurationError` before a single request or tool call is served if any of them
-   sits outside it.
+   MCP server's own `main()` — is a thin call to `settings.residency_allow_list.check_deployment`
+   (`app.residency.ResidencyAllowList`), which walks every endpoint this deployment is actually
+   configured to reach (the model/gateway host, the embedding endpoint, the trace sink) against
+   the allow-list for the deployment's own residency, and raises `ResidencyConfigurationError`
+   before a single request or tool call is served if any of them sits outside it.
 3. **There is no default embedding provider.** `Settings.embedding_provider` and
    `Settings.embedding_model` have no default value; `Settings` refuses to construct at all
    (`ValueError` from `_require_embedding_config`) unless both are set explicitly. A deployment
@@ -43,11 +43,12 @@ different trace sinks, resolved fresh on every request from `control.tenants.res
 
 ## Sub-processors
 
-Every host any content-bearing path can reach is named in `RESIDENCY_ALLOW_LIST`, loaded from
+Every host any content-bearing path can reach is named in the residency allow-list
+(`app.residency.ResidencyAllowList`, held as `Settings.residency_allow_list`), loaded from
 [`config/residency.toml`](../config/residency.toml) (path overridable with
-`RESIDENCY_CONFIG_PATH`; `app.config.load_residency_config` loads and validates it once at
-process startup) — this file *is* the sub-processor list; there is no second, hand-maintained
-copy for legal to check against a different set of names, and no Python literal to edit. As
+`RESIDENCY_CONFIG_PATH`; `ResidencyAllowList.load` loads and validates it once, at `Settings`
+construction) — this file *is* the sub-processor list; there is no second, hand-maintained copy
+for legal to check against a different set of names, and no Python literal to edit. As
 shipped, two residencies are configured, **each reaching its own, disjoint set of hosts** — a
 residency's allow-list names only that residency's own LiteLLM gateway, never a raw,
 globally-reachable provider domain like `*.anthropic.com`/`*.openai.com`, which is reachable from
@@ -71,10 +72,10 @@ family itself is shared across every residency by design (ADR-0008: the vector c
 fixed dimension, so a residency picks the provider's *region* — reached through that residency's
 own gateway — never a different embedding model or a host another residency can also reach). A
 host not in this table is unreachable on a content-bearing path — the startup check refuses to
-start otherwise, `app.llm.resolve_tenant_chat_model` refuses a model name outside
-`RESIDENCY_MODEL_ALLOW_LIST` for the tenant's own residency before ever building a client, and
-`load_residency_config` itself refuses to load a file in which two residencies name the same
-host.
+start otherwise, `app.llm.resolve_tenant_chat_model` refuses a model name outside that
+residency's own allow-listed models (`ResidencyAllowList.alias_for`) before ever building a
+client, and `ResidencyAllowList.load`/`.from_data` itself refuses to load a file in which two
+residencies name the same host.
 
 ## Worked example: adding a second residency
 
@@ -93,10 +94,10 @@ data, in one file, no branching:
    models = ["claude-uk", "embeddings"]
    ```
 
-   `RESIDENCY_ALLOW_LIST` and `RESIDENCY_MODEL_ALLOW_LIST` (`app/config.py`) pick this entry up
-   automatically the next time the process starts — `load_residency_config` also refuses to start
-   if `gateway-uk.internal`/`*.uk.litellm.internal` collide with any host already claimed by `eu`
-   or `us`.
+   `Settings.residency_allow_list` (`app.residency.ResidencyAllowList`) picks this entry up
+   automatically the next time the process starts — loading it also refuses to start if
+   `gateway-uk.internal`/`*.uk.litellm.internal` collide with any host already claimed by `eu` or
+   `us`.
 
 2. **The model route** — the `models` list above names the gateway aliases a `uk` tenant may use;
    add a matching `model_list` entry in `docker/litellm/config.yaml` routing that alias to a
@@ -129,8 +130,8 @@ The MCP server (`app/mcp/server.py`) hands the exact same tool functions (`searc
 `list_memberships`) to whichever client connects to it. That client brings **its own model** —
 Claude Code, Claude Desktop, or any other MCP client the operator has not configured — and that
 model sits entirely outside the residency guarantees above: the operator's processor chain
-(`RESIDENCY_ALLOW_LIST`, the gateway, the per-residency trace sink) governs the model *this
-deployment* calls on a tenant's behalf, never the model a connecting client happens to be
+(`Settings.residency_allow_list`, the gateway, the per-residency trace sink) governs the model
+*this deployment* calls on a tenant's behalf, never the model a connecting client happens to be
 configured with. A document snippet handed to an MCP client through `search_documents` may
 therefore leave the tenant's residency the moment that client's own model processes it — that is
 the connecting client's (the customer's) responsibility, not something this deployment can

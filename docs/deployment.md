@@ -63,7 +63,8 @@ Every host a content-bearing path can reach — the database, the model gateway,
 sink — must be inside the deployment's residency, the same requirement for all three: a EU
 deployment's `DATABASE_URL`/gateway host and its `LANGFUSE_HOST` must both resolve inside the EU,
 just as a US deployment's must both resolve inside the US. `RESIDENCY` in `.env` names which one
-this deployment is; `RESIDENCY_ALLOW_LIST` (loaded by `app/config.py` from
+this deployment is; the residency allow-list (`Settings.residency_allow_list`,
+`app.residency.ResidencyAllowList`, loaded from
 [`config/residency.toml`](../config/residency.toml), path overridable with
 `RESIDENCY_CONFIG_PATH`) is the single place that lists each residency's allowed hosts — add a
 residency there (a new `[residency.<name>]` table, see `docs/residency.md`), not by editing a host
@@ -83,7 +84,7 @@ Langfuse v3 needs ClickHouse, Redis/Valkey, and MinIO. Use the official compose 
 https://github.com/langfuse/langfuse (do not rebuild it), start it on the same Docker network,
 inside the deployment's residency (see above), and set `LANGFUSE_PUBLIC_KEY`,
 `LANGFUSE_SECRET_KEY` (ADR-0008: the trace sink host itself is resolved per tenant from
-`RESIDENCY_ALLOW_LIST`, not from `LANGFUSE_HOST` — see `app/observability.py`). The tracing
+`Settings.residency_allow_list`, not from `LANGFUSE_HOST` — see `app/observability.py`). The tracing
 dependency (`logfire`, plus the OpenTelemetry SDK/OTLP exporter) is a regular dependency, always
 installed — no extra `uv sync` step. Traces carry identifiers only; a tenant admin opts their own
 tenant into content capture via `tenants.settings["content_tracing_opt_in"]`

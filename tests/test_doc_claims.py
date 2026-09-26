@@ -391,8 +391,10 @@ def test_residency_doc_sub_processor_list_matches_the_allow_list_object() -> Non
 def test_residency_doc_has_a_worked_second_residency_recipe() -> None:
     section = RESIDENCY_MD.split("## Worked example: adding a second residency", 1)[1]
     section = section.split("## The MCP boundary", 1)[0]
-    assert "RESIDENCY_ALLOW_LIST" in section
-    assert "RESIDENCY_MODEL_ALLOW_LIST" in section
+    # Spec A4 / #111: the doc names the one object every caller resolves through, not the
+    # retired `RESIDENCY_ALLOW_LIST`/`RESIDENCY_MODEL_ALLOW_LIST` globals.
+    assert "ResidencyAllowList" in section
+    assert "residency_allow_list" in section
     assert "docker/litellm/config.yaml" in section
     assert "trace_sink_host" in section
 
@@ -450,7 +452,7 @@ def test_tenant_settings_catalog_documents_residency_and_content_tracing_opt_in(
     assert "control.tenants.residency" in doc
     assert "content_tracing_opt_in" in doc
     # Shape, validation, and default are all named for both entries, not just one.
-    assert "RESIDENCY_ALLOW_LIST" in doc
+    assert "ResidencyAllowList" in doc
     assert "no default" in doc
     assert "False" in doc
 
