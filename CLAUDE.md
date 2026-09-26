@@ -191,8 +191,8 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    (`/v1/t/{tenant_id}/agent-identities`, `/agent-credentials`, `/agent-tokens`, admin-only to
    issue/revoke) resolves to autonomous use.
    **Two independent algorithm/key settings, never one** (review finding): a person's token is
-   checked against `JWT_VERIFICATION_KEY`/`JWT_ALGORITHM` (a real IdP's own, typically asymmetric,
-   algorithm — this holds only its public key); an agent identity's token is minted by this
+   checked against `JWT_VERIFICATION_KEY`/`JWT_ALGORITHM` (a real identity provider's own,
+   typically asymmetric, algorithm — this holds only its public key); an agent identity's token is minted by this
    application itself and checked against `AGENT_TOKEN_SIGNING_KEY` (or
    `AGENT_TOKEN_VERIFICATION_KEY`)/`AGENT_TOKEN_ALGORITHM` (default `HS256`, since this process is
    both signer and verifier here). `app.context_resolution.key_source_for`/`algorithm_source_for`

@@ -14,16 +14,16 @@ control plane a second time. Every caller -- `app/context_resolution.py`'s beare
 both the HTTP API and the MCP transport (#102) resolve through -- gets that check.
 
 **Gap fix (Spec 6, closing the loop between #46/#47 and this module).** An agent identity's token
-(minted by `app/agent_credential_exchange.py`) is *not* governed by a tenant's own human-IdP
-`identity_issuer` setting: `control.create_agent_identity` (migration 0032) synthesizes every
-agent identity's issuer as the fixed literal `AGENT_IDENTITY_ISSUER` below, the same constant the
-exchange module signs with. This module peeks at a presented token's own (unverified) `iss` claim
-before deciding which issuer/key pair to check it against: `AGENT_IDENTITY_ISSUER` routes to the
-agent-token issuer directly (no tenant auth-settings lookup -- an agent token is tenant-independent
-by construction), and anything else falls back to the tenant's own configured issuer exactly as
-before. The peek is never trusted on its own: `verify_token` re-checks the real `iss` claim against
-whichever issuer this picks, under signature, so a forged `iss` that does not match its own
-signature still fails closed the same way it always did.
+(minted by `app/agent_credential_exchange.py`) is *not* governed by a tenant's own human
+identity provider's `identity_issuer` setting: `control.create_agent_identity` (migration 0032)
+synthesizes every agent identity's issuer as the fixed literal `AGENT_IDENTITY_ISSUER` below, the
+same constant the exchange module signs with. This module peeks at a presented token's own
+(unverified) `iss` claim before deciding which issuer/key pair to check it against:
+`AGENT_IDENTITY_ISSUER` routes to the agent-token issuer directly (no tenant auth-settings lookup --
+an agent token is tenant-independent by construction), and anything else falls back to the tenant's
+own configured issuer exactly as before. The peek is never trusted on its own: `verify_token`
+re-checks the real `iss` claim against whichever issuer this picks, under signature, so a forged
+`iss` that does not match its own signature still fails closed the same way it always did.
 
 **One injectable adapter for every control-plane/membership read (#100, prefactor for Spec A1).**
 `verify_tenant_token` needs three reads -- a tenant's auth settings, an identity by (issuer,
@@ -79,8 +79,9 @@ AlgorithmSource = Callable[[str], tuple[str, ...]]
 
 # The fixed issuer `control.create_agent_identity` (migration 0032) synthesizes for every agent
 # identity, and the issuer `app/agent_credential_exchange.py` mints agent tokens under. Never a
-# tenant's own (human-IdP) issuer -- an agent token is tenant-independent by construction, the
-# same credential-issuing tenant is instead enforced via the token's audience (below).
+# tenant's own (human identity provider's) issuer -- an agent token is tenant-independent by
+# construction, the same credential-issuing tenant is instead enforced via the token's audience
+# (below).
 AGENT_IDENTITY_ISSUER: Final[str] = "agent"
 
 

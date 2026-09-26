@@ -11,14 +11,14 @@ single module (`app/token_verifier.py`) verifies both kinds later.
 **Gap fix (Spec 6 / #49):** the minted token's issuer is the agent identity's *own* issuer
 (`token_verifier.AGENT_IDENTITY_ISSUER`, the fixed literal `control.create_agent_identity`
 synthesizes every agent identity's `issuer` column as) -- never the requesting tenant's own
-human-IdP issuer. The two used to be conflated here, which meant a real agent token could never
-verify: `verify_tenant_token` resolved the tenant's human issuer and checked the token's signature
-against `jwt_verification_key`, while this module signed with the separate
+human identity provider's issuer. The two used to be conflated here, which meant a real agent
+token could never verify: `verify_tenant_token` resolved the tenant's human issuer and checked the
+token's signature against `jwt_verification_key`, while this module signed with the separate
 `agent_token_signing_key`. Signing under the agent identity's real issuer lets the shared verifier
 recognize it (by peeking `iss`, see `app/token_verifier.py`) and check it against the matching key
-instead. The credential's own public id travels along as an extra `cred` claim so a caller
-resolving the token later (the MCP transport, #49) can name it as `RequestContext`'s means without
-a second lookup.
+instead. The credential's own public id travels along as an extra `cred` claim so a caller resolving
+the token later (the MCP transport, #49) can name it as `RequestContext`'s means without a second
+lookup.
 
 This module raises exactly one exception, `AgentCredentialExchangeError`, for every way an
 exchange can fail -- the caller (`app/api/agent_tokens.py`) maps it to one generic response,
@@ -134,9 +134,9 @@ async def exchange_agent_credential(
         raise AgentCredentialExchangeError("credential's identity does not resolve")
 
     # Gap fix (see module docstring): the agent identity's own issuer, never the tenant's
-    # human-IdP one -- `control.create_agent_identity` (migration 0032) is the only writer of
-    # `identity.issuer` for an identity of kind agent, and it always synthesizes exactly this
-    # value. A mismatch here would mean this credential does not actually belong to an agent
+    # human identity provider's -- `control.create_agent_identity` (migration 0032) is the only
+    # writer of `identity.issuer` for an identity of kind agent, and it always synthesizes exactly
+    # this value. A mismatch here would mean this credential does not actually belong to an agent
     # identity at all -- fail closed rather than mint a token nothing can later verify correctly.
     if identity.issuer != AGENT_IDENTITY_ISSUER:
         raise AgentCredentialExchangeError("credential's identity is not an agent identity")

@@ -50,7 +50,7 @@ own public Host header(s), checked by `check_mcp_mode` below before `streamable-
 Freshness note: MCP Python SDK 2.x -> `from mcp.server.mcpserver import MCPServer`
 (previously `from mcp.server.fastmcp import FastMCP`). Check on SDK updates.
 
-The residency boundary (ADR-0008, docs/residency.md): a connecting MCP client brings its own
+Residency (ADR-0008, docs/residency.md): a connecting MCP client brings its own
 model. That model sits entirely outside this application's processor chain and outside
 residency enforcement -- `Settings.residency_allow_list`, the gateway, and the per-residency
 trace sink (`app/config.py`, `app/residency.py`, `app/observability.py`) govern the model *this

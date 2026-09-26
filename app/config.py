@@ -114,23 +114,24 @@ class Settings(BaseSettings):
     default_identity_issuer: str | None = None
 
     # JWT verification (issue #24 / ADR-0003 / ADR-0012): the interim single process-wide
-    # verification key/algorithm, not a per-tenant JWKS lookup -- a customer-owned IdP needs a
-    # real JWKS key source (swap `app.deps.get_key_source`, never `app/jwt_verifier.py`). No
+    # verification key/algorithm, not a per-tenant JWKS lookup -- a customer-owned identity
+    # provider needs a real JWKS key source (change `app.context_resolution.key_source_for`, the
+    # one place both the HTTP and MCP adapters read; never `app/jwt_verifier.py`). No
     # default: AUTH_MODE=jwt with no key fails every request as unauthenticated (app/deps.py).
     jwt_verification_key: SecretStr | None = None
     jwt_algorithm: str = "RS256"
 
     # Agent-credential token exchange (Spec 6 / #47, ADR-0005): mints a short-lived access token
-    # when an agent identity exchanges its own credential -- never verifies a tenant IdP's own
-    # tokens (`jwt_verification_key`/`verify_token`'s job). No default: unconfigured fails every
-    # exchange rather than minting an unsigned token.
+    # when an agent identity exchanges its own credential -- never verifies the tokens of a
+    # tenant's identity provider (`jwt_verification_key`/`verify_token`'s job). No default:
+    # unconfigured fails every exchange rather than minting an unsigned token.
     #
     # **Deliberately a separate algorithm from `jwt_algorithm` (review finding, Spec 6 /
-    # ADR-0005 / ADR-0003)**: a real IdP signs asymmetrically, this process is both signer and
-    # verifier of its own agent tokens, so `agent_token_algorithm` defaults to `HS256` and can be
-    # set asymmetric instead (`agent_token_verification_key` below then holds the derived public
-    # half). `app.deps.get_key_source`/`get_algorithm_source` pin the matching pair per issuer,
-    # never the other one -- the algorithm-confusion guard.
+    # ADR-0005 / ADR-0003)**: a real identity provider signs asymmetrically, this process is both
+    # signer and verifier of its own agent tokens, so `agent_token_algorithm` defaults to `HS256`
+    # and can be set asymmetric instead (`agent_token_verification_key` below then holds the derived
+    # public half). `app.deps.get_key_source`/`get_algorithm_source` pin the matching pair per
+    # issuer, never the other one -- the algorithm-confusion guard.
     agent_token_signing_key: SecretStr | None = None
     agent_token_algorithm: str = "HS256"
     # Meaningful only when `agent_token_algorithm` is asymmetric: the public key

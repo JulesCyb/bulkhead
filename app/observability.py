@@ -233,8 +233,9 @@ def instrumentation_capabilities(
     at all), unknown to the allow-list, or tracing is not configured for any residency. Unlike the
     model and embedding paths, which must fail the request closed (`app.residency.
     ResidencyUnresolved`), tracing is not content-bearing on its own: an untraced run can neither
-    cross a residency boundary nor leak content, whereas refusing the request would make a
-    tracing-only gap user-facing. What it never does is fall back to another residency's sink.
+    carry content out of the tenant's residency nor leak content, whereas refusing the request
+    would make a tracing-only gap user-facing. What it never does is fall back to another
+    residency's sink.
 
     `content_tracing_opt_in` maps straight onto `InstrumentationSettings.include_content`:
     prompts and tool results are captured only when the tenant has explicitly opted in, never by
