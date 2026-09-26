@@ -15,12 +15,16 @@
 Kept as two separate `Agent` objects (not one agent with a flag) so that wiring a writing tool
 into the one-shot agent is a change to code that doesn't exist, not a config toggle to flip back.
 
-- No model hard-wired: `resolve_chat_model()` resolves it per request from the tenant record
-  the request's context carries -- its residency, its own `model` setting (else the deployment
-  default), its gateway credential alias (Spec 8 / #61, ADR-0008, #105) -- via
-  `app.llm.resolve_tenant_chat_model`, never the removed, deployment-wide
-  `app.llm.get_model()` (ai-app-starter#7).
-  Tests override with TestModel/FunctionModel — no real model call.
+This module holds the two agents, their instructions, and their tool registration -- nothing that
+*runs* them. A run is prepared and executed by `app/agents/run.py` (spec A3 / #107): it resolves
+the model from the tenant record (no model is hard-wired here), builds the run limit, the tracing
+capabilities and span attributes, and the `AssistantDeps` below, and its execution method decides
+which of the two agents runs (`answer`/`stream_text` bind `one_shot_assistant`). Tests inject a
+TestModel/FunctionModel through that module -- no real model call.
+
+- `AssistantDeps` is internal to a run: what the tools read from `ctx.deps`, constructed by
+  `app.agents.run.prepare_run` and never by a route (`app/api/chat.py` still builds its own until
+  #108 moves the chat route onto the run module).
 - Tools are thin wrappers around app/tools/* that take the context from ctx.deps.
 - LangGraph only once a flow becomes a state machine (checkpoints, human-in-the-loop) —
   then as its own module, with an ADR.
@@ -28,22 +32,15 @@ into the one-shot agent is a change to code that doesn't exist, not a config tog
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from uuid import UUID
 
 from pydantic_ai import Agent, DeferredToolRequests, RunContext
 from pydantic_ai.messages import ModelMessage
-from pydantic_ai.models import Model
-from pydantic_ai.result import StreamedRunResult
 
 from app.context import RequestContext
-from app.llm import resolve_tenant_chat_model
-from app.observability import instrumentation_capabilities, tenant_span_attributes
 from app.repositories.documents import DocumentHit
-from app.residency import ResidencyUnresolved
-from app.run_limits import RunLimits, build_run_limits, run_deadline
 from app.tools import conversations as conversation_tools
 from app.tools import documents as document_tools
 from app.tools.approvals import ApprovalContext, record_write_outcome, require_approval
@@ -55,6 +52,8 @@ SaveRunFn = Callable[[RequestContext, str, list[ModelMessage]], Awaitable[None]]
 
 @dataclass
 class AssistantDeps:
+    """What the tools read from `ctx.deps` -- internal to one run (module docstring)."""
+
     ctx: RequestContext
     # Injectable so tests run without a database and embeddings (None = the real search).
     search: SearchFn | None = None
@@ -67,7 +66,7 @@ class AssistantDeps:
     # session of its own, independent of the streamed response's own lifecycle.
     save_run: SaveRunFn | None = None
     # No model name here (#105): the model is resolved from `ctx.tenant_record` (the tenant's own
-    # `model` setting, else the deployment default) by `resolve_chat_model` below.
+    # `model` setting, else the deployment default) by `app.agents.run.prepare_run`.
     # The bare (non tenant-prefixed) conversation id this run belongs to (ADR-0007, #40): what
     # `app/tools/approvals.py` scopes a pending action to -- distinct from the tenant-scoped id
     # `app/api/chat.py` passes as the run's own `conversation_id` for tracing (module docstring
@@ -80,12 +79,12 @@ class AssistantDeps:
     # `executed`/`failed_to_execute` outcome (`app.tools.approvals.record_write_outcome`). Never
     # set by anything else.
     pending_approval: ApprovalContext | None = None
-    # Tracing (Spec 8 / #62, ADR-0008): the caller takes both from the tenant record its context
-    # carries before building these deps (`app.observability.resolve_tenant_tracing`, #105 -- no
-    # database read) and passes them straight through — `None`/`False` here (the defaults) mean
-    # "trace this run, if at all, with no residency resolved and no content", which
-    # `instrumentation_capabilities()` below always treats as untraced, never as a fallback to
-    # some other tenant's sink.
+    # Tracing (Spec 8 / #62, ADR-0008): the preparation takes both from the tenant record its
+    # context carries (`app.observability.resolve_tenant_tracing`, #105 -- no database read) and
+    # passes them straight through — `None`/`False` here (the defaults) mean "trace this run, if at
+    # all, with no residency resolved and no content", which
+    # `app.observability.instrumentation_capabilities()` always treats as untraced, never as a
+    # fallback to some other tenant's sink.
     residency: str | None = None
     content_tracing_opt_in: bool = False
 
@@ -185,101 +184,11 @@ _register_reading_tools(chat_assistant)
 _register_writing_tools(chat_assistant)
 
 
-async def resolve_chat_model(deps: AssistantDeps) -> Model:
-    """Resolves `deps.ctx`'s own per-tenant chat model, routed through its residency
-    (Spec 8 / #61, ADR-0008) -- the one seam `run_assistant`, `stream_assistant`, and
-    `app/api/chat.py` all use instead of the removed, deployment-wide
-    `app.llm.get_model()` (ai-app-starter#7).
-
-    A function of the tenant record the context carries (`deps.ctx.tenant_record`, read once at
-    context resolution, #104/#105) -- no session, no control-plane read here: its residency, its
-    own `model` setting (else the deployment default), its gateway credential alias
-    (`app.llm.resolve_tenant_chat_model`). A context without a record (a job, a test) fails
-    closed with `ResidencyUnresolved`: never a read of its own, never the deployment's residency.
-    Propagates `app.residency.ResidencyUnresolved`, `app.llm.ModelNotAllowedForResidency`, and
-    `app.gateway_credentials.GatewayCredentialUnavailable` unchanged; callers map them to a clear
-    failure (see `app/api/agents.py` and `app/api/chat.py`), never a fallback to a default route.
-    """
-    record = deps.ctx.tenant_record
-    if record is None:
-        raise ResidencyUnresolved(
-            f"context for tenant {deps.ctx.tenant_id} carries no tenant record to resolve a "
-            "model from"
-        )
-    return resolve_tenant_chat_model(record)
-
-
-async def run_assistant(prompt: str, deps: AssistantDeps, limits: RunLimits | None = None) -> str:
-    """Runs the one-shot (reading-only) agent — backs `/v1/t/{tenant_id}/agents/assistant/run`.
-
-    Checks suspension nowhere in this function (#106, ADR-0010): suspension has exactly two
-    enforcement points now -- context resolution, which refuses a suspended tenant's record before
-    `deps.ctx` is ever built, and `tenant_session()`'s own routing read, which a tool's repository
-    call still hits for a context that carries no record at all (a job, a test). This entry point
-    no longer duplicates either check.
-    """
-    limits = limits or build_run_limits()
-    model = await resolve_chat_model(deps)
-    capabilities = instrumentation_capabilities(deps.residency, deps.content_tracing_opt_in)
-    async with run_deadline(limits):
-        # The whole run happens inside this one awaited call, so wrapping it here (rather than at
-        # the route) is enough for every span it produces to carry tenant/user attributes.
-        with tenant_span_attributes(deps.ctx.trace_attributes()):
-            result = await one_shot_assistant.run(
-                prompt,
-                deps=deps,
-                model=model,
-                usage_limits=limits.usage_limits,
-                metadata=deps.ctx.trace_attributes(),
-                capabilities=capabilities,
-            )
-    return result.output
-
-
-@asynccontextmanager
-async def stream_assistant(
-    prompt: str, deps: AssistantDeps, limits: RunLimits | None = None
-) -> AsyncIterator[StreamedRunResult]:
-    """Async context manager yielding a StreamedRunResult; use it via `async with` in routes.
-
-    Backs `/v1/t/{tenant_id}/agents/assistant/stream` — runs the one-shot (reading-only) agent.
-
-    Checks suspension nowhere in this function (#106, ADR-0010) — see `run_assistant`'s docstring
-    for the two enforcement points that cover it instead.
-
-    Does NOT itself enforce the run's wall-clock deadline, and does NOT itself wrap
-    `tenant_span_attributes` (Spec 8 / #62): both must bound the full open-and-consume lifecycle
-    (opening the stream, then reading every delta from it), not just the call that starts it —
-    the caller's `async with ... as result: async for ...` block is what needs wrapping, in
-    `run_limits.run_deadline(limits)` and `app.observability.tenant_span_attributes(...)`. See
-    `app/api/agents.py`'s `/assistant/stream` route.
-
-    Model resolution (`resolve_chat_model`, above) happens before the stream is even opened, so a
-    `ResidencyUnresolved`/`ModelNotAllowedForResidency`/`GatewayCredentialUnavailable` failure is
-    raised here, before any chunk of the response has been sent -- the caller (`app/api/agents.py`)
-    catches it inside its own streaming generator and emits a mapped SSE error event instead of a
-    raw exception on an already-started stream.
-    """
-    limits = limits or build_run_limits()
-    model = await resolve_chat_model(deps)
-    capabilities = instrumentation_capabilities(deps.residency, deps.content_tracing_opt_in)
-    async with one_shot_assistant.run_stream(
-        prompt,
-        deps=deps,
-        model=model,
-        usage_limits=limits.usage_limits,
-        metadata=deps.ctx.trace_attributes(),
-        capabilities=capabilities,
-    ) as result:
-        yield result
-
-
 __all__ = [
     "AssistantDeps",
-    "StreamedRunResult",
+    "LoadHistoryFn",
+    "SaveRunFn",
+    "SearchFn",
     "chat_assistant",
     "one_shot_assistant",
-    "resolve_chat_model",
-    "run_assistant",
-    "stream_assistant",
 ]

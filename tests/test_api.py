@@ -13,45 +13,41 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.toolsets.function import FunctionToolset
 
-from app.agents import assistant as assistant_module
 from app.agents.assistant import chat_assistant, one_shot_assistant
-from app.api import chat as chat_module
 from app.config import Settings
 from app.main import app
+from app.tools import conversations as conversation_tools
 from tests.conftest import (
     looping_tool_calls,
     looping_tool_calls_stream,
     make_stalling_model,
     make_stalling_stream_model,
-    resolve_to_model,
 )
 
 
 @pytest.fixture
-def client(monkeypatch, fake_search, fake_history, test_model):
-    # Search and conversation history without a DB: AssistantDeps resolves both defaults at
-    # runtime -> inject the fakes (ADR-0006, #33).
-    monkeypatch.setattr(assistant_module.document_tools, "search_documents", fake_search)
-    monkeypatch.setattr(
-        assistant_module.conversation_tools, "load_conversation_history", fake_history
-    )
+def client(route_run):
+    # Model, search, and conversation history without a DB or a gateway: installed for every run
+    # the routes prepare (`app.agents.run`), nothing patched.
+    route_run(TestModel(call_tools=["search_documents"]))
     transport = httpx.ASGITransport(app=app)
     return httpx.AsyncClient(transport=transport, base_url="http://test")
 
 
 @pytest.fixture
-def raw_client(monkeypatch, fake_search, fake_history):
-    """Like `client`, but without the `test_model` override — for tests that need to inject their
-    own model via `resolve_chat_model` (patched per-test, in place of the removed, deployment-wide
-    `get_model()`), so the `run_limits` wiring in `app/agents/assistant.py` and
-    `app/api/agents.py` is genuinely exercised rather than bypassed.
-    """
-    monkeypatch.setattr(assistant_module.document_tools, "search_documents", fake_search)
-    monkeypatch.setattr(
-        assistant_module.conversation_tools, "load_conversation_history", fake_history
-    )
+def raw_client(route_run):
+    """Like `client`, but with no model installed -- each test installs its own through
+    `route_run`, so the run-limit wiring in `app/agents/run.py` is genuinely exercised."""
+    route_run()
     transport = httpx.ASGITransport(app=app)
     return httpx.AsyncClient(transport=transport, base_url="http://test")
+
+
+@pytest.fixture
+def chat_history(monkeypatch, fake_history):
+    """The chat route still builds its own tool dependencies until #108 moves it onto
+    `app.agents.run`: its history loader is the real module's, replaced here."""
+    monkeypatch.setattr(conversation_tools, "load_conversation_history", fake_history)
 
 
 @pytest.fixture
@@ -97,15 +93,13 @@ async def test_run_with_context(client, calls, contexts):
 
 
 async def test_run_ends_with_defined_error_when_tool_call_ceiling_exceeded(
-    raw_client, small_run_limits, monkeypatch
+    raw_client, small_run_limits, route_run
 ):
     """One-shot endpoint: an engineered run that calls a tool more times than the configured
     ceiling ends in a defined error status and body, not a raw exception.
     """
     small_run_limits()
-    monkeypatch.setattr(
-        assistant_module, "resolve_chat_model", resolve_to_model(FunctionModel(looping_tool_calls))
-    )
+    route_run(FunctionModel(looping_tool_calls))
     async with raw_client:
         response = await raw_client.post(
             _tenant_path("/agents/assistant/run"),
@@ -117,19 +111,13 @@ async def test_run_ends_with_defined_error_when_tool_call_ceiling_exceeded(
 
 
 async def test_stream_ends_with_terminal_error_event_when_tool_call_ceiling_exceeded(
-    raw_client, small_run_limits, monkeypatch
+    raw_client, small_run_limits, route_run
 ):
     """Streaming endpoint: the same engineered run ends in a terminal `event: error` before the
     stream closes, never a silent stop.
     """
     small_run_limits()
-    monkeypatch.setattr(
-        assistant_module,
-        "resolve_chat_model",
-        resolve_to_model(
-            FunctionModel(looping_tool_calls, stream_function=looping_tool_calls_stream)
-        ),
-    )
+    route_run(FunctionModel(looping_tool_calls, stream_function=looping_tool_calls_stream))
     async with raw_client:
         response = await raw_client.post(
             _tenant_path("/agents/assistant/stream"),
@@ -143,22 +131,18 @@ async def test_stream_ends_with_terminal_error_event_when_tool_call_ceiling_exce
 
 
 async def test_stream_ends_with_distinct_error_when_wall_clock_deadline_exceeded(
-    raw_client, small_run_limits, monkeypatch
+    raw_client, small_run_limits, route_run
 ):
     """A stalled provider (FunctionModel that sleeps) cannot hold the streaming client open past
     the run's own deadline — it ends with a distinct, generic error, and the stream closes,
     instead of waiting for the provider's own (much longer) default timeout.
     """
     small_run_limits(run_deadline_seconds=0.2)
-    monkeypatch.setattr(
-        assistant_module,
-        "resolve_chat_model",
-        resolve_to_model(
-            FunctionModel(
-                make_stalling_model(seconds=30),
-                stream_function=make_stalling_stream_model(seconds=30),
-            )
-        ),
+    route_run(
+        FunctionModel(
+            make_stalling_model(seconds=30),
+            stream_function=make_stalling_stream_model(seconds=30),
+        )
     )
     async with raw_client:
         response = await asyncio.wait_for(
@@ -175,12 +159,10 @@ async def test_stream_ends_with_distinct_error_when_wall_clock_deadline_exceeded
     assert "event: done" not in response.text
 
 
-async def test_run_within_limits_completes_normally(
-    raw_client, small_run_limits, calls, monkeypatch
-):
+async def test_run_within_limits_completes_normally(raw_client, small_run_limits, calls, route_run):
     """A run within the ceilings completes normally, unaffected by the new limiting."""
     small_run_limits()
-    monkeypatch.setattr(assistant_module, "resolve_chat_model", resolve_to_model(TestModel()))
+    route_run(TestModel())
     async with raw_client:
         response = await raw_client.post(
             _tenant_path("/agents/assistant/run"), json={"prompt": "hi"}, headers=_headers()
@@ -247,16 +229,10 @@ def _function_toolset(agent) -> FunctionToolset:
     raise AssertionError(f"{agent} has no function toolset")
 
 
-def test_one_shot_agent_has_no_tool_requiring_approval():
-    """S5-T2 / #36: a structural property check, not "no test happened to call one".
-
-    Asserted from `ToolDefinition.kind` (`'unapproved'` iff `requires_approval=True`), the same
-    signal pydantic-ai's own approval machinery reads — not from ever having run a model.
-    """
-    toolset = _function_toolset(one_shot_assistant)
-    assert toolset.tools, "expected at least one registered tool"
-    for name, tool in toolset.tools.items():
-        assert not tool.requires_approval, f"one-shot agent must not carry {name!r} for approval"
+# The structural ADR-0007 guarantee (the reading-only agent registers no tool with an approval
+# validator, and `answer`/`stream_text` bind it) is asserted once, at the run module's own seam:
+# `tests/test_run.py::test_answer_and_stream_text_bind_the_reading_only_agent`. The route-level
+# test below shows the one-shot endpoints inherit it.
 
 
 def test_one_shot_and_chat_are_distinct_agents():
@@ -275,13 +251,12 @@ def _capturing_model(sink: list[AgentInfo]) -> FunctionModel:
     return FunctionModel(call, stream_function=stream_call)
 
 
-async def test_one_shot_endpoints_answer_through_reading_only_agent(monkeypatch, fake_search):
+async def test_one_shot_endpoints_answer_through_reading_only_agent(route_run):
     """Both one-shot endpoints expose exactly the one-shot agent's tool set, and never the
     chat agent's — asserted from the tool set the run actually sends to the model, not from
     reading which function the route happens to call.
     """
-    monkeypatch.setattr(assistant_module.document_tools, "search_documents", fake_search)
-    monkeypatch.setattr(assistant_module, "resolve_chat_model", resolve_to_model(TestModel()))
+    route_run(TestModel())
     one_shot_seen: list[AgentInfo] = []
     chat_seen: list[AgentInfo] = []
     expected_names = set(_function_toolset(one_shot_assistant).tools)
@@ -309,15 +284,11 @@ async def test_one_shot_endpoints_answer_through_reading_only_agent(monkeypatch,
         assert all(tool_def.kind != "unapproved" for tool_def in info.function_tools)
 
 
-async def test_chat_endpoint_answers_through_chat_agent(monkeypatch, fake_search, fake_history):
+async def test_chat_endpoint_answers_through_chat_agent(route_run, chat_history):
     """The chat endpoint exposes the chat agent's tool set, and never touches the one-shot
     agent — the mirror image of the one-shot assertion above.
     """
-    monkeypatch.setattr(assistant_module.document_tools, "search_documents", fake_search)
-    monkeypatch.setattr(
-        assistant_module.conversation_tools, "load_conversation_history", fake_history
-    )
-    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(TestModel()))
+    route_run(TestModel())
     one_shot_seen: list[AgentInfo] = []
     chat_seen: list[AgentInfo] = []
     expected_names = set(_function_toolset(chat_assistant).tools)
@@ -339,17 +310,10 @@ async def test_chat_endpoint_answers_through_chat_agent(monkeypatch, fake_search
     assert seen_names == expected_names
 
 
-async def test_both_agents_instructions_state_tool_results_are_data(
-    monkeypatch, fake_search, fake_history
-):
+async def test_both_agents_instructions_state_tool_results_are_data(route_run, chat_history):
     """Acceptance criterion: each agent's instructions text plainly states that tool results
     are data to weigh, not instructions to follow (closes the prompt-injection gap)."""
-    monkeypatch.setattr(assistant_module.document_tools, "search_documents", fake_search)
-    monkeypatch.setattr(
-        assistant_module.conversation_tools, "load_conversation_history", fake_history
-    )
-    monkeypatch.setattr(assistant_module, "resolve_chat_model", resolve_to_model(TestModel()))
-    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(TestModel()))
+    route_run(TestModel())
     one_shot_seen: list[AgentInfo] = []
     chat_seen: list[AgentInfo] = []
 

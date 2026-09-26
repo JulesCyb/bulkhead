@@ -15,9 +15,10 @@ exists somewhere" a 404 wouldn't).
 `list_agent_credentials`/`revoke_agent_credential` and the membership listing are), so there is
 no real route to drive an ASGI request through the standing-grants tool. This file instead proves
 the mapping the same way `tests/test_error_handling.py` proves the generic-500 and 403 cases: by
-monkeypatching `run_assistant` (an existing, real route) to raise the exception in question, and
-observing what the real, registered `app.main` exception handler turns it into over a real ASGI
-call -- the tool/handler seam, not a fabricated route.
+installing a search tool that raises the exception in question for every run the one-shot run
+route (an existing, real route) prepares (`tests/conftest.py`'s `route_run`), and observing what
+the real, registered `app.main` exception handler turns it into over a real ASGI call -- the
+tool/handler seam, not a fabricated route.
 """
 
 from __future__ import annotations
@@ -25,9 +26,8 @@ from __future__ import annotations
 import uuid
 
 import httpx
-import pytest
+from pydantic_ai.models.test import TestModel
 
-from app.api import agents as agents_module
 from app.main import app
 from app.repositories.agent_credentials import UnknownAgentIdentity
 from app.repositories.errors import NotFoundInTenant
@@ -42,11 +42,11 @@ def _tenant_path(suffix: str) -> str:
     return f"/v1/t/{uuid.uuid4()}{suffix}"
 
 
-async def _post_run_that_raises(monkeypatch: pytest.MonkeyPatch, exc: Exception) -> httpx.Response:
-    async def _raise(prompt: str, deps) -> str:
+async def _post_run_that_raises(route_run, exc: Exception) -> httpx.Response:
+    async def _raise(ctx, query, limit):
         raise exc
 
-    monkeypatch.setattr(agents_module, "run_assistant", _raise)
+    route_run(TestModel(call_tools=["search_documents"]), search=_raise)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         return await client.post(
@@ -57,9 +57,9 @@ async def _post_run_that_raises(monkeypatch: pytest.MonkeyPatch, exc: Exception)
 # --- The finding itself: NotAnAgentMembership must be a 404, not the generic 500 ---
 
 
-async def test_not_an_agent_membership_is_404_not_500(monkeypatch):
+async def test_not_an_agent_membership_is_404_not_500(route_run):
     response = await _post_run_that_raises(
-        monkeypatch, NotAnAgentMembership("membership abc123 does not carry the agent role")
+        route_run, NotAnAgentMembership("membership abc123 does not carry the agent role")
     )
 
     assert response.status_code == 404, response.text
@@ -74,9 +74,9 @@ async def test_not_an_agent_membership_is_404_not_500(monkeypatch):
 # --- The sibling case (UnknownAgentIdentity) keeps its existing body/behaviour ---
 
 
-async def test_unknown_agent_identity_keeps_its_existing_404_body(monkeypatch):
+async def test_unknown_agent_identity_keeps_its_existing_404_body(route_run):
     response = await _post_run_that_raises(
-        monkeypatch, UnknownAgentIdentity("identity xyz789 has no agent membership in this tenant")
+        route_run, UnknownAgentIdentity("identity xyz789 has no agent membership in this tenant")
     )
 
     assert response.status_code == 404, response.text
@@ -98,7 +98,7 @@ def test_both_exceptions_are_notfoundintenant_subclasses():
 
 
 async def test_a_plain_notfoundintenant_subclass_with_no_override_gets_the_base_message(
-    monkeypatch,
+    route_run,
 ):
     """A future repository that subclasses `NotFoundInTenant` without setting its own
     `public_message` still gets a clean 404 (the base class's own fixed sentence), never a
@@ -107,7 +107,7 @@ async def test_a_plain_notfoundintenant_subclass_with_no_override_gets_the_base_
     class SomeFutureNotFound(NotFoundInTenant):
         pass
 
-    response = await _post_run_that_raises(monkeypatch, SomeFutureNotFound("internal detail"))
+    response = await _post_run_that_raises(route_run, SomeFutureNotFound("internal detail"))
 
     assert response.status_code == 404, response.text
     assert response.json() == {"error": "not_found", "message": "Not found in this tenant."}
@@ -117,11 +117,8 @@ async def test_a_plain_notfoundintenant_subclass_with_no_override_gets_the_base_
 # --- Happy path unchanged: a normal run still succeeds when nothing raises ---
 
 
-async def test_happy_path_run_is_unaffected(monkeypatch):
-    async def _ok(prompt: str, deps) -> str:
-        return "hello"
-
-    monkeypatch.setattr(agents_module, "run_assistant", _ok)
+async def test_happy_path_run_is_unaffected(route_run):
+    route_run(TestModel(custom_output_text="hello"))
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(

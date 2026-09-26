@@ -504,6 +504,7 @@ def test_claude_md_per_table_rule_names_conversations_retention_with_no_exceptio
 
 SESSION_SOURCE = (REPO_ROOT / "app" / "db" / "session.py").read_text(encoding="utf-8")
 ASSISTANT_SOURCE = (REPO_ROOT / "app" / "agents" / "assistant.py").read_text(encoding="utf-8")
+RUN_SOURCE = (REPO_ROOT / "app" / "agents" / "run.py").read_text(encoding="utf-8")
 CHAT_SOURCE = (REPO_ROOT / "app" / "api" / "chat.py").read_text(encoding="utf-8")
 RETENTION_SOURCE = (REPO_ROOT / "app" / "retention.py").read_text(encoding="utf-8")
 
@@ -559,10 +560,11 @@ def test_no_app_comment_still_claims_an_independent_check_at_every_entry_point()
 
 
 def test_assistant_and_chat_modules_no_longer_claim_their_own_suspension_check() -> None:
-    """`run_assistant`/`stream_assistant` (`app/agents/assistant.py`) and the chat route
-    (`app/api/chat.py`) used to each document their own suspension check (Spec 9 / #69) -- #106
-    removed the check itself, so neither module's docstrings/comments may still claim one."""
-    for source in (ASSISTANT_SOURCE, CHAT_SOURCE):
+    """The agent-run entry points (`run_assistant`/`stream_assistant` in `app/agents/assistant.py`,
+    since #107 the prepared run in `app/agents/run.py`) and the chat route (`app/api/chat.py`) used
+    to each document their own suspension check (Spec 9 / #69) -- #106 removed the check itself,
+    so none of these modules' docstrings/comments may still claim one."""
+    for source in (ASSISTANT_SOURCE, RUN_SOURCE, CHAT_SOURCE):
         assert "ensure_tenant_not_suspended" not in source
         assert "tenant_suspension" not in source
 

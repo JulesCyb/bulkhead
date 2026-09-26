@@ -157,7 +157,10 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    The one-shot endpoints (`/agents/assistant/run`, `/agents/assistant/stream`) run a
    reading-tools-only agent and can never carry an approval round-trip by construction — every
    writing tool is reachable only through `/api/chat`, where a conversation exists to resume
-   against. See ADR-0007 (accepted) and `docs/adr/0005-agent-identities.md`.
+   against. The split lives in `app/agents/run.py`: `prepare_run(ctx)` assembles every run once
+   (model, run limit, tracing, tool dependencies) and the execution method picks the agent —
+   `answer`/`stream_text` bind the reading-only `one_shot_assistant`; no route builds a run
+   itself. See ADR-0007 (accepted) and `docs/adr/0005-agent-identities.md`.
 5. **Integrations as MCP servers** (`app/mcp/server.py`) using the same functions from `app/tools/`.
    Two transports, one setting (`MCP_TRANSPORT`, ADR-0005): `stdio` (default) is development-only
    — guarded like `AUTH_MODE=dev-headers`, identity from the process-wide `MCP_TENANT_ID`/
@@ -214,8 +217,9 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    the run produces (`app.observability.tenant_span_attributes(ctx.trace_attributes())`,
    ADR-0008) — not only as `metadata` on the root span, though the same
    `RequestContext.trace_attributes()` is also passed as `metadata` at the call sites that
-   support it. Content-free by default: prompts, tool arguments, and document text are captured
-   only when the calling tenant has explicitly opted in
+   support it. `app/agents/run.py` applies both around a run's full open-and-consume lifecycle,
+   stream consumption included; no route wraps either. Content-free by default: prompts, tool
+   arguments, and document text are captured only when the calling tenant has explicitly opted in
    (`tenants.settings["content_tracing_opt_in"]`, `app/tenant_settings.py`, default `False`) —
    resolved per run via `app.observability.resolve_tenant_tracing(ctx.tenant_record)` — the same
    record the model is resolved from, no read of its own; untraced when the record has no
@@ -247,7 +251,7 @@ app/context_resolution.py  path tenant + authorization -> RequestContext or Cont
 app/db/               engine, tenant_session(), models
 app/repositories/     data access (the only path to the DB)
 app/tools/            tool functions (agent + MCP)
-app/agents/           PydanticAI agents
+app/agents/           PydanticAI agents (assistant.py); run.py prepares and executes one run, run_errors.py maps its failures
 app/api/              routers: /health, /ready, /v1/t/{tenant_id}/agents/assistant/{run,stream}, /v1/t/{tenant_id}/api/chat
 app/mcp/server.py     MCP server -- stdio (development) and streamable-http (production, ADR-0005)
 app/llm.py            provider abstraction; app/embeddings.py; app/observability.py

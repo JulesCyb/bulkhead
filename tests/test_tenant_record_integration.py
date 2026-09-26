@@ -12,7 +12,8 @@ call, `app.embeddings`) is skipped. That keeps a tenant-bound session inside the
 so "the session layer consumes the record instead of reading the view again" is observed, not
 assumed.
 
-Model and tracing resolution are NOT stubbed (#105): the real `resolve_chat_model` resolves the
+Model and tracing resolution are NOT stubbed (#105): the run module's real model resolver
+(`app.llm.resolve_tenant_chat_model`, installed only wrapped to record its answer) resolves the
 seeded tenant's model from its record -- residency, the deployment default model validated
 against that residency's allow-list, and the gateway credential file the record's alias names
 (written to a temporary directory) -- and the real `resolve_tenant_tracing` reads the same record.
@@ -36,12 +37,12 @@ from sqlalchemy import event, text
 pgserver = pytest.importorskip("pgserver")
 
 from app import config  # noqa: E402
-from app.agents import assistant as assistant_module  # noqa: E402
 from app.agents.assistant import chat_assistant, one_shot_assistant  # noqa: E402
 from app.config import Settings, get_settings  # noqa: E402
 from app.context import RequestContext  # noqa: E402
 from app.context_resolution import FORBIDDEN_DETAIL  # noqa: E402
 from app.db.session import get_engine, tenant_session  # noqa: E402
+from app.llm import resolve_tenant_chat_model  # noqa: E402
 from app.main import app  # noqa: E402
 from app.operator.suspend import set_tenant_suspended  # noqa: E402
 from app.repositories.documents import DocumentHit, DocumentRepository  # noqa: E402
@@ -82,24 +83,24 @@ _CREDENTIAL_ALIAS = "record-integration-gateway-key"
 
 
 @pytest.fixture
-def resolved_models(environment, monkeypatch, tmp_path) -> list[str]:
+def resolved_models(environment, monkeypatch, tmp_path, route_run) -> list[str]:
     """The real model resolution, end to end, minus the network: a gateway credential file under
-    a temporary `GATEWAY_CREDENTIALS_DIR`, the real `resolve_chat_model` (wrapped only to record
-    the bare model name it resolved), and both agents overridden with a `TestModel` for the call
-    itself. A tenant must have `_CREDENTIAL_ALIAS` recorded (`_record_gateway_alias`)."""
+    a temporary `GATEWAY_CREDENTIALS_DIR`, the real `resolve_tenant_chat_model` (installed as the
+    run's model resolver through `route_run`, wrapped only to record the bare model name it
+    resolved), and both agents overridden with a `TestModel` for the call itself. A tenant must
+    have `_CREDENTIAL_ALIAS` recorded (`_record_gateway_alias`)."""
     (tmp_path / _CREDENTIAL_ALIAS).write_text("sk-record-integration")
     monkeypatch.setenv("GATEWAY_CREDENTIALS_DIR", str(tmp_path))
     config.get_settings.cache_clear()
 
     seen: list[str] = []
-    real_resolve = assistant_module.resolve_chat_model
 
-    async def _recording_resolve(deps):
-        model = await real_resolve(deps)
+    def _recording_resolve(record, *, settings=None):
+        model = resolve_tenant_chat_model(record, settings=settings)
         seen.append(model.model_name)
         return model
 
-    monkeypatch.setattr(assistant_module, "resolve_chat_model", _recording_resolve)
+    route_run(model_resolver=_recording_resolve)
     model_call = TestModel(call_tools=["search_documents"])
     with one_shot_assistant.override(model=model_call), chat_assistant.override(model=model_call):
         yield seen
@@ -118,7 +119,7 @@ async def _record_gateway_alias(tenant: SeededTenant) -> None:
 
 
 @pytest.fixture
-def searched(monkeypatch, resolved_models) -> list[tuple[RequestContext, list[DocumentHit]]]:
+def searched(route_run, resolved_models) -> list[tuple[RequestContext, list[DocumentHit]]]:
     """Every (context, hits) the search tool produced -- through a real tenant-bound session."""
     seen: list[tuple[RequestContext, list[DocumentHit]]] = []
 
@@ -130,7 +131,7 @@ def searched(monkeypatch, resolved_models) -> list[tuple[RequestContext, list[Do
         seen.append((ctx, hits))
         return hits
 
-    monkeypatch.setattr(assistant_module.document_tools, "search_documents", _search)
+    route_run(search=_search)
     return seen
 
 

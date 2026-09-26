@@ -40,11 +40,13 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import ValidationError
 from pydantic_ai.agent import AgentRunResult
 from pydantic_ai.messages import ModelMessage
+from pydantic_ai.models import Model
 from pydantic_ai.ui.vercel_ai import VercelAIAdapter
 from pydantic_ai.ui.vercel_ai.request_types import FileUIPart, TextUIPart, UIMessage
 
-from app.agents.assistant import AssistantDeps, chat_assistant, resolve_chat_model
-from app.api.agents import ROUTING_ERRORS, routing_error_detail
+from app.agents.assistant import AssistantDeps, chat_assistant
+from app.agents.run import prepare_run
+from app.agents.run_errors import ROUTING_ERRORS, routing_error_detail
 from app.context import RequestContext
 from app.deps import Context
 from app.observability import (
@@ -100,6 +102,15 @@ def _decouple_from_client(source: AsyncIterator[str]) -> AsyncIterator[str]:
     queue: asyncio.Queue[str | None] = asyncio.Queue()
     _spawn_background(_drain_into_queue(source, queue))
     return _queue_iterator(queue)
+
+
+async def resolve_chat_model(deps: AssistantDeps) -> Model:
+    """Transitional (#107 -> #108): this route's model, resolved by the run module's own
+    preparation (`app.agents.run.prepare_run`) from the tenant record `deps.ctx` carries -- so it
+    fails closed exactly as the one-shot routes do. Kept under this name only because the chat
+    tests still replace it; #108 moves this route onto a prepared run's `chat(adapter)` and
+    removes it."""
+    return (await prepare_run(deps.ctx)).model
 
 
 # Chat histories are legitimately larger than a single prompt, but not unbounded —

@@ -21,8 +21,8 @@ import uuid
 
 import httpx
 import pytest
+from pydantic_ai.models.test import TestModel
 
-from app.agents import assistant as assistant_module
 from app.main import app
 from app.token_verifier import set_default_adapter_for_tests
 from tests.conftest import FakeControlPlaneReads
@@ -37,8 +37,8 @@ def _suspend(suspended_tenant_id: uuid.UUID) -> None:
 
 
 @pytest.fixture
-def client(monkeypatch, fake_search, test_model):
-    monkeypatch.setattr(assistant_module.document_tools, "search_documents", fake_search)
+def client(route_run):
+    route_run(TestModel(call_tools=["search_documents"]))
     transport = httpx.ASGITransport(app=app)
     return httpx.AsyncClient(transport=transport, base_url="http://test")
 
