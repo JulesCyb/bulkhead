@@ -618,6 +618,40 @@ def test_connection_guide_covers_both_the_member_and_the_admin_walkthrough() -> 
     assert "streamable-http" in MCP_CONNECTION_MD
 
 
+# --- Spec A1's closing ticket (#103): one context-resolution module, three thin adapters --------
+
+ADR_0012 = (REPO_ROOT / "docs" / "adr" / "0012-tenant-in-the-path.md").read_text(encoding="utf-8")
+
+
+def test_claude_md_and_connection_guide_name_the_context_resolution_module() -> None:
+    """#101/#102: `app/context_resolution.py` is the one chain every adapter (the HTTP dependency,
+    the MCP ASGI middleware, the dev-headers path) resolves a request's context through -- not a
+    second, drifting description of five module-level collaborators each adapter used to reach
+    directly. `CLAUDE.md` rule 1/5 and `docs/mcp-connection.md` both name it by module path."""
+    assert "app/context_resolution.py" in CLAUDE_MD
+    assert "app.context_resolution.resolve_bearer_context" in MCP_CONNECTION_MD
+
+
+def test_no_doc_mentions_the_retired_context_provider_indirection() -> None:
+    """#102 deleted the `context_provider` indirection and the orphaned connection reader from
+    `app/mcp/server.py` -- no doc describing the current MCP auth chain should still name it as
+    the mechanism. (The retired name survives only in test docstrings recording that it is gone,
+    and in the dated 2026-09-12 security-review finding that first called it out -- neither of
+    those is a doc this test reads.)"""
+    docs_text = "\n".join(
+        [README, CLAUDE_MD, DEPLOYMENT_MD, CONTEXT_MD, MCP_CONNECTION_MD, ADR_0005, ADR_0012]
+    )
+    assert "context_provider" not in docs_text
+
+
+def test_adr_0012_describes_the_three_way_check_the_module_implements() -> None:
+    """ADR-0012 needs no decision change for #103 (its own three-way check -- path, audience,
+    membership -- is what `app.context_resolution.resolve_bearer_context` now implements for
+    every adapter) -- this only pins the wording that makes that still true."""
+    assert "resolves the identity from the token" in ADR_0012
+    assert "checks the audience against the path" in ADR_0012
+
+
 def test_claude_md_directory_table_marks_networked_transport_as_production() -> None:
     line = next(line for line in CLAUDE_MD.splitlines() if line.startswith("app/mcp/server.py"))
     assert "streamable-http" in line
