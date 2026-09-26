@@ -13,14 +13,15 @@ second one: a `SECURITY DEFINER` function, owned by `app_owner`, gated on
 `current_user = 'app_owner'` plus a flag it sets and restores itself. The connection passed to
 `run_retention_job` is used for exactly that one read -- listing tenants -- and never for
 anything touching `conversations`/`messages`; the moment a tenant is chosen, this job opens its
-own `tenant_session(ctx)` (a distinct connection, resolved the same way ADR-0002 resolves it for
-any other request) to read that tenant's own retention setting and delete its own expired rows.
+tenant's record read and its own `tenant_session(ctx)` (a distinct connection, routed by that
+record the same way ADR-0002 routes any request) to delete its own expired rows.
 
 Each tenant's cutoff is its own `settings["retention_days"]` (`app/tenant_settings.py`) if it has
-set one, else the documented `DEFAULT_RETENTION_DAYS` -- read fresh, per tenant, inside that
-tenant's own `tenant_session`, through `TenantSettingsRepository` (the same reader
-`app.observability` already uses for `content_tracing_opt_in`), so the setting is actually
-honored rather than merely readable.
+set one, else the documented `DEFAULT_RETENTION_DAYS` -- read fresh, per tenant, from that
+tenant's own record (`app.tenant_record.TenantRecord`, built by the very function a request's
+context resolution uses: `ControlRepository.get_tenant_record`, #104/#105), the same settings
+object `content_tracing_opt_in` and `model` are read from, so the setting is actually honored
+rather than merely readable.
 """
 
 from __future__ import annotations
@@ -32,10 +33,10 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from app.context import RequestContext
-from app.db.session import tenant_session
+from app.db.session import tenant_record_session, tenant_session
 from app.operator.listing import list_tenants
+from app.repositories.control import ControlRepository
 from app.repositories.conversations import ConversationsRepository
-from app.repositories.tenant_settings import TenantSettingsRepository
 from app.tenant_settings import DEFAULT_RETENTION_DAYS
 
 # This job has no acting person or agent identity behind it -- it is a scheduled sweep, not a
@@ -64,11 +65,16 @@ async def run_retention_job(conn: AsyncConnection) -> list[RetentionOutcome]:
     """
     outcomes: list[RetentionOutcome] = []
     for tenant in await list_tenants(conn):
-        ctx = RequestContext(tenant_id=tenant.tenant_id, identity_id=JOB_IDENTITY_ID)
+        async with tenant_record_session(tenant.tenant_id) as record_session:
+            record = await ControlRepository().get_tenant_record(
+                record_session, tenant_id=tenant.tenant_id
+            )
+        ctx = RequestContext(
+            tenant_id=tenant.tenant_id, identity_id=JOB_IDENTITY_ID, tenant_record=record
+        )
+        retention_days = record.settings.retention_days or DEFAULT_RETENTION_DAYS
+        cutoff = datetime.now(UTC) - timedelta(days=retention_days)
         async with tenant_session(ctx) as session:
-            tenant_settings = await TenantSettingsRepository().get(session, ctx)
-            retention_days = tenant_settings.retention_days or DEFAULT_RETENTION_DAYS
-            cutoff = datetime.now(UTC) - timedelta(days=retention_days)
             deleted = await ConversationsRepository().delete_expired(
                 session, ctx, older_than=cutoff
             )

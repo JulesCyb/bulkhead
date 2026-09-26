@@ -166,7 +166,7 @@ async def chat(request: Request, ctx: Context, _limit: RequestLimit) -> Response
         await ensure_tenant_not_suspended(ctx.tenant_id)
     except TenantSuspendedError as exc:
         raise HTTPException(status.HTTP_403_FORBIDDEN, FORBIDDEN_DETAIL) from exc
-    tracing = await resolve_tenant_tracing(ctx)
+    tracing = resolve_tenant_tracing(ctx.tenant_record)
     deps = AssistantDeps(
         ctx=ctx,
         residency=tracing.residency,

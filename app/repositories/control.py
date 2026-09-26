@@ -6,11 +6,12 @@ The application never creates, changes, or removes an identity; only the owner-r
 path does that. `find_by_issuer_and_subject` and `get` below are read-only by construction: they
 issue a single SELECT each and return None on no match rather than raising.
 
-`ControlRepository` (Spec 7 / #52) is the one tenant-scoped read: it takes a session from
-`tenant_session(ctx)` and reads the caller's own row through `control.tenants_view`, which RLS
-filters to `ctx.tenant_id`. Its `get_tenant_record` (#104) is the once-per-request read of that
-row plus the tenant's own settings, on a session from `tenant_record_session(tenant_id)` instead
-(pooled database, `app.tenant_id` set for that one transaction) -- see `app.tenant_record`.
+`ControlRepository` (Spec 7 / #52) is the one tenant-scoped read: `get_tenant_record` (#104)
+reads the caller's own row through `control.tenants_view` (RLS-filtered to that one tenant) plus
+the tenant's own settings, on a session from `tenant_record_session(tenant_id)` (pooled database,
+`app.tenant_id` set for that one transaction) -- see `app.tenant_record`. It is the only reader of
+residency and the gateway credential alias (#105): model, embedding, and tracing resolution are
+functions of the record it returns, and read nothing themselves.
 """
 
 from __future__ import annotations
@@ -21,7 +22,6 @@ from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.context import RequestContext
 from app.repositories.tenant_settings import TenantSettingsRepository
 from app.tenant_record import TenantRecord
 
@@ -164,29 +164,3 @@ class ControlRepository:
             gateway_credential_alias=row["gateway_credential_alias"],
             settings=settings,
         )
-
-    async def get_gateway_credential_alias(
-        self, session: AsyncSession, ctx: RequestContext
-    ) -> str | None:
-        """The alias of `ctx.tenant_id`'s gateway credential, or None if none is recorded yet."""
-        row = (
-            await session.execute(
-                text(
-                    "SELECT gateway_credential_alias FROM control.tenants_view "
-                    "WHERE tenant_id = :tid"
-                ),
-                {"tid": str(ctx.tenant_id)},
-            )
-        ).first()
-        return row[0] if row else None
-
-    async def get_residency(self, session: AsyncSession, ctx: RequestContext) -> str | None:
-        """`ctx.tenant_id`'s residency (ADR-0008), or None if none is recorded -- callers fail
-        closed on None (`app.residency.ResidencyUnresolved`), never fall back to a default."""
-        row = (
-            await session.execute(
-                text("SELECT residency FROM control.tenants_view WHERE tenant_id = :tid"),
-                {"tid": str(ctx.tenant_id)},
-            )
-        ).first()
-        return row[0] if row else None

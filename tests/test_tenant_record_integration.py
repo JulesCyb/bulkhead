@@ -8,11 +8,18 @@ and whether any statement reaches a tenant table at all.
 
 The search tool is replaced by one that opens a real `tenant_session(ctx)` and runs the real,
 RLS-filtered `DocumentRepository.search` -- only the query embedding (a residency-routed network
-call, `app.embeddings`, rewritten onto the record by #105) is skipped. That keeps a tenant-bound
-session inside the counted request, so "the session layer consumes the record instead of reading
-the view again" is observed, not assumed. The model resolver is replaced by `TestModel` through
-the shared `test_model` fixture for the same reason (#105); tracing is unconfigured in the suite,
-so `resolve_tenant_tracing` opens no session at all.
+call, `app.embeddings`) is skipped. That keeps a tenant-bound session inside the counted request,
+so "the session layer consumes the record instead of reading the view again" is observed, not
+assumed.
+
+Model and tracing resolution are NOT stubbed (#105): the real `resolve_chat_model` resolves the
+seeded tenant's model from its record -- residency, the deployment default model validated
+against that residency's allow-list, and the gateway credential file the record's alias names
+(written to a temporary directory) -- and the real `resolve_tenant_tracing` reads the same record.
+Only the model *call* is replaced (`Agent.override(model=TestModel)`, which takes precedence over
+the resolved model), since it would otherwise reach the gateway over the network. So the "exactly
+one statement against the view" below counts the whole request, residency and credential alias
+included: before #105 each of those was its own read of the view.
 """
 
 from __future__ import annotations
@@ -23,11 +30,14 @@ import time
 import httpx
 import jwt
 import pytest
-from sqlalchemy import event
+from pydantic_ai.models.test import TestModel
+from sqlalchemy import event, text
 
 pgserver = pytest.importorskip("pgserver")
 
+from app import config  # noqa: E402
 from app.agents import assistant as assistant_module  # noqa: E402
+from app.agents.assistant import chat_assistant, one_shot_assistant  # noqa: E402
 from app.config import Settings, get_settings  # noqa: E402
 from app.context import RequestContext  # noqa: E402
 from app.context_resolution import FORBIDDEN_DETAIL  # noqa: E402
@@ -68,8 +78,47 @@ def statements(environment) -> list[str]:
     event.remove(engine, "before_cursor_execute", _record)
 
 
+_CREDENTIAL_ALIAS = "record-integration-gateway-key"
+
+
 @pytest.fixture
-def searched(monkeypatch, test_model) -> list[tuple[RequestContext, list[DocumentHit]]]:
+def resolved_models(environment, monkeypatch, tmp_path) -> list[str]:
+    """The real model resolution, end to end, minus the network: a gateway credential file under
+    a temporary `GATEWAY_CREDENTIALS_DIR`, the real `resolve_chat_model` (wrapped only to record
+    the bare model name it resolved), and both agents overridden with a `TestModel` for the call
+    itself. A tenant must have `_CREDENTIAL_ALIAS` recorded (`_record_gateway_alias`)."""
+    (tmp_path / _CREDENTIAL_ALIAS).write_text("sk-record-integration")
+    monkeypatch.setenv("GATEWAY_CREDENTIALS_DIR", str(tmp_path))
+    config.get_settings.cache_clear()
+
+    seen: list[str] = []
+    real_resolve = assistant_module.resolve_chat_model
+
+    async def _recording_resolve(deps):
+        model = await real_resolve(deps)
+        seen.append(model.model_name)
+        return model
+
+    monkeypatch.setattr(assistant_module, "resolve_chat_model", _recording_resolve)
+    model_call = TestModel(call_tools=["search_documents"])
+    with one_shot_assistant.override(model=model_call), chat_assistant.override(model=model_call):
+        yield seen
+    config.get_settings.cache_clear()
+
+
+async def _record_gateway_alias(tenant: SeededTenant) -> None:
+    async with tenant.superuser_connection() as conn:
+        async with conn.begin():
+            await conn.execute(
+                text(
+                    "UPDATE control.tenants SET gateway_credential_alias = :a WHERE tenant_id = :t"
+                ),
+                {"a": _CREDENTIAL_ALIAS, "t": tenant.tenant_id},
+            )
+
+
+@pytest.fixture
+def searched(monkeypatch, resolved_models) -> list[tuple[RequestContext, list[DocumentHit]]]:
     """Every (context, hits) the search tool produced -- through a real tenant-bound session."""
     seen: list[tuple[RequestContext, list[DocumentHit]]] = []
 
@@ -112,11 +161,13 @@ async def _suspend(tenant: SeededTenant) -> None:
 
 
 async def test_one_request_reads_the_control_plane_view_exactly_once(
-    environment, statements, searched
+    environment, statements, searched, resolved_models
 ):
     """AC: one request issues exactly one statement against the control-plane view, and a second
-    request issues one again -- no cross-request caching."""
+    request issues one again -- no cross-request caching. Model resolution runs for real on each
+    request (#105): its residency, model, and gateway credential alias come from that one read."""
     tenant = await seed_tenant(environment, residency="eu", roles=["member"], documents=1)
+    await _record_gateway_alias(tenant)
 
     for request_number in (1, 2):
         statements.clear()
@@ -136,6 +187,8 @@ async def test_one_request_reads_the_control_plane_view_exactly_once(
         "eu",
     )
     assert record.suspended_at is None
+    assert record.gateway_credential_alias == _CREDENTIAL_ALIAS
+    assert resolved_models == ["claude-eu", "claude-eu"]  # the deployment default, per request
 
 
 async def test_suspending_between_two_requests_refuses_the_second_before_any_tenant_table(
@@ -145,6 +198,7 @@ async def test_suspending_between_two_requests_refuses_the_second_before_any_ten
     one statement reaches a tenant table for it."""
     tenant = await seed_tenant(environment, residency="eu", roles=["member"], documents=1)
 
+    await _record_gateway_alias(tenant)
     first = await _run(tenant, _member_headers(tenant))
     assert first.status_code == 200, first.text
     await _suspend(tenant)
@@ -194,13 +248,14 @@ def _bearer(tenant: SeededTenant) -> dict[str, str]:
 
 
 async def test_a_bearer_request_reads_the_control_plane_view_exactly_once(
-    environment, statements, searched, jwt_mode
+    environment, statements, searched, resolved_models, jwt_mode
 ):
     """AC on the production path: the record is read right after the token verifies (no database
     needed for that) and handed to the membership lookup, whose session routes from it -- so the
     membership lookup, the tool's session, and everything after share the one view read. A second
     request reads it once again."""
     tenant = await seed_tenant(environment, residency="eu", roles=["member"], documents=1)
+    await _record_gateway_alias(tenant)
 
     for request_number in (1, 2):
         statements.clear()
@@ -210,6 +265,7 @@ async def test_a_bearer_request_reads_the_control_plane_view_exactly_once(
         assert _view_reads(statements) == 1, (request_number, statements)
 
     assert [[hit.id for hit in hits] for _, hits in searched] == [tenant.document_ids] * 2
+    assert resolved_models == ["claude-eu", "claude-eu"]
 
 
 async def test_a_suspended_tenants_bearer_request_is_refused_with_the_generic_403(

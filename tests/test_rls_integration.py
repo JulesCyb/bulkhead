@@ -1418,34 +1418,33 @@ async def _set_gateway_alias(url: str, tenant_id: uuid.UUID, alias: str) -> None
     await engine.dispose()
 
 
+async def _tenant_record(tenant_id: uuid.UUID):
+    """The tenant's record through the one read every request and job uses (#104/#105):
+    `ControlRepository.get_tenant_record` on a `tenant_record_session` -- RLS-scoped to that one
+    tenant. Every resolver below is a function of what this returns."""
+    from app.db.session import tenant_record_session
+    from app.repositories.control import ControlRepository
+
+    async with tenant_record_session(tenant_id) as session:
+        return await ControlRepository().get_tenant_record(session, tenant_id=tenant_id)
+
+
 async def test_control_tenants_view_exposes_the_gateway_credential_alias(
     app_settings, database_urls
 ):
-    """The alias the owner role recorded is visible to `app` through the read-only view,
-    scoped to the caller's own tenant like every other row in `control.tenants` (#52)."""
-    from app.context import RequestContext
-    from app.db.session import tenant_session
-    from app.repositories.control import ControlRepository
-
-    tenant_a, _ = await _seed(database_urls["superuser"])
+    """The alias the owner role recorded is visible to `app` through the read-only view, on the
+    tenant's record, scoped to the caller's own tenant like every other row in `control.tenants`
+    (#52, #105) -- and never on the other tenant's record."""
+    tenant_a, tenant_b = await _seed(database_urls["superuser"])
     await _set_gateway_alias(database_urls["migrations"], tenant_a, "acme-gateway-key")
 
-    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
-    async with tenant_session(ctx_a) as session:
-        alias = await ControlRepository().get_gateway_credential_alias(session, ctx_a)
-    assert alias == "acme-gateway-key"
+    assert (await _tenant_record(tenant_a)).gateway_credential_alias == "acme-gateway-key"
+    assert (await _tenant_record(tenant_b)).gateway_credential_alias is None
 
 
 async def test_control_tenants_alias_is_none_when_not_yet_recorded(app_settings, database_urls):
-    from app.context import RequestContext
-    from app.db.session import tenant_session
-    from app.repositories.control import ControlRepository
-
     tenant_a, _ = await _seed(database_urls["superuser"])
-    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
-    async with tenant_session(ctx_a) as session:
-        alias = await ControlRepository().get_gateway_credential_alias(session, ctx_a)
-    assert alias is None
+    assert (await _tenant_record(tenant_a)).gateway_credential_alias is None
 
 
 async def test_app_cannot_write_the_gateway_credential_alias(app_settings, database_urls):
@@ -1473,12 +1472,10 @@ async def test_app_cannot_write_the_gateway_credential_alias(app_settings, datab
 async def test_two_tenants_with_different_aliases_resolve_different_credentials(
     app_settings, database_urls, tmp_path
 ):
-    """End to end (#52): given a tenant id, the resolver reads the control plane's alias, then
-    that alias's secret file fresh -- two tenants with different aliases get two different
+    """End to end (#52, #105): the tenant record carries the control plane's alias, the resolver
+    reads that alias's secret file fresh -- two tenants with different aliases get two different
     credential contents, nothing shared or cached between them."""
     from app.config import Settings
-    from app.context import RequestContext
-    from app.db.session import tenant_session
     from app.gateway_credentials import resolve_gateway_credential
 
     tenant_a, tenant_b = await _seed(database_urls["superuser"])
@@ -1491,13 +1488,8 @@ async def test_two_tenants_with_different_aliases_resolve_different_credentials(
         gateway_credentials_dir=str(tmp_path),
     )
 
-    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
-    async with tenant_session(ctx_a) as session:
-        credential_a = await resolve_gateway_credential(session, ctx_a, settings=settings)
-
-    ctx_b = RequestContext(tenant_id=tenant_b, identity_id=uuid.uuid4())
-    async with tenant_session(ctx_b) as session:
-        credential_b = await resolve_gateway_credential(session, ctx_b, settings=settings)
+    credential_a = resolve_gateway_credential(await _tenant_record(tenant_a), settings=settings)
+    credential_b = resolve_gateway_credential(await _tenant_record(tenant_b), settings=settings)
 
     assert credential_a.get_secret_value() == "sk-acme-secret"
     assert credential_b.get_secret_value() == "sk-globex-secret"
@@ -1506,23 +1498,18 @@ async def test_two_tenants_with_different_aliases_resolve_different_credentials(
 async def test_resolver_raises_typed_error_for_a_tenant_with_no_alias_recorded(
     app_settings, database_urls
 ):
-    from app.context import RequestContext
-    from app.db.session import tenant_session
     from app.gateway_credentials import GatewayCredentialUnavailable, resolve_gateway_credential
 
     tenant_a, _ = await _seed(database_urls["superuser"])
-    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
+    record = await _tenant_record(tenant_a)
     with pytest.raises(GatewayCredentialUnavailable):
-        async with tenant_session(ctx_a) as session:
-            await resolve_gateway_credential(session, ctx_a)
+        resolve_gateway_credential(record)
 
 
 async def test_resolver_raises_typed_error_when_the_secret_file_is_missing(
     app_settings, database_urls, tmp_path
 ):
     from app.config import Settings
-    from app.context import RequestContext
-    from app.db.session import tenant_session
     from app.gateway_credentials import GatewayCredentialUnavailable, resolve_gateway_credential
 
     tenant_a, _ = await _seed(database_urls["superuser"])
@@ -1532,10 +1519,9 @@ async def test_resolver_raises_typed_error_when_the_secret_file_is_missing(
         gateway_credentials_dir=str(tmp_path),
     )
 
-    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
+    record = await _tenant_record(tenant_a)
     with pytest.raises(GatewayCredentialUnavailable):
-        async with tenant_session(ctx_a) as session:
-            await resolve_gateway_credential(session, ctx_a, settings=settings)
+        resolve_gateway_credential(record, settings=settings)
 
 
 # --- Live role/RLS guard (issue #15 / ADR-0011): the same exception list as the ---
@@ -1642,33 +1628,21 @@ async def test_control_tenants_residency_rejects_an_unknown_value(database_urls)
 
 
 async def test_control_tenants_view_exposes_residency(app_settings, database_urls):
-    """The residency the owner role recorded is visible to `app` through the read-only view,
-    scoped to the caller's own tenant like every other row in `control.tenants`."""
-    from app.context import RequestContext
-    from app.db.session import tenant_session
-    from app.repositories.control import ControlRepository
-
-    tenant_a, _ = await _seed(database_urls["superuser"])
+    """The residency the owner role recorded is visible to `app` through the read-only view, on
+    the tenant's record, scoped to the caller's own tenant like every other row in
+    `control.tenants` -- never on the other tenant's record."""
+    tenant_a, tenant_b = await _seed(database_urls["superuser"])
     await _set_residency(database_urls["superuser"], tenant_a, "us")
 
-    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
-    async with tenant_session(ctx_a) as session:
-        residency = await ControlRepository().get_residency(session, ctx_a)
-    assert residency == "us"
+    assert (await _tenant_record(tenant_a)).residency == "us"
+    assert (await _tenant_record(tenant_b)).residency is None
 
 
 async def test_control_tenants_residency_is_none_when_no_control_plane_row(
     app_settings, database_urls
 ):
-    from app.context import RequestContext
-    from app.db.session import tenant_session
-    from app.repositories.control import ControlRepository
-
     tenant_a, _ = await _seed(database_urls["superuser"])
-    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
-    async with tenant_session(ctx_a) as session:
-        residency = await ControlRepository().get_residency(session, ctx_a)
-    assert residency is None
+    assert (await _tenant_record(tenant_a)).residency is None
 
 
 async def test_app_cannot_write_residency(app_settings, database_urls):
@@ -1738,15 +1712,28 @@ async def _set_residency(url: str, tenant_id: uuid.UUID, residency: str | None) 
     await engine.dispose()
 
 
+async def _set_tenant_model(url: str, tenant_id: uuid.UUID, model: str) -> None:
+    """As the superuser, like `_set_residency`: writes the tenant's own `model` setting into
+    `tenants.settings` directly, so the record read is what's being verified."""
+    engine = create_async_engine(url)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE tenants SET settings = jsonb_build_object('model', CAST(:model AS text)) "
+                "WHERE id = :tid"
+            ),
+            {"tid": tenant_id, "model": model},
+        )
+    await engine.dispose()
+
+
 async def test_residency_resolves_through_real_rls_and_never_crosses_tenants(
     app_settings, database_urls, tmp_path
 ):
     """Given two tenants set to different residencies, resolving one tenant's route never
-    returns the other's -- read through the same tenant-scoped session/RLS scaffolding every
-    repository uses, exactly like the document-search isolation test above (#60)."""
+    returns the other's -- each from its own record, read through the RLS-scoped record read
+    (#60, #105)."""
     from app.config import Settings
-    from app.context import RequestContext
-    from app.db.session import tenant_session
     from app.residency import ResidencyAllowList, resolve_residency_route
 
     allow_list = ResidencyAllowList.load()
@@ -1759,13 +1746,8 @@ async def test_residency_resolves_through_real_rls_and_never_crosses_tenants(
     (tmp_path / "globex-gateway-key").write_text("sk-globex-secret")
     settings = Settings(database_url=database_urls["app"], gateway_credentials_dir=str(tmp_path))
 
-    ctx_eu = RequestContext(tenant_id=tenant_eu, identity_id=uuid.uuid4())
-    async with tenant_session(ctx_eu) as session:
-        resolved_eu = await resolve_residency_route(session, ctx_eu, settings=settings)
-
-    ctx_us = RequestContext(tenant_id=tenant_us, identity_id=uuid.uuid4())
-    async with tenant_session(ctx_us) as session:
-        resolved_us = await resolve_residency_route(session, ctx_us, settings=settings)
+    resolved_eu = resolve_residency_route(await _tenant_record(tenant_eu), settings=settings)
+    resolved_us = resolve_residency_route(await _tenant_record(tenant_us), settings=settings)
 
     assert resolved_eu.residency == "eu"
     assert resolved_eu.route == allow_list.route_for("eu")
@@ -1813,23 +1795,18 @@ async def test_residency_resolution_is_scoped_by_rls_not_just_the_where_clause(
 async def test_resolver_fails_closed_for_a_tenant_with_no_residency_set(
     app_settings, database_urls
 ):
-    from app.context import RequestContext
-    from app.db.session import tenant_session
     from app.residency import ResidencyUnresolved, resolve_residency_route
 
     tenant_a, _ = await _seed(database_urls["superuser"])
-    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
+    record = await _tenant_record(tenant_a)
     with pytest.raises(ResidencyUnresolved):
-        async with tenant_session(ctx_a) as session:
-            await resolve_residency_route(session, ctx_a)
+        resolve_residency_route(record)
 
 
 async def test_resolver_fails_closed_for_a_tenant_with_an_unknown_residency(
     app_settings, database_urls
 ):
     from app.config import Settings
-    from app.context import RequestContext
-    from app.db.session import tenant_session
     from app.residency import ResidencyAllowList, ResidencyUnresolved, resolve_residency_route
 
     tenant_a, _ = await _seed(database_urls["superuser"])
@@ -1850,10 +1827,9 @@ async def test_resolver_fails_closed_for_a_tenant_with_an_unknown_residency(
             }
         }
     )
-    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
+    record = await _tenant_record(tenant_a)
     with pytest.raises(ResidencyUnresolved):
-        async with tenant_session(ctx_a) as session:
-            await resolve_residency_route(session, ctx_a, settings=settings)
+        resolve_residency_route(record, settings=settings)
 
 
 # --- Chat and document-search routing through a tenant's real residency (Spec 8 / #61) -----
@@ -1865,13 +1841,12 @@ async def test_tenant_chat_and_embedding_clients_route_through_real_residency_an
     """`resolve_tenant_chat_model` (app/llm.py) and `resolve_tenant_embedding_client`
     (app/embeddings.py) -- the two entry points the running assistant and the document-search
     tool actually call in production (#61) -- built end to end for two tenants of different
-    residencies, through the same tenant-scoped session/RLS scaffolding every repository uses.
+    residencies, each from its own record (#105) -- the US tenant's model is its own `model`
+    setting, written to `tenants.settings`, since the deployment default is an EU alias.
     No real provider call is made: only client *construction* is exercised. Two tenants never
     get the same bare model alias, the same embedding endpoint client, or the same credential.
     """
     from app.config import Settings
-    from app.context import RequestContext
-    from app.db.session import tenant_session
     from app.embeddings import (
         reset_tenant_embedding_client_cache,
         resolve_tenant_embedding_client,
@@ -1886,6 +1861,7 @@ async def test_tenant_chat_and_embedding_clients_route_through_real_residency_an
     await _set_residency(database_urls["superuser"], tenant_us, "us")
     await _set_gateway_alias(database_urls["migrations"], tenant_eu, "acme-gateway-key")
     await _set_gateway_alias(database_urls["migrations"], tenant_us, "globex-gateway-key")
+    await _set_tenant_model(database_urls["superuser"], tenant_us, "claude")
     (tmp_path / "acme-gateway-key").write_text("sk-acme-secret")
     (tmp_path / "globex-gateway-key").write_text("sk-globex-secret")
     settings = Settings(
@@ -1895,25 +1871,14 @@ async def test_tenant_chat_and_embedding_clients_route_through_real_residency_an
     )
 
     try:
-        ctx_eu = RequestContext(tenant_id=tenant_eu, identity_id=uuid.uuid4())
-        async with tenant_session(ctx_eu) as session:
-            chat_model_eu = await resolve_tenant_chat_model(
-                session, ctx_eu, "claude-eu", settings=settings
-            )
-        async with tenant_session(ctx_eu) as session:
-            embedding_client_eu = await resolve_tenant_embedding_client(
-                session, ctx_eu, settings=settings
-            )
+        record_eu = await _tenant_record(tenant_eu)
+        chat_model_eu = resolve_tenant_chat_model(record_eu, settings=settings)
+        embedding_client_eu = resolve_tenant_embedding_client(record_eu, settings=settings)
 
-        ctx_us = RequestContext(tenant_id=tenant_us, identity_id=uuid.uuid4())
-        async with tenant_session(ctx_us) as session:
-            chat_model_us = await resolve_tenant_chat_model(
-                session, ctx_us, "claude", settings=settings
-            )
-        async with tenant_session(ctx_us) as session:
-            embedding_client_us = await resolve_tenant_embedding_client(
-                session, ctx_us, settings=settings
-            )
+        record_us = await _tenant_record(tenant_us)
+        assert record_us.settings.model == "claude"
+        chat_model_us = resolve_tenant_chat_model(record_us, settings=settings)
+        embedding_client_us = resolve_tenant_embedding_client(record_us, settings=settings)
 
         # Two tenants of different residencies visibly use different routes for the same request.
         assert chat_model_eu.model_name == "claude-eu"
@@ -1936,22 +1901,18 @@ async def test_tenant_with_no_resolvable_residency_fails_closed_on_chat_and_embe
 ):
     """#61 AC3: a tenant with no resolvable residency is refused cleanly on both the chat and the
     document-search (embedding) path -- neither silently falls back to a default route."""
-    from app.context import RequestContext
-    from app.db.session import tenant_session
     from app.embeddings import resolve_tenant_embedding_client
     from app.llm import resolve_tenant_chat_model
     from app.residency import ResidencyUnresolved
 
     tenant_a, _ = await _seed(database_urls["superuser"])
-    ctx_a = RequestContext(tenant_id=tenant_a, identity_id=uuid.uuid4())
+    record = await _tenant_record(tenant_a)
 
     with pytest.raises(ResidencyUnresolved):
-        async with tenant_session(ctx_a) as session:
-            await resolve_tenant_chat_model(session, ctx_a, "claude-eu")
+        resolve_tenant_chat_model(record)
 
     with pytest.raises(ResidencyUnresolved):
-        async with tenant_session(ctx_a) as session:
-            await resolve_tenant_embedding_client(session, ctx_a)
+        resolve_tenant_embedding_client(record)
 
 
 # --- Tenant memberships replace per-tenant users (ADR-0003, Spec 2 / #23) ---

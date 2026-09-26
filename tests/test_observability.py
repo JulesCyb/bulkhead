@@ -1,14 +1,13 @@
 """Unit tests for `app/observability.py` (Spec 8 / #62, ADR-0008): content-free-by-default
 tracing, per-tenant opt-in, per-residency trace sinks, and a fail-loud startup guard — exercised
-directly against the module (real `Settings`, fake control-plane sessions), no real database and
-no real network call. The full ASGI-level, end-to-end behavior (spans an actual agent run
-produces) lives in `tests/test_content_tracing.py`.
+directly against the module (real `Settings`, tenant records constructed directly -- #105), no
+real database and no real network call. The full ASGI-level, end-to-end behavior (spans an
+actual agent run produces) lives in `tests/test_content_tracing.py`.
 """
 
 from __future__ import annotations
 
 import uuid
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -16,8 +15,9 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 
 from app import observability
 from app.config import Settings
-from app.context import RequestContext
 from app.residency import ResidencyAllowList
+from app.tenant_record import TenantRecord
+from app.tenant_settings import TenantSettings
 
 
 @pytest.fixture(autouse=True)
@@ -115,60 +115,54 @@ def test_each_call_builds_a_fresh_instrumentation_never_a_shared_instance():
     assert first[0].settings is not second[0].settings
 
 
-# --- resolve_tenant_tracing_selection / resolve_tenant_tracing ----------------------------------
+# --- resolve_tenant_tracing: a function of the tenant record (#105) ----------------------------
 
 
-def _fake_session(residency_row, settings_row) -> AsyncMock:
-    """Mirrors `tests/test_residency.py`'s `_fake_session`: `.execute(...).first()` returns
-    whichever row is next, in the exact order `resolve_tenant_tracing_selection` issues its two
-    queries (residency, then `tenants.settings`)."""
-    rows = iter([residency_row, settings_row])
-
-    async def _execute(*_args, **_kwargs):
-        result = MagicMock()
-        result.first.return_value = next(rows)
-        return result
-
-    session = AsyncMock()
-    session.execute = AsyncMock(side_effect=_execute)
-    return session
+def _record(residency: str | None, opt_in: bool) -> TenantRecord:
+    return TenantRecord(
+        tenant_id=uuid.uuid4(),
+        residency=residency,
+        settings=TenantSettings(content_tracing_opt_in=opt_in),
+    )
 
 
-async def test_resolve_tenant_tracing_selection_reads_residency_and_content_opt_in():
-    ctx = RequestContext(tenant_id=uuid.uuid4(), identity_id=uuid.uuid4())
-    session = _fake_session(("eu",), ({"content_tracing_opt_in": True},))
-
-    selection = await observability.resolve_tenant_tracing_selection(session, ctx)
+def test_resolve_tenant_tracing_reads_residency_and_content_opt_in_from_the_record():
+    selection = observability.resolve_tenant_tracing(_record("eu", True))
 
     assert selection.residency == "eu"
     assert selection.content_tracing_opt_in is True
 
 
-async def test_resolve_tenant_tracing_selection_defaults_to_untraced_content():
-    ctx = RequestContext(tenant_id=uuid.uuid4(), identity_id=uuid.uuid4())
-    session = _fake_session((None,), (None,))
+def test_resolve_tenant_tracing_defaults_to_untraced_content():
+    selection = observability.resolve_tenant_tracing(_record("eu", False))
 
-    selection = await observability.resolve_tenant_tracing_selection(session, ctx)
-
-    assert selection.residency is None
     assert selection.content_tracing_opt_in is False
 
 
-async def test_resolve_tenant_tracing_opens_no_session_when_tracing_is_off(monkeypatch):
-    """`resolve_tenant_tracing` (the convenience entry point routes call) must not pay for a
-    database round trip on every request in the overwhelmingly common case of tracing being off
-    entirely."""
+def test_a_context_without_a_record_is_untraced():
+    """A job or test context carries no record: nothing to trace it under, and no read here to
+    find out (#105) -- untraced, content off."""
+    selection = observability.resolve_tenant_tracing(None)
 
-    def _fail_if_called(_ctx):
-        raise AssertionError("no tenant session should be opened when tracing isn't configured")
+    assert selection == observability.TenantTracingSelection(
+        residency=None, content_tracing_opt_in=False
+    )
 
-    monkeypatch.setattr(observability, "tenant_session", _fail_if_called)
-    ctx = RequestContext(tenant_id=uuid.uuid4(), identity_id=uuid.uuid4())
 
-    selection = await observability.resolve_tenant_tracing(ctx)
+@pytest.mark.parametrize("residency", [None, "atlantis"])
+def test_a_record_with_an_unresolved_residency_yields_no_capabilities(residency):
+    """The one deliberate fail-open (ADR-0008): tracing on, content opted in, but no residency
+    (or one with no sink) on the record -- the run goes untraced rather than failing or reaching
+    another residency's sink."""
+    observability.setup_observability(_configured_settings())
+    selection = observability.resolve_tenant_tracing(_record(residency, True))
 
-    assert selection.residency is None
-    assert selection.content_tracing_opt_in is False
+    assert (
+        observability.instrumentation_capabilities(
+            selection.residency, selection.content_tracing_opt_in
+        )
+        == []
+    )
 
 
 # --- tenant_span_attributes: only spans started inside the block are stamped -------------------
