@@ -2,16 +2,14 @@
 per-residency trace sinks (Spec 8 / #62, ADR-0008) — a real running app (`app.main.app`), a
 `TestModel` that actually calls the search tool, and a fake in-memory span exporter swapped in
 per residency (`app.observability.set_tracer_provider_for_residency`).
-`app.observability.tenant_session` is monkeypatched to a fake session (mirrors
-`tests/test_residency.py`'s pattern) so `resolve_tenant_tracing` never touches a real database;
-no real model call anywhere.
+Each tenant's residency and content opt-in come from its tenant record (#105), installed through
+the shared control-plane fake (`tests.conftest.FakeControlPlaneReads.records`) that context
+resolution reads it from -- no database, no real model call anywhere.
 """
 
 from __future__ import annotations
 
 import uuid
-from contextlib import asynccontextmanager
-from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -22,6 +20,10 @@ from app import observability
 from app.agents import assistant as assistant_module
 from app.main import app
 from app.repositories.documents import DocumentHit
+from app.tenant_record import TenantRecord
+from app.tenant_settings import TenantSettings
+from app.token_verifier import set_default_adapter_for_tests
+from tests.conftest import FakeControlPlaneReads
 
 PROMPT = "What does the contract say?"
 DOCUMENT_TITLE = "Acme confidential contract"
@@ -56,27 +58,21 @@ def client(content_search, test_model):
     return httpx.AsyncClient(transport=transport, base_url="http://test")
 
 
-def _fake_tenant_session(directory: dict[uuid.UUID, tuple[str | None, bool]]):
-    """A fake `tenant_session(ctx)` returning canned `(residency, content_tracing_opt_in)` values
-    per tenant id — swapped in for `app.observability.tenant_session`, mirroring
-    `tests/test_residency.py`'s fake-session seam, so `resolve_tenant_tracing` never opens a real
-    database connection."""
-
-    @asynccontextmanager
-    async def _tenant_session(ctx):
-        residency, opt_in = directory[ctx.tenant_id]
-        rows = iter([(residency,), ({"content_tracing_opt_in": opt_in},)])
-
-        async def _execute(*_args, **_kwargs):
-            result = MagicMock()
-            result.first.return_value = next(rows)
-            return result
-
-        session = AsyncMock()
-        session.execute = AsyncMock(side_effect=_execute)
-        yield session
-
-    return _tenant_session
+def _install_records(directory: dict[uuid.UUID, tuple[str | None, bool]]) -> None:
+    """Each tenant's `(residency, content_tracing_opt_in)` as its tenant record -- what context
+    resolution attaches to the request and the routes take tracing from (#105)."""
+    set_default_adapter_for_tests(
+        FakeControlPlaneReads(
+            records={
+                tenant_id: TenantRecord(
+                    tenant_id=tenant_id,
+                    residency=residency,
+                    settings=TenantSettings(content_tracing_opt_in=opt_in),
+                )
+                for tenant_id, (residency, opt_in) in directory.items()
+            }
+        )
+    )
 
 
 def _all_span_text(spans) -> str:
@@ -92,9 +88,7 @@ async def test_untraced_by_default_produces_no_prompt_or_tool_result_content(cli
     exporter = InMemorySpanExporter()
     provider = observability.build_tracer_provider(exporter, processor_cls=SimpleSpanProcessor)
     observability.set_tracer_provider_for_residency("eu", provider)
-    monkeypatch.setattr(
-        observability, "tenant_session", _fake_tenant_session({tenant_id: ("eu", False)})
-    )
+    _install_records({tenant_id: ("eu", False)})
 
     async with client:
         response = await client.post(
@@ -119,9 +113,7 @@ async def test_content_opt_in_tenant_produces_that_content_in_the_spans(client, 
     exporter = InMemorySpanExporter()
     provider = observability.build_tracer_provider(exporter, processor_cls=SimpleSpanProcessor)
     observability.set_tracer_provider_for_residency("eu", provider)
-    monkeypatch.setattr(
-        observability, "tenant_session", _fake_tenant_session({tenant_id: ("eu", True)})
-    )
+    _install_records({tenant_id: ("eu", True)})
 
     async with client:
         response = await client.post(
@@ -143,9 +135,7 @@ async def test_every_span_carries_tenant_and_user_identifiers(client, monkeypatc
     exporter = InMemorySpanExporter()
     provider = observability.build_tracer_provider(exporter, processor_cls=SimpleSpanProcessor)
     observability.set_tracer_provider_for_residency("eu", provider)
-    monkeypatch.setattr(
-        observability, "tenant_session", _fake_tenant_session({tenant_id: ("eu", False)})
-    )
+    _install_records({tenant_id: ("eu", False)})
 
     async with client:
         response = await client.post(
@@ -182,11 +172,7 @@ async def test_two_tenants_different_residencies_use_two_distinct_sinks(client, 
     observability.set_tracer_provider_for_residency(
         "us", observability.build_tracer_provider(us_exporter, processor_cls=SimpleSpanProcessor)
     )
-    monkeypatch.setattr(
-        observability,
-        "tenant_session",
-        _fake_tenant_session({eu_tenant: ("eu", False), us_tenant: ("us", False)}),
-    )
+    _install_records({eu_tenant: ("eu", False), us_tenant: ("us", False)})
 
     async with client:
         eu_response = await client.post(
@@ -221,9 +207,7 @@ async def test_tenant_with_no_resolvable_residency_runs_untraced_not_crashed(cli
     observability.set_tracer_provider_for_residency(
         "eu", observability.build_tracer_provider(exporter, processor_cls=SimpleSpanProcessor)
     )
-    monkeypatch.setattr(
-        observability, "tenant_session", _fake_tenant_session({tenant_id: (None, False)})
-    )
+    _install_records({tenant_id: (None, False)})
 
     async with client:
         response = await client.post(

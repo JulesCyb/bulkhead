@@ -20,7 +20,8 @@ an operator can fix it without reading this module's source.
 
 `Settings.residency_allow_list` (`app/config.py`) holds one instance, built from the configured
 path at construction (never at import) -- this module's own `resolve_residency_route` (the
-per-tenant, per-request resolver, composed with a tenant's gateway credential) and
+per-tenant, per-request resolver: a function of the tenant record, `app.tenant_record`, composed
+with the tenant's gateway credential; #105) and
 `app.startup_checks.run_startup_checks` both read that instance rather than a module-level
 global. `app/llm.py` (`validate_model_for_residency`, via `alias_for`), `app/embeddings.py` (via
 `resolve_residency_route`), `app/observability.py` (`setup_observability`/
@@ -45,10 +46,8 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, SecretStr
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.context import RequestContext
-from app.repositories.control import ControlRepository
+from app.tenant_record import TenantRecord
 
 if TYPE_CHECKING:
     from app.config import Settings
@@ -345,60 +344,72 @@ class ResolvedResidencyRoute(BaseModel):
     gateway_credential: SecretStr
 
 
-async def _read_tenant_residency(session: AsyncSession, ctx: RequestContext) -> str | None:
-    """The caller's own residency from the control plane (`control.tenants.residency`, 0013).
-
-    An operator-owned fact: `app` can read it through `control.tenants_view` (RLS-scoped to the
-    caller's tenant) but never write it, so a tenant's own request cannot move itself to another
-    jurisdiction.
-    """
-    return await ControlRepository().get_residency(session, ctx)
-
-
-async def resolve_residency_route(
-    session: AsyncSession, ctx: RequestContext, *, settings: Settings | None = None
-) -> ResolvedResidencyRoute:
-    """The single call site every content-bearing path resolves its route from (ADR-0008).
-
-    Composes three facts that must never be mixed across tenants: the tenant's own residency
-    setting, the allow-listed route for that residency (`settings.residency_allow_list`, read
-    from `get_settings()` when `settings` is not given), and the tenant's own gateway credential.
-    Raises `ResidencyUnresolved` if the residency is missing, unknown, or absent from the
-    allow-list, and propagates `GatewayCredentialUnavailable`
-    (`app.gateway_credentials.GatewayCredentialUnavailable`) unchanged if the credential itself
-    cannot be resolved -- both are fail-closed errors, never a fallback.
-    """
+def _settings_or_default(settings: Settings | None) -> Settings:
     # Deferred import (see module docstring): `app.config` imports this module at its own top
     # level, so importing `get_settings` back at this module's top level would be a real cycle.
-    if settings is None:
-        from app.config import get_settings
+    if settings is not None:
+        return settings
+    from app.config import get_settings
 
-        settings = get_settings()
+    return get_settings()
 
-    residency = await _read_tenant_residency(session, ctx)
+
+def tenant_residency_route(
+    record: TenantRecord, *, settings: Settings | None = None
+) -> tuple[str, ResidencyRoute]:
+    """The tenant's residency and its allow-listed route, from the record alone -- no credential.
+
+    Raises `ResidencyUnresolved` if the record carries no residency or one the allow-list does
+    not know (ADR-0008: fail closed, never a default or another residency's route). The first
+    step of `resolve_residency_route` below, and of `app.llm.resolve_tenant_chat_model`, which
+    must validate the model name against this residency *before* any credential is read
+    (ADR-0009)."""
+    s = _settings_or_default(settings)
+    residency = record.residency
     if not residency:
         raise ResidencyUnresolved(
-            f"tenant {ctx.tenant_id} has no usable residency (control.tenants.residency = "
+            f"tenant {record.tenant_id} has no usable residency (control.tenants.residency = "
             f"{residency!r})"
         )
     try:
-        route = settings.residency_allow_list.route_for(residency)
+        route = s.residency_allow_list.route_for(residency)
     except ResidencyUnresolved as exc:
         raise ResidencyUnresolved(
-            f"tenant {ctx.tenant_id} has no usable residency (control.tenants.residency = "
+            f"tenant {record.tenant_id} has no usable residency (control.tenants.residency = "
             f"{residency!r}); configured residencies: "
-            f"{sorted(settings.residency_allow_list.residencies)}"
+            f"{sorted(s.residency_allow_list.residencies)}"
         ) from exc
+    return residency, route
+
+
+def resolve_residency_route(
+    record: TenantRecord, *, settings: Settings | None = None
+) -> ResolvedResidencyRoute:
+    """The single call site every content-bearing path resolves its route from (ADR-0008) -- a
+    function of the tenant record and settings, with no database read of its own (#105): the
+    residency and the gateway credential alias were read once, with the rest of the record, when
+    the request's context was resolved (`app.tenant_record`).
+
+    Composes three facts that must never be mixed across tenants: the tenant's own residency
+    (`record.residency`), the allow-listed route for that residency (`settings.residency_allow_
+    list`, read from `get_settings()` when `settings` is not given), and the tenant's own gateway
+    credential (the file `record.gateway_credential_alias` names). Raises `ResidencyUnresolved` if
+    the residency is missing, unknown, or absent from the allow-list -- before the credential is
+    read -- and propagates `GatewayCredentialUnavailable`
+    (`app.gateway_credentials.GatewayCredentialUnavailable`) unchanged if the alias is missing or
+    its file is missing/empty -- both are fail-closed errors, never a fallback.
+    """
+    s = _settings_or_default(settings)
+    residency, route = tenant_residency_route(record, settings=s)
 
     # Deferred import (see module docstring): `app.gateway_credentials` imports `app.config` at
     # its own top level, so importing it back at this module's top level would be a real cycle.
     from app.gateway_credentials import resolve_gateway_credential
 
-    gateway_credential = await resolve_gateway_credential(session, ctx, settings=settings)
     return ResolvedResidencyRoute(
         residency=residency,
         route=route,
-        gateway_credential=gateway_credential,
+        gateway_credential=resolve_gateway_credential(record, settings=s),
     )
 
 
@@ -410,4 +421,5 @@ __all__ = [
     "ResidencyUnresolved",
     "ResolvedResidencyRoute",
     "resolve_residency_route",
+    "tenant_residency_route",
 ]

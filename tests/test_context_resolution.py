@@ -13,9 +13,7 @@ from __future__ import annotations
 import re
 import time
 import uuid
-from contextlib import asynccontextmanager
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import jwt
@@ -31,6 +29,7 @@ from app.config import Settings, get_settings
 from app.context import Means
 from app.context_resolution import ContextRejection, RejectionReason, RejectionStatus
 from app.main import app
+from app.tenant_record import TenantRecord
 from app.token_verifier import (
     AGENT_IDENTITY_ISSUER,
     ResolvedIdentity,
@@ -210,27 +209,6 @@ async def test_an_agent_identitys_token_reaches_the_tool_naming_its_credential(
     assert contexts[0].means == Means(kind="credential", id="agt_public_1")
 
 
-def _fake_tracing_session(tenant_id: uuid.UUID):
-    """`resolve_tenant_tracing` reads (residency, settings) through `tenant_session`; answer
-    residency "eu", no content opt-in, without a database (tests/test_content_tracing.py)."""
-
-    @asynccontextmanager
-    async def _tenant_session(ctx):
-        assert ctx.tenant_id == tenant_id
-        rows = iter([("eu",), ({"content_tracing_opt_in": False},)])
-
-        async def _execute(*_args, **_kwargs):
-            result = MagicMock()
-            result.first.return_value = next(rows)
-            return result
-
-        session = AsyncMock()
-        session.execute = AsyncMock(side_effect=_execute)
-        yield session
-
-    return _tenant_session
-
-
 async def test_every_span_of_an_http_run_records_the_person_as_actor_and_the_agent_as_means(
     monkeypatch, run_route
 ):
@@ -241,7 +219,12 @@ async def test_every_span_of_an_http_run_records_the_person_as_actor_and_the_age
     exporter = InMemorySpanExporter()
     provider = observability.build_tracer_provider(exporter, processor_cls=SimpleSpanProcessor)
     observability.set_tracer_provider_for_residency("eu", provider)
-    monkeypatch.setattr(observability, "tenant_session", _fake_tracing_session(tenant_id))
+    # Residency "eu", no content opt-in, on the tenant record context resolution reads (#105).
+    set_default_adapter_for_tests(
+        FakeControlPlaneReads(
+            records={tenant_id: TenantRecord(tenant_id=tenant_id, residency="eu")}
+        )
+    )
     try:
         response = await _post_run(tenant_id, {"X-Identity-Id": str(identity_id)})
     finally:

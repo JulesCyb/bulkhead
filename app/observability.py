@@ -7,7 +7,8 @@ Content-free by default, per-tenant opt-in, per-residency sink:
   whole duration) — not only as `metadata` on the root span.
 - Prompts, tool arguments, and document text (`include_content`) are captured only when the
   calling tenant's own `tenants.settings["content_tracing_opt_in"]` is true
-  (`app.tenant_settings.TenantSettings`) — resolved per run, never a process-wide toggle.
+  (`app.tenant_settings.TenantSettings`, carried on the tenant record) — resolved per run, never
+  a process-wide toggle.
 - The trace sink a run's spans reach is resolved from the tenant's residency exactly like the
   model and embedding routes: one `TracerProvider` per residency
   (`settings.residency_allow_list.route_for(residency).trace_sink_host`,
@@ -26,9 +27,12 @@ Content-free by default, per-tenant opt-in, per-residency sink:
   returns `[]`).
 
 Per-run wiring lives at the call sites that actually run an agent (`app/agents/assistant.py`,
-`app/api/agents.py`, `app/api/chat.py`): each resolves the calling tenant's residency and content
-opt-in (`resolve_tenant_tracing_selection`, below), builds this run's `capabilities=` from
-`instrumentation_capabilities()`, and wraps the run in `tenant_span_attributes(...)`. Never
+`app/api/agents.py`, `app/api/chat.py`): each takes the calling tenant's residency and content
+opt-in from the tenant record the request's context already carries (`resolve_tenant_tracing`,
+below -- no database read of its own, #105; the model is resolved from the very same record, so
+tracing and the model can never disagree about the tenant's residency), builds this run's
+`capabilities=` from `instrumentation_capabilities()`, and wraps the run in
+`tenant_span_attributes(...)`. Never
 `Agent.instrument_all()` or a mutated agent-level `.instrument` — those are process-wide, and
 would let one tenant's residency/opt-in apply to a concurrent request for a different tenant.
 """
@@ -50,13 +54,9 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExporter
 from opentelemetry.trace import Span
 from pydantic_ai.capabilities.instrumentation import Instrumentation
 from pydantic_ai.models.instrumented import InstrumentationSettings
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from app.context import RequestContext
-from app.db.session import tenant_session
-from app.repositories.control import ControlRepository
-from app.repositories.tenant_settings import TenantSettingsRepository
+from app.tenant_record import TenantRecord
 
 log = logging.getLogger(__name__)
 
@@ -207,10 +207,9 @@ def reset_tracer_providers() -> None:
 def is_tracing_configured() -> bool:
     """True once at least one residency has a `TracerProvider` — either a real one from
     `setup_observability()` or a fake one a test injected via
-    `set_tracer_provider_for_residency`. The one check `resolve_tenant_tracing` makes before
-    opening a tenant session at all, so a deployment (or the vast majority of tests, which never
-    configure Langfuse credentials) that isn't tracing pays no extra DB round trip on every
-    request just to discover that."""
+    `set_tracer_provider_for_residency`. Introspection only: `instrumentation_capabilities()`
+    already returns `[]` when nothing is configured, and resolving a tenant's tracing costs no
+    database round trip either way (#105)."""
     return bool(_residency_tracer_providers)
 
 
@@ -228,10 +227,14 @@ def instrumentation_capabilities(
     """The `capabilities=` list a `pydantic_ai.Agent.run`/`run_stream`/
     `VercelAIAdapter.dispatch_request` call for this run should use.
 
-    Returns `[]` (no tracing at all for this run) when tracing isn't configured at all, or when
-    this tenant's residency couldn't be resolved — a tracing-only concern must never fail a
-    user-facing request; leaving one run untraced trivially can't cross a residency boundary or
-    leak content either.
+    **The one deliberate fail-open in residency handling (ADR-0008, spec #92):** returns `[]`
+    (this run goes untraced) whenever there is no trace sink for the tenant's residency -- the
+    residency is unresolved (`None`, e.g. a record with none recorded or a context with no record
+    at all), unknown to the allow-list, or tracing is not configured for any residency. Unlike the
+    model and embedding paths, which must fail the request closed (`app.residency.
+    ResidencyUnresolved`), tracing is not content-bearing on its own: an untraced run can neither
+    cross a residency boundary nor leak content, whereas refusing the request would make a
+    tracing-only gap user-facing. What it never does is fall back to another residency's sink.
 
     `content_tracing_opt_in` maps straight onto `InstrumentationSettings.include_content`:
     prompts and tool results are captured only when the tenant has explicitly opted in, never by
@@ -239,10 +242,8 @@ def instrumentation_capabilities(
     call — never a shared instance held across runs or agents — so one run's settings can never
     leak into a concurrent run for a different tenant.
     """
-    if residency is None:
-        return []
-    provider = _residency_tracer_providers.get(residency)
-    if provider is None:
+    provider = _residency_tracer_providers.get(residency) if residency else None
+    if provider is None:  # the one fail-open branch -- see the docstring
         return []
     instrumentation_settings = InstrumentationSettings(
         tracer_provider=provider, include_content=content_tracing_opt_in
@@ -250,7 +251,7 @@ def instrumentation_capabilities(
     return [Instrumentation(settings=instrumentation_settings)]
 
 
-# --- Per-request resolution of residency + content opt-in --------------------------------------
+# --- Per-request resolution of residency + content opt-in, from the tenant record -------------
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,36 +264,23 @@ class TenantTracingSelection:
     content_tracing_opt_in: bool
 
 
-async def resolve_tenant_tracing_selection(
-    session: AsyncSession, ctx: RequestContext
-) -> TenantTracingSelection:
-    """Reads the two facts `instrumentation_capabilities()` needs for `ctx.tenant_id`: its
-    residency (`control.tenants.residency`, operator-owned, ADR-0008) and its content-tracing
-    opt-in (`tenants.settings["content_tracing_opt_in"]`, tenant-owned). Both reads go through
-    the caller's own tenant-scoped session (`session`, from `tenant_session(ctx)`) — never a
-    cross-tenant control-plane session. Deliberately never raises on an unresolved residency:
-    that is a valid, fail-*safe* state here (an untraced run), unlike the model/embedding routing
-    paths, which must fail the request closed instead.
-    """
-    residency = await ControlRepository().get_residency(session, ctx)
-    tenant_settings = await TenantSettingsRepository().get(session, ctx)
-    return TenantTracingSelection(
-        residency=residency, content_tracing_opt_in=tenant_settings.content_tracing_opt_in
-    )
+def resolve_tenant_tracing(record: TenantRecord | None) -> TenantTracingSelection:
+    """The tracing selection for a tenant, as a function of its record (#105): its residency
+    (`record.residency`, operator-owned, ADR-0008) and its content-tracing opt-in
+    (`record.settings.content_tracing_opt_in`, tenant-owned) -- the same record, read once per
+    request, that the model and embedding routes resolve from, so there is no second residency
+    read that could disagree with theirs.
 
-
-async def resolve_tenant_tracing(ctx: RequestContext) -> TenantTracingSelection:
-    """The convenience entry point API routes call: when tracing isn't configured for any
-    residency at all (`is_tracing_configured()` False — the overwhelming default in tests and any
-    deployment with no Langfuse credentials), returns the untraced selection immediately without
-    opening a database session — no route that adds this call gains a new mandatory DB dependency
-    just to find out tracing is off. Only when tracing *is* configured does it open one
-    short-lived `tenant_session(ctx)` and resolve through `resolve_tenant_tracing_selection`.
+    Never raises: a record without a residency is carried through as `None`, and a context with
+    no record at all (a job, a test) gets the untraced, content-off selection -- both end in
+    `instrumentation_capabilities`'s one fail-open branch (untraced), never a fallback sink.
     """
-    if not is_tracing_configured():
+    if record is None:
         return TenantTracingSelection(residency=None, content_tracing_opt_in=False)
-    async with tenant_session(ctx) as session:
-        return await resolve_tenant_tracing_selection(session, ctx)
+    return TenantTracingSelection(
+        residency=record.residency,
+        content_tracing_opt_in=record.settings.content_tracing_opt_in,
+    )
 
 
 async def delete_tenant_traces(tenant_id: UUID) -> None:
@@ -322,7 +310,6 @@ __all__ = [
     "is_tracing_configured",
     "reset_tracer_providers",
     "resolve_tenant_tracing",
-    "resolve_tenant_tracing_selection",
     "set_tracer_provider_for_residency",
     "setup_observability",
     "tenant_span_attributes",

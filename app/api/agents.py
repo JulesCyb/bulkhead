@@ -65,7 +65,7 @@ class RunResponse(BaseModel):
 
 @router.post("/assistant/run", response_model=RunResponse)
 async def run(body: RunRequest, ctx: Context, _limit: RequestLimit) -> RunResponse:
-    tracing = await resolve_tenant_tracing(ctx)
+    tracing = resolve_tenant_tracing(ctx.tenant_record)
     deps = AssistantDeps(
         ctx=ctx,
         residency=tracing.residency,
@@ -93,7 +93,7 @@ async def run(body: RunRequest, ctx: Context, _limit: RequestLimit) -> RunRespon
 @router.post("/assistant/stream")
 async def stream(body: RunRequest, ctx: Context, _limit: RequestLimit) -> StreamingResponse:
     limits = build_run_limits()
-    tracing = await resolve_tenant_tracing(ctx)
+    tracing = resolve_tenant_tracing(ctx.tenant_record)
     deps = AssistantDeps(
         ctx=ctx,
         residency=tracing.residency,

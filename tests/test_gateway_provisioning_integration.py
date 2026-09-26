@@ -145,8 +145,7 @@ async def test_provision_writes_file_and_alias_is_readable_through_the_resolver(
     app_settings, database_urls, tmp_path
 ):
     from app.config import Settings
-    from app.context import RequestContext
-    from app.db.session import tenant_session
+    from app.db.session import tenant_record_session
     from app.gateway_credentials import resolve_gateway_credential
     from app.repositories.control import ControlRepository
 
@@ -166,13 +165,12 @@ async def test_provision_writes_file_and_alias_is_readable_through_the_resolver(
 
     assert (tmp_path / alias).read_text() == "sk-acme"
 
-    ctx = RequestContext(tenant_id=tenant_id, identity_id=uuid.uuid4())
-    async with tenant_session(ctx) as session:
-        recorded_alias = await ControlRepository().get_gateway_credential_alias(session, ctx)
-        assert recorded_alias == alias
+    async with tenant_record_session(tenant_id) as session:
+        record = await ControlRepository().get_tenant_record(session, tenant_id=tenant_id)
+    assert record.gateway_credential_alias == alias
 
-        credential = await resolve_gateway_credential(session, ctx, settings=settings)
-        assert credential.get_secret_value() == "sk-acme"
+    credential = resolve_gateway_credential(record, settings=settings)
+    assert credential.get_secret_value() == "sk-acme"
 
 
 async def test_provisioning_two_tenants_yields_distinct_alias_and_credential(

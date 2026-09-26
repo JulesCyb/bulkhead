@@ -1,14 +1,15 @@
-"""Per-tenant model/embedding resolution (Spec 7 / #54, ADR-0009): the allow-list check, the
-per-tenant client cache, and the wall-clock deadline -- exercised at the "ASGI application plus
-Settings" seam: real `Settings`, a fake control-plane session (same style as
-tests/test_gateway_credentials.py), no real database and no real model/provider call.
+"""Per-tenant model/embedding resolution (Spec 7 / #54, ADR-0009, #105): the allow-list check,
+the tenant's own `model` setting, the per-tenant client cache, and the wall-clock deadline.
+
+The resolvers are functions of the tenant record (`app.tenant_record.TenantRecord`) and
+`Settings` (#105): every case constructs the record directly -- no database, no fake session, no
+real model/provider call.
 """
 
 from __future__ import annotations
 
 import asyncio
 import uuid
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from openai import APITimeoutError, AsyncOpenAI
@@ -16,7 +17,6 @@ from pydantic import SecretStr
 from pydantic_ai.models.openai import OpenAIChatModel
 
 from app.config import Settings
-from app.context import RequestContext
 from app.embeddings import (
     build_tenant_embedding_client,
     reset_tenant_embedding_client_cache,
@@ -30,6 +30,9 @@ from app.llm import (
     resolve_tenant_chat_model,
     validate_model_for_residency,
 )
+from app.residency import ResidencyAllowList, ResidencyUnresolved
+from app.tenant_record import TenantRecord
+from app.tenant_settings import TenantSettings
 
 
 @pytest.fixture(autouse=True)
@@ -50,20 +53,46 @@ def settings(tmp_path) -> Settings:
     )
 
 
-def _fake_session(alias_row, residency_row) -> AsyncMock:
-    """A session whose `execute(...).first()` returns whichever row matches the query it was
-    called with, in the order `resolve_tenant_chat_model` issues them (residency, then alias).
-    Mirrors `tests/test_gateway_credentials.py`'s `_fake_session` helper."""
-    rows = iter([residency_row, alias_row])
+# `eu` allows two chat models here (the shipped config/residency.toml allows only one), so a
+# tenant's own choice is distinguishable from the deployment default (`claude-eu`).
+_TWO_EU_MODELS = ResidencyAllowList.from_data(
+    {
+        "residency": {
+            "eu": {
+                "model_host_patterns": ["litellm", "litellm.internal"],
+                "embedding_endpoint": "https://gateway-eu.internal/v1",
+                "trace_sink_host": "eu.cloud.langfuse.com",
+                "models": ["claude-eu", "claude-eu-large", "embeddings"],
+            },
+            "us": {
+                "model_host_patterns": ["gateway-us.internal"],
+                "embedding_endpoint": "https://gateway-us.internal/v1",
+                "trace_sink_host": "us.cloud.langfuse.com",
+                "models": ["claude", "embeddings"],
+            },
+        }
+    }
+)
 
-    async def _execute(*_args, **_kwargs):
-        result = MagicMock()
-        result.first.return_value = next(rows)
-        return result
 
-    session = AsyncMock()
-    session.execute = AsyncMock(side_effect=_execute)
-    return session
+@pytest.fixture
+def two_model_settings(settings) -> Settings:
+    settings.residency_allow_list = _TWO_EU_MODELS
+    return settings
+
+
+def _record(
+    residency: str | None = "eu",
+    alias: str | None = "acme-gateway-key",
+    model: str | None = None,
+    tenant_id: uuid.UUID | None = None,
+) -> TenantRecord:
+    return TenantRecord(
+        tenant_id=tenant_id or uuid.uuid4(),
+        residency=residency,
+        gateway_credential_alias=alias,
+        settings=TenantSettings(model=model),
+    )
 
 
 # --- Model allow-list validation (AC1) -------------------------------------------------------
@@ -89,63 +118,116 @@ def test_unknown_residency_has_no_allowed_models_at_all():
         validate_model_for_residency("claude", "atlantis")
 
 
-async def test_rejected_model_never_reaches_credential_resolution_or_client_construction(
+def test_rejected_model_never_reaches_credential_resolution_or_client_construction(
     settings, monkeypatch
 ):
     """AC1: rejected before any client is constructed and before any network call -- the
-    credential resolver must never even be called."""
+    credential resolver must never even be called (ADR-0009's order)."""
     from app import llm as llm_module
 
     called = False
 
-    async def _fail_if_called(*_args, **_kwargs):
+    def _fail_if_called(*_args, **_kwargs):
         nonlocal called
         called = True
         raise AssertionError("credential resolution must not run for a rejected model")
 
     monkeypatch.setattr(llm_module, "resolve_gateway_credential", _fail_if_called)
 
-    ctx = RequestContext(tenant_id=uuid.uuid4(), identity_id=uuid.uuid4())
-    session = _fake_session(alias_row=None, residency_row=("eu",))
-
     with pytest.raises(ModelNotAllowedForResidency):
-        await resolve_tenant_chat_model(session, ctx, "claude", settings=settings)
+        resolve_tenant_chat_model(_record(model="claude"), settings=settings)
     assert called is False
 
 
-# --- End-to-end resolution against a fake control-plane session (AC2) -----------------------
+# --- End to end from the record (AC2, #105) ---------------------------------------------------
 
 
-async def test_model_on_the_list_resolves_using_the_tenants_own_credential(settings, tmp_path):
+def test_model_on_the_list_resolves_using_the_tenants_own_credential(settings, tmp_path):
     (tmp_path / "acme-gateway-key").write_text("sk-acme-secret")
-    ctx = RequestContext(tenant_id=uuid.uuid4(), identity_id=uuid.uuid4())
-    session = _fake_session(alias_row=("acme-gateway-key",), residency_row=("eu",))
 
-    model = await resolve_tenant_chat_model(session, ctx, "claude-eu", settings=settings)
+    model = resolve_tenant_chat_model(_record(model="claude-eu"), settings=settings)
 
     assert isinstance(model, OpenAIChatModel)
     assert model.provider.client.api_key == "sk-acme-secret"
 
 
-async def test_missing_gateway_credential_raises_the_prior_tickets_typed_error(settings):
+def test_a_tenant_without_a_model_setting_runs_the_deployment_default(two_model_settings, tmp_path):
+    (tmp_path / "acme-gateway-key").write_text("sk-acme-secret")
+
+    model = resolve_tenant_chat_model(_record(model=None), settings=two_model_settings)
+
+    assert model.model_name == "claude-eu"  # Settings.llm_model
+
+
+def test_the_tenants_own_allow_listed_model_setting_is_the_model_it_runs(
+    two_model_settings, tmp_path
+):
+    """#105: `tenants.settings["model"]` is live -- the record's setting wins over the
+    deployment default when it is on the residency's allow-list."""
+    (tmp_path / "acme-gateway-key").write_text("sk-acme-secret")
+
+    model = resolve_tenant_chat_model(_record(model="claude-eu-large"), settings=two_model_settings)
+
+    assert model.model_name == "claude-eu-large"
+
+
+def test_a_provider_prefixed_model_setting_resolves_to_its_bare_gateway_alias(
+    two_model_settings, tmp_path
+):
+    (tmp_path / "acme-gateway-key").write_text("sk-acme-secret")
+
+    model = resolve_tenant_chat_model(
+        _record(model="openai:claude-eu-large"), settings=two_model_settings
+    )
+
+    assert model.model_name == "claude-eu-large"
+
+
+def test_a_model_setting_outside_the_residencys_list_fails_closed_on_read(two_model_settings):
+    """Read side (#105): a stored `model` the allow-list does not (or no longer) allow for the
+    tenant's residency is refused exactly like an unlisted deployment default -- never silently
+    replaced by the default."""
+    with pytest.raises(ModelNotAllowedForResidency):
+        resolve_tenant_chat_model(_record(model="claude"), settings=two_model_settings)
+
+
+def test_a_tenant_that_changes_its_model_gets_the_new_model_on_the_same_client(
+    two_model_settings, tmp_path
+):
+    """The per-tenant cache keeps the tenant's connection (its credential is the resource worth
+    not duplicating), never its momentary model choice: a changed setting takes effect on the
+    next resolution."""
+    (tmp_path / "acme-gateway-key").write_text("sk-acme-secret")
+    tenant_id = uuid.uuid4()
+
+    before = resolve_tenant_chat_model(
+        _record(model="claude-eu", tenant_id=tenant_id), settings=two_model_settings
+    )
+    after = resolve_tenant_chat_model(
+        _record(model="claude-eu-large", tenant_id=tenant_id), settings=two_model_settings
+    )
+
+    assert (before.model_name, after.model_name) == ("claude-eu", "claude-eu-large")
+    assert before.provider.client is after.provider.client
+
+
+def test_missing_gateway_credential_alias_fails_closed(settings):
     """The credential resolver's own typed error (#52) surfaces unchanged -- resolution here
     doesn't mask it behind a different exception."""
-    ctx = RequestContext(tenant_id=uuid.uuid4(), identity_id=uuid.uuid4())
-    session = _fake_session(alias_row=None, residency_row=("eu",))
-
     with pytest.raises(GatewayCredentialUnavailable):
-        await resolve_tenant_chat_model(session, ctx, "claude-eu", settings=settings)
+        resolve_tenant_chat_model(_record(alias=None), settings=settings)
 
 
-async def test_missing_control_plane_residency_fails_closed(settings):
-    """A tenant with no recorded residency never inherits the deployment's (ADR-0008)."""
-    from app.residency import ResidencyUnresolved
+def test_missing_gateway_credential_file_fails_closed(settings):
+    with pytest.raises(GatewayCredentialUnavailable):
+        resolve_tenant_chat_model(_record(alias="no-such-file"), settings=settings)
 
-    ctx = RequestContext(tenant_id=uuid.uuid4(), identity_id=uuid.uuid4())
-    session = _fake_session(alias_row=None, residency_row=None)
 
+@pytest.mark.parametrize("residency", [None, "", "mars"])
+def test_unresolved_residency_fails_closed(settings, residency):
+    """A tenant with no usable residency never inherits the deployment's (ADR-0008)."""
     with pytest.raises(ResidencyUnresolved):
-        await resolve_tenant_chat_model(session, ctx, "claude-eu", settings=settings)
+        resolve_tenant_chat_model(_record(residency=residency), settings=settings)
 
 
 # --- Per-tenant client caching (AC3) ----------------------------------------------------------
@@ -262,24 +344,23 @@ def test_embedding_client_carries_the_configured_call_deadline(settings):
     assert client.timeout == settings.embedding_call_timeout_seconds
 
 
-async def test_resolve_tenant_embedding_client_uses_the_tenants_own_credential(settings, tmp_path):
+def test_resolve_tenant_embedding_client_uses_the_tenants_own_credential(settings, tmp_path):
     (tmp_path / "acme-gateway-key").write_text("sk-acme-secret")
-    ctx = RequestContext(tenant_id=uuid.uuid4(), identity_id=uuid.uuid4())
-    # resolve_tenant_embedding_client now routes through resolve_residency_route (#61), which
-    # reads residency first, then the gateway-credential alias -- same order as the chat path.
-    session = _fake_session(alias_row=("acme-gateway-key",), residency_row=("eu",))
 
-    client = await resolve_tenant_embedding_client(session, ctx, settings=settings)
+    client = resolve_tenant_embedding_client(_record(), settings=settings)
     assert client.api_key == "sk-acme-secret"
 
 
-async def test_resolve_tenant_embedding_client_fails_closed_with_no_resolvable_residency(settings):
+@pytest.mark.parametrize("residency", [None, "mars"])
+def test_resolve_tenant_embedding_client_fails_closed_with_no_resolvable_residency(
+    settings, residency
+):
     """#61: the embedding path fails closed on an unresolvable residency exactly like the chat
     path does -- it must never fall back to a default embedding endpoint."""
-    from app.residency import ResidencyUnresolved
-
-    ctx = RequestContext(tenant_id=uuid.uuid4(), identity_id=uuid.uuid4())
-    session = _fake_session(alias_row=None, residency_row=None)
-
     with pytest.raises(ResidencyUnresolved):
-        await resolve_tenant_embedding_client(session, ctx, settings=settings)
+        resolve_tenant_embedding_client(_record(residency=residency), settings=settings)
+
+
+def test_resolve_tenant_embedding_client_fails_closed_with_no_credential_alias(settings):
+    with pytest.raises(GatewayCredentialUnavailable):
+        resolve_tenant_embedding_client(_record(alias=None), settings=settings)

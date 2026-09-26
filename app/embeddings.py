@@ -3,8 +3,9 @@ Spec 8 / #61, ADR-0008).
 
 The dimension must match the documents.embedding column (migration 0001: 1536).
 
-The single entry point is `resolve_tenant_embedding_client()` (Spec 7 / #54, Spec 8 / #61,
-ADR-0009, ADR-0008): it resolves `ctx.tenant_id`'s residency route and gateway credential
+The single entry point is `resolve_tenant_embedding_client(record, *, settings)` (Spec 7 / #54,
+Spec 8 / #61, ADR-0009, ADR-0008, #105): a function of the tenant record and settings, with no
+database read of its own, it resolves the tenant's residency route and gateway credential
 together through `app.residency.resolve_residency_route` -- the one call site both this module
 and `app/llm.py` use, so a tenant with no resolvable residency fails closed
 (`app.residency.ResidencyUnresolved`) exactly the same way on the embedding path as on the chat
@@ -31,11 +32,10 @@ from uuid import UUID
 import httpx
 from openai import AsyncOpenAI
 from pydantic import SecretStr
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings, get_settings
-from app.context import RequestContext
 from app.residency import resolve_residency_route
+from app.tenant_record import TenantRecord
 
 # Cache of per-tenant embedding clients (ADR-0009: "any cache of them is keyed by tenant"), the
 # embedding-side counterpart of app.llm's `_tenant_chat_models` -- same reasoning, same shape.
@@ -81,21 +81,22 @@ def reset_tenant_embedding_client_cache() -> None:
     _tenant_embedding_clients.clear()
 
 
-async def resolve_tenant_embedding_client(
-    session: AsyncSession, ctx: RequestContext, *, settings: Settings | None = None
+def resolve_tenant_embedding_client(
+    record: TenantRecord, *, settings: Settings | None = None
 ) -> AsyncOpenAI:
-    """The per-tenant embedding entry point (Spec 8 / #61, ADR-0008) -- the embedding-side
-    counterpart of `app.llm.resolve_tenant_chat_model`.
+    """The per-tenant embedding entry point (Spec 8 / #61, ADR-0008, #105) -- the embedding-side
+    counterpart of `app.llm.resolve_tenant_chat_model`, a function of the tenant record and
+    settings.
 
-    Resolves `ctx.tenant_id`'s residency route through `app.residency.resolve_residency_route`
-    (the same single call site the chat path's residency check ultimately rests on), then builds
-    (or reuses) the tenant's own cached embedding client from the credential that route bundles.
-    Raises `app.residency.ResidencyUnresolved` if the tenant's residency is missing, unknown, or
-    absent from the allow-list -- exactly the same fail-closed behaviour as the chat path, never a
+    Resolves the record's residency route through `app.residency.resolve_residency_route` (the
+    same single call site the chat path's residency check rests on), then builds (or reuses) the
+    tenant's own cached embedding client from the credential that route bundles. Raises
+    `app.residency.ResidencyUnresolved` if the record's residency is missing, unknown, or absent
+    from the allow-list -- exactly the same fail-closed behaviour as the chat path, never a
     fallback to a default embedding endpoint -- and propagates
     `app.gateway_credentials.GatewayCredentialUnavailable` unchanged if the credential itself
     cannot be resolved.
     """
     s = settings or get_settings()
-    resolved = await resolve_residency_route(session, ctx, settings=s)
-    return build_tenant_embedding_client(ctx.tenant_id, resolved.gateway_credential, settings=s)
+    resolved = resolve_residency_route(record, settings=s)
+    return build_tenant_embedding_client(record.tenant_id, resolved.gateway_credential, settings=s)

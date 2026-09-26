@@ -15,9 +15,10 @@
 Kept as two separate `Agent` objects (not one agent with a flag) so that wiring a writing tool
 into the one-shot agent is a change to code that doesn't exist, not a config toggle to flip back.
 
-- No model hard-wired: `resolve_chat_model()` resolves it per request, routed through the
-  requesting tenant's own residency (Spec 8 / #61, ADR-0008) via
-  `app.llm.resolve_tenant_chat_model` — never the removed, deployment-wide
+- No model hard-wired: `resolve_chat_model()` resolves it per request from the tenant record
+  the request's context carries -- its residency, its own `model` setting (else the deployment
+  default), its gateway credential alias (Spec 8 / #61, ADR-0008, #105) -- via
+  `app.llm.resolve_tenant_chat_model`, never the removed, deployment-wide
   `app.llm.get_model()` (ai-app-starter#7).
   Tests override with TestModel/FunctionModel — no real model call.
 - Tools are thin wrappers around app/tools/* that take the context from ctx.deps.
@@ -38,10 +39,10 @@ from pydantic_ai.models import Model
 from pydantic_ai.result import StreamedRunResult
 
 from app.context import RequestContext
-from app.db.session import tenant_session
 from app.llm import resolve_tenant_chat_model
 from app.observability import instrumentation_capabilities, tenant_span_attributes
 from app.repositories.documents import DocumentHit
+from app.residency import ResidencyUnresolved
 from app.run_limits import RunLimits, build_run_limits, run_deadline
 from app.tenant_suspension import ensure_tenant_not_suspended
 from app.tools import conversations as conversation_tools
@@ -66,7 +67,8 @@ class AssistantDeps:
     # completed run produced, persist them. None = the real ConversationsRepository, in a
     # session of its own, independent of the streamed response's own lifecycle.
     save_run: SaveRunFn | None = None
-    model_name: str | None = None  # e.g. from tenants.settings["model"]
+    # No model name here (#105): the model is resolved from `ctx.tenant_record` (the tenant's own
+    # `model` setting, else the deployment default) by `resolve_chat_model` below.
     # The bare (non tenant-prefixed) conversation id this run belongs to (ADR-0007, #40): what
     # `app/tools/approvals.py` scopes a pending action to -- distinct from the tenant-scoped id
     # `app/api/chat.py` passes as the run's own `conversation_id` for tracing (module docstring
@@ -79,11 +81,12 @@ class AssistantDeps:
     # `executed`/`failed_to_execute` outcome (`app.tools.approvals.record_write_outcome`). Never
     # set by anything else.
     pending_approval: ApprovalContext | None = None
-    # Tracing (Spec 8 / #62, ADR-0008): the caller resolves both from the database before
-    # building these deps (`app.observability.resolve_tenant_tracing_selection`) and passes them
-    # straight through — `None`/`False` here (the defaults) mean "trace this run, if at all, with
-    # no residency resolved and no content", which `instrumentation_capabilities()` below always
-    # treats as untraced, never as a fallback to some other tenant's sink.
+    # Tracing (Spec 8 / #62, ADR-0008): the caller takes both from the tenant record its context
+    # carries before building these deps (`app.observability.resolve_tenant_tracing`, #105 -- no
+    # database read) and passes them straight through — `None`/`False` here (the defaults) mean
+    # "trace this run, if at all, with no residency resolved and no content", which
+    # `instrumentation_capabilities()` below always treats as untraced, never as a fallback to
+    # some other tenant's sink.
     residency: str | None = None
     content_tracing_opt_in: bool = False
 
@@ -189,15 +192,22 @@ async def resolve_chat_model(deps: AssistantDeps) -> Model:
     `app/api/chat.py` all use instead of the removed, deployment-wide
     `app.llm.get_model()` (ai-app-starter#7).
 
-    Opens a short tenant-bound session purely to resolve the route and the tenant's own gateway
-    credential (`app.llm.resolve_tenant_chat_model`), then closes it -- the resolved model
-    (its own cached provider client) outlives the session, which the run itself never needs.
+    A function of the tenant record the context carries (`deps.ctx.tenant_record`, read once at
+    context resolution, #104/#105) -- no session, no control-plane read here: its residency, its
+    own `model` setting (else the deployment default), its gateway credential alias
+    (`app.llm.resolve_tenant_chat_model`). A context without a record (a job, a test) fails
+    closed with `ResidencyUnresolved`: never a read of its own, never the deployment's residency.
     Propagates `app.residency.ResidencyUnresolved`, `app.llm.ModelNotAllowedForResidency`, and
     `app.gateway_credentials.GatewayCredentialUnavailable` unchanged; callers map them to a clear
     failure (see `app/api/agents.py` and `app/api/chat.py`), never a fallback to a default route.
     """
-    async with tenant_session(deps.ctx) as session:
-        return await resolve_tenant_chat_model(session, deps.ctx, deps.model_name)
+    record = deps.ctx.tenant_record
+    if record is None:
+        raise ResidencyUnresolved(
+            f"context for tenant {deps.ctx.tenant_id} carries no tenant record to resolve a "
+            "model from"
+        )
+    return resolve_tenant_chat_model(record)
 
 
 async def run_assistant(prompt: str, deps: AssistantDeps, limits: RunLimits | None = None) -> str:

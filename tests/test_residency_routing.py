@@ -14,7 +14,9 @@ tenant with no resolvable residency -- rather than reaching the removed, deploym
 No real database, no real model/provider call: `resolve_chat_model`
 (`app.agents.assistant`/`app.api.chat`) and `resolve_tenant_embedding_client`
 (`app.tools.documents`) are patched per tenant id, mirroring `tests/conftest.py`'s
-`resolve_to_model` seam and `tests/test_residency.py`'s fake-session style.
+`resolve_to_model` seam -- except in the #105 section, where the real resolver runs from the
+tenant record the request's context carries (`FakeControlPlaneReads.records`) and only client
+construction is replaced, to observe which model name the run actually used.
 """
 
 from __future__ import annotations
@@ -29,12 +31,17 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from app.agents import assistant as assistant_module
 from app.api import chat as chat_module
+from app.config import get_settings
 from app.context import RequestContext
 from app.gateway_credentials import GatewayCredentialUnavailable
 from app.llm import ModelNotAllowedForResidency
 from app.main import app
-from app.residency import ResidencyUnresolved
+from app.residency import ResidencyAllowList, ResidencyUnresolved
+from app.tenant_record import TenantRecord
+from app.tenant_settings import TenantSettings
+from app.token_verifier import set_default_adapter_for_tests
 from app.tools import documents as document_tools
+from tests.conftest import FakeControlPlaneReads
 
 
 def _headers(identity_id: uuid.UUID | None = None) -> dict[str, str]:
@@ -206,6 +213,169 @@ async def test_chat_gets_a_clear_failure_not_a_default_route(asgi_client, monkey
     assert response.json()["detail"]["error"] == "content_routing_unavailable"
 
 
+# --- #105: the tenant's own `model` setting is the model its run uses ---------------------------
+# Real `resolve_chat_model` -> `resolve_tenant_chat_model` from the record the request's context
+# carries (dev-headers reads it through the installed `FakeControlPlaneReads.records`), a real
+# gateway credential file; only client construction (`app.llm.build_tenant_chat_model`, the
+# network boundary) is swapped for a `FunctionModel` that records the bare model name it was
+# built for and answers with it.
+
+# `eu` allows two chat models here (the shipped config allows one), so a tenant's own choice is
+# distinguishable from the deployment default `claude-eu`.
+_TWO_EU_MODELS = ResidencyAllowList.from_data(
+    {
+        "residency": {
+            "eu": {
+                "model_host_patterns": ["litellm"],
+                "embedding_endpoint": "https://gateway-eu.internal/v1",
+                "trace_sink_host": "eu.cloud.langfuse.com",
+                "models": ["claude-eu", "claude-eu-large", "embeddings"],
+            },
+            "us": {
+                "model_host_patterns": ["gateway-us.internal"],
+                "embedding_endpoint": "https://gateway-us.internal/v1",
+                "trace_sink_host": "us.cloud.langfuse.com",
+                "models": ["claude", "embeddings"],
+            },
+        }
+    }
+)
+
+
+@pytest.fixture
+def ran_with(monkeypatch, tmp_path) -> list[str]:
+    """Every bare model name a run was actually driven with, in order."""
+    from app import llm as llm_module
+
+    (tmp_path / "acme-gateway-key").write_text("sk-acme-secret")
+    settings = get_settings().model_copy(
+        update={"gateway_credentials_dir": str(tmp_path), "residency_allow_list": _TWO_EU_MODELS}
+    )
+    monkeypatch.setattr(llm_module, "get_settings", lambda: settings)
+    seen: list[str] = []
+
+    def _build(tenant_id, bare_model_name, credential, *, settings=None):
+        assert credential.get_secret_value() == "sk-acme-secret"
+
+        async def _respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            seen.append(bare_model_name)
+            return ModelResponse(parts=[TextPart(content=f"ran with {bare_model_name}")])
+
+        async def _respond_stream(messages: list[ModelMessage], info: AgentInfo):
+            seen.append(bare_model_name)
+            yield f"ran with {bare_model_name}"
+
+        return FunctionModel(_respond, stream_function=_respond_stream)
+
+    monkeypatch.setattr(llm_module, "build_tenant_chat_model", _build)
+
+    async def _no_history(ctx, conversation_id):
+        return []
+
+    monkeypatch.setattr(
+        assistant_module.conversation_tools, "load_conversation_history", _no_history
+    )
+    return seen
+
+
+def _tenant_with(model: str | None, *, residency: str | None = "eu") -> uuid.UUID:
+    tenant_id = uuid.uuid4()
+    set_default_adapter_for_tests(
+        FakeControlPlaneReads(
+            records={
+                tenant_id: TenantRecord(
+                    tenant_id=tenant_id,
+                    residency=residency,
+                    gateway_credential_alias="acme-gateway-key",
+                    settings=TenantSettings(model=model),
+                )
+            }
+        )
+    )
+    return tenant_id
+
+
+async def _post_run(client: httpx.AsyncClient, tenant_id: uuid.UUID) -> httpx.Response:
+    return await client.post(
+        f"/v1/t/{tenant_id}/agents/assistant/run", json={"prompt": "hi"}, headers=_headers()
+    )
+
+
+async def _post_chat(client: httpx.AsyncClient, tenant_id: uuid.UUID) -> httpx.Response:
+    return await client.post(
+        f"/v1/t/{tenant_id}/api/chat", json=_submit_message_body(), headers=_headers()
+    )
+
+
+async def test_run_uses_the_tenants_own_allow_listed_model_setting(asgi_client, ran_with):
+    tenant_id = _tenant_with("claude-eu-large")
+
+    async with asgi_client:
+        response = await _post_run(asgi_client, tenant_id)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["output"] == "ran with claude-eu-large"
+    assert ran_with == ["claude-eu-large"]
+
+
+async def test_chat_uses_the_tenants_own_allow_listed_model_setting(asgi_client, ran_with):
+    tenant_id = _tenant_with("claude-eu-large")
+
+    async with asgi_client:
+        response = await _post_chat(asgi_client, tenant_id)
+
+    assert response.status_code == 200, response.text
+    assert "ran with claude-eu-large" in response.text
+    assert ran_with == ["claude-eu-large"]
+
+
+async def test_a_tenant_without_a_model_setting_runs_the_deployment_default(asgi_client, ran_with):
+    tenant_id = _tenant_with(None)
+
+    async with asgi_client:
+        response = await _post_run(asgi_client, tenant_id)
+
+    assert response.status_code == 200, response.text
+    assert ran_with == ["claude-eu"]
+
+
+@pytest.mark.parametrize("post", [_post_run, _post_chat])
+async def test_a_model_setting_outside_the_residencys_list_is_a_503_routing_error(
+    asgi_client, ran_with, post
+):
+    """`claude` is the `us` alias: stored for an `eu` tenant (say, the allow-list changed since it
+    was written), the request fails closed -- never silently served by the default model."""
+    tenant_id = _tenant_with("claude")
+
+    async with asgi_client:
+        response = await post(asgi_client, tenant_id)
+
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"]["error"] == "content_routing_unavailable"
+    assert ran_with == []
+
+
+async def test_a_record_without_a_residency_is_a_503_routing_error(asgi_client, ran_with):
+    tenant_id = _tenant_with("claude-eu", residency=None)
+
+    async with asgi_client:
+        response = await _post_run(asgi_client, tenant_id)
+
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"]["error"] == "content_routing_unavailable"
+    assert ran_with == []
+
+
+async def test_resolve_chat_model_fails_closed_for_a_context_without_a_record():
+    """A job or test context carries no record: model resolution refuses it rather than reading
+    the control plane again or falling back to the deployment's residency (#105)."""
+    deps = assistant_module.AssistantDeps(
+        ctx=RequestContext(tenant_id=uuid.uuid4(), identity_id=uuid.uuid4())
+    )
+    with pytest.raises(ResidencyUnresolved):
+        await assistant_module.resolve_chat_model(deps)
+
+
 # --- AC2 + AC4: document search embeds against the endpoint resolved for the tenant's own ------
 # --- residency; no hard-coded default embedding endpoint is reachable from this path. ----------
 
@@ -251,8 +421,8 @@ async def test_search_documents_embeds_against_the_route_resolved_for_the_tenant
         tenant_us: _FakeEmbeddingClient([0.0, 1.0]),
     }
 
-    async def _fake_resolve(session, ctx, *, settings=None):
-        return clients[ctx.tenant_id]
+    def _fake_resolve(record, *, settings=None):
+        return clients[record.tenant_id]
 
     captured: list[tuple[uuid.UUID, list[float]]] = []
 
@@ -269,8 +439,16 @@ async def test_search_documents_embeds_against_the_route_resolved_for_the_tenant
     monkeypatch.setattr(document_tools, "DocumentRepository", _FakeDocumentRepository)
     monkeypatch.setattr(document_tools, "tenant_session", _fake_tenant_session)
 
-    ctx_eu = RequestContext(tenant_id=tenant_eu, identity_id=uuid.uuid4())
-    ctx_us = RequestContext(tenant_id=tenant_us, identity_id=uuid.uuid4())
+    ctx_eu = RequestContext(
+        tenant_id=tenant_eu,
+        identity_id=uuid.uuid4(),
+        tenant_record=TenantRecord(tenant_id=tenant_eu, residency="eu"),
+    )
+    ctx_us = RequestContext(
+        tenant_id=tenant_us,
+        identity_id=uuid.uuid4(),
+        tenant_record=TenantRecord(tenant_id=tenant_us, residency="us"),
+    )
 
     await document_tools.search_documents(ctx_eu, "acme contract")
     await document_tools.search_documents(ctx_us, "acme contract")
@@ -282,23 +460,46 @@ async def test_search_documents_embeds_against_the_route_resolved_for_the_tenant
     assert [0.0, 1.0] in embeddings_seen
 
 
-async def test_search_documents_fails_closed_when_residency_is_unresolvable(monkeypatch):
-    """#61 AC3: the search path fails exactly like the chat path for a tenant with no resolvable
-    residency -- never a fallback to a default embedding endpoint."""
-
-    async def _fake_resolve(session, ctx, *, settings=None):
-        raise ResidencyUnresolved(f"tenant {ctx.tenant_id} has no usable residency")
-
+@pytest.fixture
+def no_tenant_session(monkeypatch):
     @asynccontextmanager
     async def _fake_tenant_session(ctx):
         yield object()
 
-    monkeypatch.setattr(document_tools, "resolve_tenant_embedding_client", _fake_resolve)
     monkeypatch.setattr(document_tools, "tenant_session", _fake_tenant_session)
 
-    ctx = RequestContext(tenant_id=uuid.uuid4(), identity_id=uuid.uuid4())
+
+async def test_search_documents_fails_closed_when_residency_is_unresolvable(no_tenant_session):
+    """#61 AC3: the search path fails exactly like the chat path for a tenant whose record has no
+    residency -- never a fallback to a default embedding endpoint (the real resolver, #105)."""
+    tenant_id = uuid.uuid4()
+    ctx = RequestContext(
+        tenant_id=tenant_id,
+        identity_id=uuid.uuid4(),
+        tenant_record=TenantRecord(tenant_id=tenant_id, gateway_credential_alias="acme"),
+    )
     with pytest.raises(ResidencyUnresolved):
         await document_tools.search_documents(ctx, "acme contract")
+
+
+async def test_search_documents_reads_the_record_for_a_context_without_one(no_tenant_session):
+    """The stdio MCP development context carries no record: the tool takes it from the one
+    record read (`ControlPlaneReads.get_tenant_record`) and resolves from that -- here the fake
+    control plane's residency-less record, so it fails closed."""
+    tenant_id = uuid.uuid4()
+    asked: list[uuid.UUID] = []
+
+    class _Reads(FakeControlPlaneReads):
+        async def get_tenant_record(self, *, tenant_id):
+            asked.append(tenant_id)
+            return await super().get_tenant_record(tenant_id=tenant_id)
+
+    set_default_adapter_for_tests(_Reads())
+    ctx = RequestContext(tenant_id=tenant_id, identity_id=uuid.uuid4())
+
+    with pytest.raises(ResidencyUnresolved):
+        await document_tools.search_documents(ctx, "acme contract")
+    assert asked == [tenant_id]
 
 
 # --- AC6: the embeddings module docstring states the one-family / re-embedding-migration rule --

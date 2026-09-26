@@ -1,19 +1,21 @@
-"""Residency route resolution (Spec 8 / #60, ADR-0008): the resolver logic exercised without a
-real database -- the RLS-filtered read itself is covered by the embedded-Postgres tests in
-tests/test_rls_integration.py. Mirrors tests/test_gateway_credentials.py's fake-session seam.
+"""Residency route resolution (Spec 8 / #60, ADR-0008; #105): the resolver is a function of the
+tenant record (`app.tenant_record.TenantRecord`) and settings -- every case below constructs the
+record directly, no database and no fake session. The record read itself (RLS-scoped) is covered
+by the embedded-Postgres tests in tests/test_rls_integration.py.
 """
 
 from __future__ import annotations
 
+import re
 import uuid
-from unittest.mock import AsyncMock, MagicMock
+from pathlib import Path
 
 import pytest
 
 from app.config import Settings
-from app.context import RequestContext
 from app.gateway_credentials import GatewayCredentialUnavailable
 from app.residency import ResidencyAllowList, ResidencyUnresolved, resolve_residency_route
+from app.tenant_record import TenantRecord
 
 ALLOW_LIST = ResidencyAllowList.load()
 
@@ -26,73 +28,61 @@ def settings(tmp_path) -> Settings:
     )
 
 
-def _fake_session(residency_row: tuple[str] | None, alias_row: tuple[str] | None) -> AsyncMock:
-    """A session whose `execute(...).first()` returns, in order, the residency read then the
-    gateway-credential-alias read -- `.first()` is sync on a real SQLAlchemy `Result`, so a plain
-    `MagicMock` per call, not an `AsyncMock` (whose attributes are themselves awaitable)."""
-    residency_result = MagicMock()
-    residency_result.first.return_value = residency_row
-    alias_result = MagicMock()
-    alias_result.first.return_value = alias_row
-
-    session = AsyncMock()
-    session.execute = AsyncMock(side_effect=[residency_result, alias_result])
-    return session
+def _record(residency: str | None, alias: str | None = None) -> TenantRecord:
+    return TenantRecord(tenant_id=uuid.uuid4(), residency=residency, gateway_credential_alias=alias)
 
 
-async def test_unset_residency_raises_typed_error() -> None:
-    ctx = RequestContext(tenant_id=uuid.uuid4(), identity_id=uuid.uuid4())
-    session = _fake_session(None, None)
+def test_unset_residency_raises_typed_error(settings) -> None:
     with pytest.raises(ResidencyUnresolved):
-        await resolve_residency_route(session, ctx)
+        resolve_residency_route(_record(None, "acme-gateway-key"), settings=settings)
 
 
-async def test_null_residency_raises_typed_error() -> None:
-    ctx = RequestContext(tenant_id=uuid.uuid4(), identity_id=uuid.uuid4())
-    session = _fake_session((None,), None)
+def test_empty_residency_raises_typed_error(settings) -> None:
     with pytest.raises(ResidencyUnresolved):
-        await resolve_residency_route(session, ctx)
+        resolve_residency_route(_record("", "acme-gateway-key"), settings=settings)
 
 
-async def test_unknown_residency_raises_typed_error_not_a_fallback() -> None:
-    ctx = RequestContext(tenant_id=uuid.uuid4(), identity_id=uuid.uuid4())
-    session = _fake_session(("mars",), None)
+def test_unknown_residency_raises_typed_error_not_a_fallback(settings) -> None:
     with pytest.raises(ResidencyUnresolved):
-        await resolve_residency_route(session, ctx)
+        resolve_residency_route(_record("mars", "acme-gateway-key"), settings=settings)
 
 
-async def test_resolved_route_matches_the_allow_list_entry(tmp_path, settings) -> None:
+def test_unresolved_residency_is_refused_before_the_credential_is_read(tmp_path, settings) -> None:
+    """Fail closed on the residency first: a tenant with no usable residency never has its
+    credential file read at all -- no alias recorded here, so a credential read would raise the
+    other typed error instead."""
+    with pytest.raises(ResidencyUnresolved):
+        resolve_residency_route(_record(None, None), settings=settings)
+
+
+def test_resolved_route_matches_the_allow_list_entry(tmp_path, settings) -> None:
     (tmp_path / "acme-gateway-key").write_text("sk-acme-secret")
-    ctx = RequestContext(tenant_id=uuid.uuid4(), identity_id=uuid.uuid4())
-    session = _fake_session(("eu",), ("acme-gateway-key",))
 
-    resolved = await resolve_residency_route(session, ctx, settings=settings)
+    resolved = resolve_residency_route(_record("eu", "acme-gateway-key"), settings=settings)
 
     assert resolved.residency == "eu"
     assert resolved.route == ALLOW_LIST.route_for("eu")
     assert resolved.gateway_credential.get_secret_value() == "sk-acme-secret"
 
 
-async def test_missing_gateway_credential_propagates_unchanged(settings) -> None:
-    """The residency itself resolves fine; the credential lookup below it fails closed with its
-    own typed error rather than being masked by a residency-shaped one."""
-    ctx = RequestContext(tenant_id=uuid.uuid4(), identity_id=uuid.uuid4())
-    session = _fake_session(("eu",), None)
+def test_missing_gateway_credential_alias_fails_closed(settings) -> None:
+    """The residency itself resolves fine; a record with no credential alias fails closed with
+    the credential's own typed error rather than being masked by a residency-shaped one."""
     with pytest.raises(GatewayCredentialUnavailable):
-        await resolve_residency_route(session, ctx, settings=settings)
+        resolve_residency_route(_record("eu", None), settings=settings)
 
 
-async def test_two_tenants_different_residencies_never_cross(tmp_path, settings) -> None:
+def test_missing_gateway_credential_file_fails_closed(settings) -> None:
+    with pytest.raises(GatewayCredentialUnavailable):
+        resolve_residency_route(_record("eu", "no-such-alias"), settings=settings)
+
+
+def test_two_tenants_different_residencies_never_cross(tmp_path, settings) -> None:
     (tmp_path / "acme-gateway-key").write_text("sk-acme-secret")
     (tmp_path / "globex-gateway-key").write_text("sk-globex-secret")
 
-    ctx_eu = RequestContext(tenant_id=uuid.uuid4(), identity_id=uuid.uuid4())
-    session_eu = _fake_session(("eu",), ("acme-gateway-key",))
-    ctx_us = RequestContext(tenant_id=uuid.uuid4(), identity_id=uuid.uuid4())
-    session_us = _fake_session(("us",), ("globex-gateway-key",))
-
-    resolved_eu = await resolve_residency_route(session_eu, ctx_eu, settings=settings)
-    resolved_us = await resolve_residency_route(session_us, ctx_us, settings=settings)
+    resolved_eu = resolve_residency_route(_record("eu", "acme-gateway-key"), settings=settings)
+    resolved_us = resolve_residency_route(_record("us", "globex-gateway-key"), settings=settings)
 
     assert resolved_eu.residency == "eu"
     assert resolved_us.residency == "us"
@@ -124,3 +114,28 @@ def _build_resolved_for_frozen_check():
         route=ALLOW_LIST.route_for("eu"),
         gateway_credential=SecretStr("sk-test"),
     )
+
+
+# --- The tenant record is the only read of residency and settings (#105) -----------------------
+
+_APP = Path(__file__).resolve().parent.parent / "app"
+
+# Each of these was once a per-request control-plane or settings read; model, embedding, and
+# tracing resolution are functions of the tenant record now, and the record's own read
+# (`ControlRepository.get_tenant_record`) reads the view and the settings row itself.
+_RETIRED_READS = {
+    "residency read": re.compile(r"\bget_residency\("),
+    "gateway credential alias read": re.compile(r"\bget_gateway_credential_alias\("),
+    "per-context settings read": re.compile(r"TenantSettingsRepository\(\)\.get\("),
+    "session-taking tracing selection": re.compile(r"\bresolve_tenant_tracing_selection\b"),
+}
+
+
+def test_residency_and_settings_are_read_from_the_record_only() -> None:
+    found = {
+        (name, path.relative_to(_APP.parent).as_posix())
+        for path in _APP.rglob("*.py")
+        for name, pattern in _RETIRED_READS.items()
+        if pattern.search(path.read_text())
+    }
+    assert found == set()

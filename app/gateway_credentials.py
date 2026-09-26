@@ -1,9 +1,11 @@
 """Per-tenant gateway credential resolution (Spec 7 / #52, ADR-0009, ADR-0011).
 
 Distinct from `app.config.Settings`: a gateway credential is per-tenant and must be resolved on
-every request from the control plane's own alias and a fresh disk read, never baked in once at
-process startup like a Settings field is. Nothing here is cached across tenants, or across
-calls for the same tenant -- a rotated file is picked up on the very next resolution. This is
+every request from the control plane's own alias -- carried on the tenant record
+(`app.tenant_record.TenantRecord.gateway_credential_alias`, read once per request, #104/#105) --
+and a fresh disk read, never baked in once at process startup like a Settings field is. Nothing
+here is cached across tenants, or across calls for the same tenant -- a rotated file is picked up
+on the very next resolution. This is
 the shared seam every later per-tenant model/embedding client (and the future credential-minting
 call) is built on.
 
@@ -18,11 +20,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from pydantic import SecretStr
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings, get_settings
-from app.context import RequestContext
-from app.repositories.control import ControlRepository
+from app.tenant_record import TenantRecord
 
 
 class GatewayCredentialUnavailable(Exception):
@@ -32,19 +32,6 @@ class GatewayCredentialUnavailable(Exception):
     the control plane yet, or that alias names a secret file that is missing or empty under the
     configured directory. Never raised for, and never masks, any other kind of failure.
     """
-
-
-async def resolve_gateway_credential_alias(session: AsyncSession, ctx: RequestContext) -> str:
-    """The tenant's gateway-credential alias from the control plane.
-
-    Raises `GatewayCredentialUnavailable` if the tenant has none recorded yet.
-    """
-    alias = await ControlRepository().get_gateway_credential_alias(session, ctx)
-    if not alias:
-        raise GatewayCredentialUnavailable(
-            f"tenant {ctx.tenant_id} has no gateway credential alias recorded in the control plane"
-        )
-    return alias
 
 
 def read_gateway_credential(alias: str, *, settings: Settings | None = None) -> SecretStr:
@@ -69,13 +56,19 @@ def read_gateway_credential(alias: str, *, settings: Settings | None = None) -> 
     return SecretStr(content)
 
 
-async def resolve_gateway_credential(
-    session: AsyncSession, ctx: RequestContext, *, settings: Settings | None = None
+def resolve_gateway_credential(
+    record: TenantRecord, *, settings: Settings | None = None
 ) -> SecretStr:
-    """Given a tenant's request context, resolve its gateway credential end to end: the alias
-    from the control plane, then a fresh read of that alias's secret file. Two tenants with
-    different aliases always resolve to two different `SecretStr` values; nothing here is
-    shared or cached between them.
+    """The tenant's gateway credential end to end: the alias its record carries, then a fresh
+    read of that alias's secret file. No database read of its own (#105): the alias was read with
+    the rest of the tenant record. Raises `GatewayCredentialUnavailable` if the record has no
+    alias or the file is missing/empty. Two tenants with different aliases always resolve to two
+    different `SecretStr` values; nothing here is shared or cached between them.
     """
-    alias = await resolve_gateway_credential_alias(session, ctx)
+    alias = record.gateway_credential_alias
+    if not alias:
+        raise GatewayCredentialUnavailable(
+            f"tenant {record.tenant_id} has no gateway credential alias recorded in the control "
+            "plane"
+        )
     return read_gateway_credential(alias, settings=settings)

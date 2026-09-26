@@ -172,7 +172,12 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    `settings.residency_allow_list.alias_for`) before building any client (ADR-0009); a name
    outside the list is rejected with `ModelNotAllowedForResidency` — a subclass of
    `app.residency.ResidencyUnresolved`, not a second, unrelated exception type — never silently
-   passed through to the gateway. More generally (ADR-0008): every content-bearing path — model,
+   passed through to the gateway. Model, embedding, and residency resolution
+   (`resolve_tenant_chat_model`/`resolve_tenant_embedding_client`/`resolve_residency_route`,
+   each `(record, *, settings)`) are functions of the tenant record `ctx.tenant_record` and read
+   nothing themselves; the tenant's `model` setting is validated against its residency's
+   allow-list on write (`app.operator.create._validate_model`) and again on every read, failing
+   closed like the default (#105). More generally (ADR-0008): every content-bearing path — model,
    embeddings, and tracing — resolves its route from the tenant's own `control.tenants.residency`
    through `app.residency.resolve_residency_route` or the same `settings.residency_allow_list`
    (`app.residency.ResidencyAllowList`) it reads; an unset or unlisted residency fails closed
@@ -198,7 +203,9 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    support it. Content-free by default: prompts, tool arguments, and document text are captured
    only when the calling tenant has explicitly opted in
    (`tenants.settings["content_tracing_opt_in"]`, `app/tenant_settings.py`, default `False`) —
-   resolved per run via `app.observability.resolve_tenant_tracing`, never a process-wide switch.
+   resolved per run via `app.observability.resolve_tenant_tracing(ctx.tenant_record)` — the same
+   record the model is resolved from, no read of its own; untraced when the record has no
+   residency (the one documented fail-open, #105) — never a process-wide switch.
    The trace sink itself is resolved per the tenant's residency, exactly like the model and
    embedding routes (rule 6); see `docs/residency.md`.
 8. **Cache keys** include the `tenant_id`.

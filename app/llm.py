@@ -6,12 +6,16 @@ service, not an optional profile (ADR-0009): a deployment always routes through 
 construction itself refuses to succeed with no `LITELLM_BASE_URL` configured
 (`app.config.Settings._require_gateway_configured`) -- there is no direct-provider fallback
 anywhere in this module, and there must never be one added. Per tenant,
-tenants.settings["model"] can override the default (the model_name argument).
+tenants.settings["model"] overrides the default -- read from the tenant record
+(`app.tenant_record.TenantRecord.settings.model`, #105), validated on write by the operator
+tool's `create` (`app.operator.create._validate_model`) and again here on every read.
 
 The one entry point that builds a chat client lives here:
 
-- `resolve_tenant_chat_model()` — the per-tenant entry point (Spec 7 / #54, ADR-0009): before a
-  chat client is ever built, the tenant's chosen model name is validated against the allow-list
+- `resolve_tenant_chat_model(record, *, settings)` — the per-tenant entry point (Spec 7 / #54,
+  ADR-0009), a function of the tenant record and settings with no database read of its own
+  (#105): before a chat client is ever built, the tenant's chosen model name (its own
+  `model` setting, else `Settings.llm_model`) is validated against the allow-list
   for its residency (`validate_model_for_residency`, a thin call to
   `settings.residency_allow_list.alias_for` -- `app.residency.ResidencyAllowList`, spec A4 /
   #111) and rejected with `ModelNotAllowedForResidency` if it is not on it — before any client is
@@ -20,9 +24,9 @@ The one entry point that builds a chat client lives here:
   caller that only ever wants to fail closed on "this allow-list cannot answer that" catches the
   one base type, while this name is kept because `CLAUDE.md` and the tests still name it. The
   client that is finally built is constructed from that tenant's own gateway credential
-  (`app.gateway_credentials`, #52) and cached per tenant id, so two tenants never share a
-  connection; every call it makes carries an explicit wall-clock deadline
-  (`model_settings.timeout`) instead of the client library's multi-minute default.
+  (`app.gateway_credentials`, #52, the alias the record carries); its connection is cached per
+  tenant id, so two tenants never share one; every call it makes carries an explicit wall-clock
+  deadline (`model_settings.timeout`) instead of the client library's multi-minute default.
 
 There used to be a second entry point here, `get_model()` — a deployment-wide resolver with its
 own, separate `LITELLM_BASE_URL` check that fell back to returning a bare `"<provider>:<model>"`
@@ -44,13 +48,11 @@ from pydantic import SecretStr
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings, get_settings
-from app.context import RequestContext
 from app.gateway_credentials import resolve_gateway_credential
-from app.repositories.control import ControlRepository
-from app.residency import ResidencyUnresolved
+from app.residency import ResidencyUnresolved, tenant_residency_route
+from app.tenant_record import TenantRecord
 
 
 class ModelNotAllowedForResidency(ResidencyUnresolved):
@@ -97,11 +99,15 @@ def validate_model_for_residency(
         raise ModelNotAllowedForResidency(model_name, residency) from exc
 
 
-# Cache of per-tenant chat model clients (ADR-0009: "any cache of them is keyed by tenant"), so
+# Cache of per-tenant gateway connections (ADR-0009: "any cache of them is keyed by tenant"), so
 # two tenants never share a connection or credential, and resolving the same tenant twice reuses
-# one client rather than reconnecting. Never keyed by anything else (not by model name): a
-# tenant's credential -- not its momentary model choice -- is the resource worth not duplicating.
-_tenant_chat_models: dict[UUID, OpenAIChatModel] = {}
+# one connection rather than reconnecting. The tenant's credential -- not its momentary model
+# choice -- is the resource worth not duplicating, so the provider (the connection) is keyed by
+# tenant id alone; the model objects built on it are keyed by (tenant id, model name), so a
+# tenant that changes its `model` setting (#105) gets the new model on its same connection on
+# the very next resolution, never the cached old one.
+_tenant_providers: dict[UUID, OpenAIProvider] = {}
+_tenant_chat_models: dict[tuple[UUID, str], OpenAIChatModel] = {}
 
 
 def build_tenant_chat_model(
@@ -112,17 +118,18 @@ def build_tenant_chat_model(
     settings: Settings | None = None,
     http_client: httpx.AsyncClient | None = None,
 ) -> OpenAIChatModel:
-    """Builds (or reuses) the chat model client for `tenant_id`, from that tenant's own gateway
-    credential -- never a process-wide key. Cached per tenant id: calling this twice for the same
-    `tenant_id` returns the exact same object; calling it for a different `tenant_id` always
-    returns a distinct one. Carries an explicit wall-clock deadline
+    """Builds (or reuses) the chat model client for `tenant_id` and `bare_model_name`, from that
+    tenant's own gateway credential -- never a process-wide key. The tenant's connection is
+    cached per tenant id: two calls for the same tenant share one client whatever the model
+    name, the same name twice returns the exact same model object, and a different `tenant_id`
+    always gets a distinct client. Carries an explicit wall-clock deadline
     (`ModelSettings.timeout` = `Settings.llm_call_timeout_seconds`), replacing the client
     library's multi-minute default.
 
     `http_client` is test-only (an already-configured `httpx.AsyncClient`, e.g. one backed by a
     `MockTransport`); production call sites never pass it.
     """
-    cached = _tenant_chat_models.get(tenant_id)
+    cached = _tenant_chat_models.get((tenant_id, bare_model_name))
     if cached is not None:
         return cached
     s = settings or get_settings()
@@ -131,48 +138,50 @@ def build_tenant_chat_model(
             "LITELLM_BASE_URL must be configured to build a per-tenant model client: a gateway "
             "credential is only valid against the gateway, never a raw provider endpoint."
         )
-    provider = OpenAIProvider(
-        base_url=s.litellm_base_url,
-        api_key=credential.get_secret_value(),
-        http_client=http_client,
-    )
+    provider = _tenant_providers.get(tenant_id)
+    if provider is None:
+        provider = OpenAIProvider(
+            base_url=s.litellm_base_url,
+            api_key=credential.get_secret_value(),
+            http_client=http_client,
+        )
+        _tenant_providers[tenant_id] = provider
     model = OpenAIChatModel(
         bare_model_name,
         provider=provider,
         settings=ModelSettings(timeout=s.llm_call_timeout_seconds),
     )
-    _tenant_chat_models[tenant_id] = model
+    _tenant_chat_models[(tenant_id, bare_model_name)] = model
     return model
 
 
 def reset_tenant_chat_model_cache() -> None:
     """Test-only: clears the per-tenant chat model cache between test cases."""
     _tenant_chat_models.clear()
+    _tenant_providers.clear()
 
 
-async def resolve_tenant_chat_model(
-    session: AsyncSession,
-    ctx: RequestContext,
-    model_name: str | None = None,
-    *,
-    settings: Settings | None = None,
+def resolve_tenant_chat_model(
+    record: TenantRecord, *, settings: Settings | None = None
 ) -> OpenAIChatModel:
-    """The per-tenant model-resolution entry point (ADR-0009, Spec 7 / #54).
+    """The per-tenant model-resolution entry point (ADR-0009, Spec 7 / #54) -- a function of the
+    tenant record and settings, with no database read of its own (#105).
 
-    In order: resolves the tenant's residency from the control plane (raising `ResidencyUnresolved`
-    if none is recorded -- ADR-0008 fails closed, no default), validates the requested model name
-    (or the deployment default) against that residency's allow-list -- raising
-    `ModelNotAllowedForResidency` before anything else happens -- then resolves the tenant's own
-    gateway credential and builds (or reuses) its cached client.
+    In order: the record's residency and its allow-listed route (`ResidencyUnresolved` if none
+    is recorded or the allow-list does not know it -- ADR-0008 fails closed, no default); the
+    model name -- the tenant's own `record.settings.model`, else the deployment default
+    `Settings.llm_model` -- validated against that residency's allow-list, raising
+    `ModelNotAllowedForResidency` before anything else happens (a rejected model never reaches
+    credential resolution); then the tenant's own gateway credential (the file
+    `record.gateway_credential_alias` names, `GatewayCredentialUnavailable` if either is missing)
+    and its cached client.
     """
     s = settings or get_settings()
-    residency = await ControlRepository().get_residency(session, ctx)
-    if residency is None:
-        raise ResidencyUnresolved(f"tenant {ctx.tenant_id} has no residency recorded")
-    name = model_name or s.llm_model
+    residency, _route = tenant_residency_route(record, settings=s)
+    name = record.settings.model or s.llm_model
     bare = validate_model_for_residency(name, residency, settings=s)
-    credential = await resolve_gateway_credential(session, ctx, settings=s)
-    return build_tenant_chat_model(ctx.tenant_id, bare, credential, settings=s)
+    credential = resolve_gateway_credential(record, settings=s)
+    return build_tenant_chat_model(record.tenant_id, bare, credential, settings=s)
 
 
 __all__ = [
