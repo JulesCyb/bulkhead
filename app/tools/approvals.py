@@ -16,7 +16,8 @@ stays exactly as thin as a reading tool, going through the repository layer and 
   even though its own ASGI tests belong to a later ticket (#42): an `agent`-role membership (no
   person present) may act only under an active standing grant for this exact tool, never through
   a pending action at all.
-- `resolve_incoming_decisions()` is called by `app/api/chat.py` itself, *before* the agent run,
+- `resolve_incoming_decisions()` is called by the chat run itself (`app.agents.run.PreparedRun.
+  chat`), *before* the agent run starts,
   for every approve/refuse decision the resumed request's own body carries
   (`VercelAIAdapter.deferred_tool_results`). This exists because a refusal is resolved by
   pydantic-ai substituting `ToolDenied` directly -- the tool's own `args_validator` and body never
@@ -245,7 +246,8 @@ async def resolve_incoming_decisions(
 ) -> None:
     """Resolves every pending action a resumed chat request's approve/refuse decisions name,
     recording the ADR-0007 `approved`/`refused` audit milestone for each. Called by
-    `app/api/chat.py` before the agent run itself -- see the module docstring for why a refusal
+    `app.agents.run.PreparedRun.chat` before the agent run itself -- see the module docstring for
+    why a refusal
     can only ever be recorded here, never from inside the tool.
 
     A decision naming no pending action in this tenant and conversation (an unknown or foreign

@@ -23,12 +23,10 @@ from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from app.api import chat as chat_module
 from app.context import RequestContext
 from app.db.session import tenant_session
 from app.main import app
 from app.repositories.standing_grants import StandingGrantRepository
-from tests.conftest import resolve_to_model
 
 pgserver = pytest.importorskip("pgserver")
 
@@ -188,7 +186,7 @@ def client() -> httpx.AsyncClient:
 
 
 async def test_agent_identity_without_a_standing_grant_is_refused_outright(
-    environment, client, monkeypatch
+    environment, client, use_model
 ):
     """AC1: an agent identity's context calling the writing tool with no active standing grant is
     refused outright -- no pending action is ever created, and no fallback to asking anyone -- and
@@ -206,7 +204,7 @@ async def test_agent_identity_without_a_standing_grant_is_refused_outright(
     )
 
     model = _rename_model(document_id=document_id, title=NEW_TITLE)
-    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(model))
+    use_model(model)
 
     async with client:
         response = await client.post(
@@ -230,7 +228,7 @@ async def test_agent_identity_without_a_standing_grant_is_refused_outright(
 
 
 async def test_agent_identity_with_a_standing_grant_executes_with_no_pending_action(
-    environment, client, monkeypatch
+    environment, client, use_model
 ):
     """AC2: the same agent-identity context succeeds once an active standing grant for that
     identity and tool exists, executes with no pending action ever created, and the audit record
@@ -257,7 +255,7 @@ async def test_agent_identity_with_a_standing_grant_executes_with_no_pending_act
     )
 
     model = _rename_model(document_id=document_id, title=NEW_TITLE)
-    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(model))
+    use_model(model)
 
     async with client:
         response = await client.post(
@@ -279,7 +277,7 @@ async def test_agent_identity_with_a_standing_grant_executes_with_no_pending_act
 
 
 async def test_agent_identity_is_refused_when_the_only_grant_names_a_different_tool(
-    environment, client, monkeypatch
+    environment, client, use_model
 ):
     """AC3: an agent-identity context is refused when the only active grant it holds names a
     different tool than the one being called."""
@@ -305,7 +303,7 @@ async def test_agent_identity_is_refused_when_the_only_grant_names_a_different_t
     )
 
     model = _rename_model(document_id=document_id, title=NEW_TITLE)
-    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(model))
+    use_model(model)
 
     async with client:
         response = await client.post(

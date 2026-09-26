@@ -163,16 +163,8 @@ async def test_chunked_body_over_the_cap_is_rejected_before_full_read():
     assert len(chunks_yielded) < total_chunks
 
 
-async def test_chunked_body_under_the_cap_still_succeeds(
-    monkeypatch, route_run, fake_search, fake_history
-):
-    from app.tools import conversations as conversation_tools
-    from app.tools import documents as document_tools
-
+async def test_chunked_body_under_the_cap_still_succeeds(route_run):
     route_run(TestModel(call_tools=["search_documents"]))
-    # The chat route still builds its own tool dependencies until #108.
-    monkeypatch.setattr(document_tools, "search_documents", fake_search)
-    monkeypatch.setattr(conversation_tools, "load_conversation_history", fake_history)
     payload = _chat_body_json(text_len=100)
 
     async def chunked_body() -> AsyncIterator[bytes]:

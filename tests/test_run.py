@@ -1,17 +1,21 @@
 """Unit tests of one prepared run (`app.agents.run`, spec A3 / #93, #107): preparation over a
-`RequestContext` carrying its tenant record, and the two one-shot execution methods, `answer` and
-`stream_text` -- with the model and the tool functions injected through `prepare_run`'s own
-collaborators, never a patched module attribute.
+`RequestContext` carrying its tenant record, the two one-shot execution methods, `answer` and
+`stream_text`, and the chat method, `chat(adapter)` (#108) -- with the model and the tool
+functions injected through `prepare_run`'s own collaborators, never a patched module attribute.
 
-The ASGI routes over the same module are covered in `tests/test_api.py`,
+The ASGI routes over the same module are covered in `tests/test_api.py`, `tests/test_chat.py`,
 `tests/test_request_limit.py`, `tests/test_content_tracing.py`, and
 `tests/test_residency_routing.py`.
 """
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
+import json
+import re
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 import pytest
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -21,6 +25,7 @@ from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.toolsets.function import FunctionToolset
+from pydantic_ai.ui.vercel_ai import VercelAIAdapter
 
 from app import observability
 from app.agents.assistant import chat_assistant, one_shot_assistant
@@ -156,6 +161,103 @@ async def test_answer_and_stream_text_bind_the_reading_only_agent(run_ctx, fake_
         assert all(tool_def.kind != "unapproved" for tool_def in info.function_tools)
 
 
+def _chat_adapter(*, agent, conversation_id: str = "conv-1") -> VercelAIAdapter:
+    """A Vercel AI SDK adapter over a one-message body, built without a request -- and bound to
+    whatever `agent` the caller names, to show that `chat` decides the agent itself."""
+    body = {
+        "id": conversation_id,
+        "trigger": "submit-message",
+        "messages": [{"id": "m1", "role": "user", "parts": [{"type": "text", "text": "hi"}]}],
+    }
+    return VercelAIAdapter(
+        agent=agent,
+        run_input=VercelAIAdapter.build_run_input(json.dumps(body).encode()),
+        sdk_version=6,
+    )
+
+
+async def test_only_chat_binds_the_writing_capable_agent(
+    run_ctx, fake_search, fake_history, fake_save
+):
+    """ADR-0007, the other half: `chat` runs the writing-capable agent -- the tool set it sends to
+    the model includes the approval-gated writing tool -- even when handed an adapter built with
+    the reading-only agent, since which agent runs is decided by the execution method, never by
+    the caller. The route-level mirror is `tests/test_api.py::
+    test_chat_endpoint_answers_through_chat_agent`."""
+    writing_tools = {
+        name
+        for name, tool in _function_toolset(chat_assistant).tools.items()
+        if tool.args_validator is require_approval
+    }
+    seen: list[AgentInfo] = []
+    prepared = await prepare_run(
+        run_ctx,
+        conversation_id="conv-1",
+        model_resolver=returning(_capturing_model(seen)),
+        search=fake_search,
+        load_history=fake_history,
+        save_run=fake_save,
+    )
+    response = await prepared.chat(_chat_adapter(agent=one_shot_assistant))
+    body = "".join([chunk async for chunk in response.body_iterator])
+
+    assert '"type":"error"' not in body
+    assert len(seen) == 1
+    names = {tool_def.name for tool_def in seen[0].function_tools}
+    assert names == set(_function_toolset(chat_assistant).tools)
+    assert writing_tools <= names
+
+
+async def test_chat_persists_the_run_even_if_the_response_is_never_read(
+    run_ctx, fake_search, fake_history
+):
+    """ADR-0006 (#34), at the module's own seam: the prepared run's new messages are persisted
+    once the run completes, even though nothing ever reads a byte of the response `chat`
+    returns -- the client decoupling lives in the run module, not in a route. Its ASGI mirror (a
+    client disconnecting mid-stream) is `tests/test_chat.py::
+    test_persistence_happens_even_when_the_response_is_not_fully_read`."""
+    persisted: list[tuple[str, list]] = []
+    saved = asyncio.Event()
+
+    async def _save(ctx, conversation_id, messages) -> None:
+        persisted.append((conversation_id, messages))
+        saved.set()
+
+    prepared = await prepare_run(
+        run_ctx,
+        conversation_id="conv-1",
+        model_resolver=returning(TestModel(call_tools=["search_documents"])),
+        search=fake_search,
+        load_history=fake_history,
+        save_run=_save,
+    )
+    await prepared.chat(_chat_adapter(agent=chat_assistant))
+
+    await asyncio.wait_for(saved.wait(), timeout=5)
+    [(conversation_id, messages)] = persisted
+    assert conversation_id == "conv-1"
+    assert messages
+
+
+async def test_chat_refuses_an_adapter_for_a_different_conversation(
+    run_ctx, fake_search, fake_history, history_calls
+):
+    """A run prepared for one conversation never runs against another's adapter: the approval
+    scope (`AssistantDeps.conversation_id`) and the history must name the same conversation, so
+    a mismatch is refused before any history is loaded."""
+    prepared = await prepare_run(
+        run_ctx,
+        conversation_id="conv-1",
+        model_resolver=returning(TestModel()),
+        search=fake_search,
+        load_history=fake_history,
+    )
+
+    with pytest.raises(ValueError, match="different conversation"):
+        await prepared.chat(_chat_adapter(agent=chat_assistant, conversation_id="conv-2"))
+    assert history_calls == []
+
+
 async def _prepare_limited(run_ctx, fake_search, model, **settings_overrides):
     settings = Settings(run_tool_calls_limit=2, run_request_limit=50, **settings_overrides)
     return await prepare_run(
@@ -238,3 +340,47 @@ async def test_every_span_of_either_execution_carries_the_runs_identifiers(
         assert span.attributes["tenant_id"] == str(ctx.tenant_id)
         assert span.attributes["identity_id"] == str(ctx.identity_id)
         assert span.attributes["request_id"] == ctx.request_id
+
+
+# --- No test patches a run's collaborators onto a module (spec A3 / #93, #108) ------------------
+
+_TESTS_DIR = Path(__file__).resolve().parent
+
+# Every way a test used to swap a run's model or tool functions by patching a module attribute
+# instead of injecting it through `prepare_run` / `set_run_collaborators_for_tests`: the retired
+# chat-route seam, the agent and chat modules' namespaces, and the three tool functions
+# `AssistantDeps` already carries as constructor input. The retired seam's name is assembled from
+# two halves so that a plain `grep -rn` for it over `tests/` and `app/` (#108's acceptance check)
+# finds nothing, this guard included.
+_RETIRED_CHAT_SEAM = "resolve_chat" + "_model"
+_RETIRED_PATCH_IDIOMS = (
+    re.compile(re.escape(_RETIRED_CHAT_SEAM)),
+    re.compile(r"setattr\(\s*(assistant_module|chat_module)\b"),
+    re.compile(r"setattr\(\s*(assistant_module\.)?document_tools,\s*\"search_documents\""),
+    re.compile(
+        r"setattr\(\s*(assistant_module\.)?conversation_tools,\s*"
+        r"\"(load_conversation_history|save_conversation_run)\""
+    ),
+)
+
+
+def test_no_test_patches_a_run_collaborator_onto_a_module() -> None:
+    offenders = []
+    for path in sorted(_TESTS_DIR.rglob("*.py")):
+        if path == Path(__file__).resolve():
+            continue
+        text = path.read_text(encoding="utf-8")
+        for idiom in _RETIRED_PATCH_IDIOMS:
+            for match in idiom.finditer(text):
+                offenders.append(f"{path.relative_to(_TESTS_DIR)}: {match.group(0)!r}")
+    assert offenders == [], offenders
+
+
+def test_the_chat_route_seam_is_gone_from_the_application() -> None:
+    app_dir = _TESTS_DIR.parent / "app"
+    offenders = [
+        str(path.relative_to(app_dir))
+        for path in sorted(app_dir.rglob("*.py"))
+        if _RETIRED_CHAT_SEAM in path.read_text(encoding="utf-8")
+    ]
+    assert offenders == [], offenders

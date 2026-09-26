@@ -40,7 +40,6 @@ from app.residency import ResidencyAllowList, ResidencyUnresolved
 from app.tenant_record import TenantRecord
 from app.tenant_settings import TenantSettings
 from app.token_verifier import set_default_adapter_for_tests
-from app.tools import conversations as conversation_tools
 from app.tools import documents as document_tools
 from tests.conftest import FakeControlPlaneReads
 
@@ -113,7 +112,7 @@ async def test_run_endpoint_uses_the_model_resolved_for_each_tenants_residency(
 
 
 async def test_chat_endpoint_uses_the_model_resolved_for_each_tenants_residency(
-    asgi_client, monkeypatch, route_run
+    asgi_client, route_run
 ):
     """The same claim, driven through `/api/chat` (the Vercel AI SDK adapter) instead of the
     one-shot endpoint."""
@@ -126,9 +125,7 @@ async def test_chat_endpoint_uses_the_model_resolved_for_each_tenants_residency(
     async def _fake_load_history(ctx, conversation_id):
         return []
 
-    route_run(model_resolver=_fake_resolve)
-    # The chat route still builds its own tool dependencies until #108.
-    monkeypatch.setattr(conversation_tools, "load_conversation_history", _fake_load_history)
+    route_run(model_resolver=_fake_resolve, load_history=_fake_load_history)
 
     async with asgi_client:
         response_eu = await asgi_client.post(
@@ -243,8 +240,9 @@ _TWO_EU_MODELS = ResidencyAllowList.from_data(
 
 
 @pytest.fixture
-def ran_with(monkeypatch, tmp_path) -> list[str]:
-    """Every bare model name a run was actually driven with, in order."""
+def ran_with(monkeypatch, tmp_path, route_run) -> list[str]:
+    """Every bare model name a run was actually driven with, in order. The real model resolver
+    runs (`route_run` installs no model); only the chat run's history loader is a fake."""
     from app import llm as llm_module
 
     (tmp_path / "acme-gateway-key").write_text("sk-acme-secret")
@@ -272,7 +270,7 @@ def ran_with(monkeypatch, tmp_path) -> list[str]:
     async def _no_history(ctx, conversation_id):
         return []
 
-    monkeypatch.setattr(conversation_tools, "load_conversation_history", _no_history)
+    route_run(load_history=_no_history)
     return seen
 
 

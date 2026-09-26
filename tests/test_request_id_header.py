@@ -15,10 +15,8 @@ import httpx
 import pytest
 from pydantic_ai.models.test import TestModel
 
-from app.api import chat as chat_module
 from app.context import RequestContext
 from app.main import app
-from app.tools import conversations as conversation_tools
 
 HEADER = "X-Request-Id"
 
@@ -73,16 +71,8 @@ async def test_stream_endpoint_carries_request_id_header(client, captured_ctx):
     assert header_value == captured_ctx[0].request_id
 
 
-async def test_chat_endpoint_carries_request_id_header(monkeypatch, fake_history):
-    from tests.conftest import resolve_to_model
-
-    monkeypatch.setattr(
-        chat_module,
-        "resolve_chat_model",
-        resolve_to_model(TestModel(call_tools=["search_documents"])),
-    )
-    # The chat route still builds its own tool dependencies until #108.
-    monkeypatch.setattr(conversation_tools, "load_conversation_history", fake_history)
+async def test_chat_endpoint_carries_request_id_header(route_run):
+    route_run(TestModel(call_tools=["search_documents"]))
     transport = httpx.ASGITransport(app=app)
     body = {
         "id": "conv-1",

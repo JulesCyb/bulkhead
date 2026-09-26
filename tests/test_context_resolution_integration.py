@@ -49,8 +49,6 @@ pgserver = pytest.importorskip("pgserver")
 
 import app.mcp.server as mcp_server  # noqa: E402
 from app import main as main_module  # noqa: E402
-from app.agents import assistant as assistant_module  # noqa: E402
-from app.api import chat as chat_module  # noqa: E402
 from app.config import Settings, get_settings  # noqa: E402
 from app.context import Means  # noqa: E402
 from app.context_resolution import FORBIDDEN_DETAIL  # noqa: E402
@@ -60,7 +58,6 @@ from app.operator.suspend import set_tenant_suspended  # noqa: E402
 from app.repositories.agent_credentials import AgentCredentialRepository  # noqa: E402
 from app.repositories.agent_identities import AgentIdentityRepository  # noqa: E402
 from app.token_verifier import set_default_adapter_for_tests  # noqa: E402
-from tests.conftest import resolve_to_model  # noqa: E402
 from tests.support import (  # noqa: E402
     SeededTenant,
     cluster,
@@ -169,7 +166,7 @@ async def _http_run(tenant_id: uuid.UUID, token: str) -> httpx.Response:
 
 
 async def test_http_person_reaches_the_tool_as_delegation_with_a_tenant_record(
-    environment, monkeypatch, test_model
+    environment, route_run, test_model
 ):
     """AC (a): the tool receives a context carrying the member's own identity, role `member`,
     delegation as the means (`("agent", "assistant")`), and a `tenant_record` -- resolved by
@@ -185,7 +182,7 @@ async def test_http_person_reaches_the_tool_as_delegation_with_a_tenant_record(
         captured["ctx"] = ctx
         return [_fixed_hit()]
 
-    monkeypatch.setattr(assistant_module.document_tools, "search_documents", fake_search)
+    route_run(search=fake_search)
 
     try:
         response = await _http_run(tenant.tenant_id, _person_token(tenant, role="member"))
@@ -314,9 +311,7 @@ async def test_mcp_agent_identity_reaches_the_tool_naming_its_credential(
 # --- (d) audit row: the actor is real; the means is only ever a context/span fact (#117) ---------
 
 
-async def test_writing_tool_approval_audit_row_names_the_acting_membership(
-    environment, monkeypatch
-):
+async def test_writing_tool_approval_audit_row_names_the_acting_membership(environment, use_model):
     """AC (d): drives one real writing-tool approval round-trip on `/api/chat`
     (`tests/test_writing_tool_approval_integration.py`'s own machinery -- a cheap, already-proven
     path, reused rather than rebuilt) against a seeded tenant, then reads the resulting
@@ -345,7 +340,7 @@ async def test_writing_tool_approval_audit_row_names_the_acting_membership(
     )
 
     model = _rename_model(document_id=document_id, title=NEW_TITLE)
-    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(model))
+    use_model(model)
 
     transport = httpx.ASGITransport(app=http_app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:

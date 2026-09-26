@@ -159,7 +159,10 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    writing tool is reachable only through `/api/chat`, where a conversation exists to resume
    against. The split lives in `app/agents/run.py`: `prepare_run(ctx)` assembles every run once
    (model, run limit, tracing, tool dependencies) and the execution method picks the agent —
-   `answer`/`stream_text` bind the reading-only `one_shot_assistant`; no route builds a run
+   `answer`/`stream_text` bind the reading-only `one_shot_assistant`, and only `chat(adapter)`
+   binds the writing-capable `chat_assistant`, after loading the server-held history, keeping
+   only the member-authored newest turn, and resolving incoming approve/refuse decisions, with
+   persistence on completion decoupled from the client (ADR-0006); no route builds a run
    itself. See ADR-0007 (accepted) and `docs/adr/0005-agent-identities.md`.
 5. **Integrations as MCP servers** (`app/mcp/server.py`) using the same functions from `app/tools/`.
    Two transports, one setting (`MCP_TRANSPORT`, ADR-0005): `stdio` (default) is development-only
