@@ -82,14 +82,16 @@ from app.tenant_settings import TenantSettings
 ISOLATION_TIERS = ("pooled", "dedicated")
 
 
-class UnrecognizedResidencyError(ValueError):
+class UnrecognizedResidencyError(ValueError, ResidencyUnresolved):
     """`residency` is not a key of `settings.residency_allow_list.residencies` -- rejected before
-    any write."""
+    any write. A `ResidencyUnresolved` like every other residency rejection (spec A4's "one
+    exception type" rule, code review 2026-09-26), and a `ValueError` for the operator CLI's
+    user-facing error handling."""
 
 
-class UnrecognizedModelError(ValueError):
+class UnrecognizedModelError(ValueError, ResidencyUnresolved):
     """`model` is not in the model allow-list for the requested residency -- rejected before any
-    write."""
+    write. A `ResidencyUnresolved` and a `ValueError`, like `UnrecognizedResidencyError`."""
 
 
 class UnrecognizedIsolationTierError(ValueError):
@@ -157,8 +159,9 @@ class CreateTenantResult:
 def _validate_residency(residency: str, settings: Settings) -> None:
     """Rejects an unrecognized residency before any write, via `route_for` (spec A4 / #111) --
     the operator tool's own `UnrecognizedResidencyError` (a `ValueError`, what the CLI's
-    user-facing error handling expects) wraps `app.residency.ResidencyUnresolved` rather than
-    re-implementing the lookup against `allow_list.residencies` itself.
+    user-facing error handling expects, and itself a `ResidencyUnresolved`) chains the allow-list's
+    own `ResidencyUnresolved` rather than re-implementing the lookup against
+    `allow_list.residencies` itself.
     """
     allow_list = settings.residency_allow_list
     assert allow_list is not None  # set by Settings construction

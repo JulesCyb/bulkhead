@@ -139,3 +139,27 @@ def test_residency_and_settings_are_read_from_the_record_only() -> None:
         if pattern.search(path.read_text())
     }
     assert found == set()
+
+
+@pytest.mark.parametrize(
+    ("residency", "model"), [("atlantis", None), ("eu", "not-an-allow-listed-model")]
+)
+async def test_operator_create_rejections_are_the_one_residency_exception_type(
+    settings, residency, model
+):
+    """Spec A4's "one exception type" rule (code review 2026-09-26): the operator `create`
+    command's own residency/model rejections are `ResidencyUnresolved` too -- and stay
+    `ValueError`s, which the operator CLI's error handling expects. Both reject before any write,
+    so no connection is needed."""
+    from app.operator.create import create_tenant
+
+    with pytest.raises(ResidencyUnresolved) as exc_info:
+        await create_tenant(
+            None,  # type: ignore[arg-type]  -- rejected before the connection is ever used
+            tenant_name="Rejected Co",
+            residency=residency,
+            admin_email="admin@example.test",
+            model=model,
+            settings=settings,
+        )
+    assert isinstance(exc_info.value, ValueError)
