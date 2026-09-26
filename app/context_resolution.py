@@ -31,13 +31,16 @@ tenant still from the path, suspension is still checked, and the means is still 
 `resolve_request_context` selects between the two by `settings.auth_mode`; it is the one function
 an adapter calls.
 
-Adapters (the FastAPI dependency `app.deps.get_context` today; the MCP middleware in #102) read
-their transport's inputs, call `resolve_request_context` (or `resolve_bearer_context` where only
-a bearer token makes sense), and render a `ContextRejection` in their transport's shape: its
-`status` is the HTTP status code, its `detail` the only thing a client may see, and a
-`FORBIDDEN` rejection is a security event the adapter logs with `reason`, tenant, `issuer`, and
-`request_id` -- never the token. Nothing outside this module builds a request's context
-(`tests/test_context_resolution.py` greps for it).
+Adapters -- the FastAPI dependency `app.deps.get_context` and the MCP ASGI middleware
+`app.mcp.server.MCPTenantAuthMiddleware` (#102) -- read their transport's inputs, call
+`resolve_request_context` (or `resolve_bearer_context` where only a bearer token makes sense, as
+MCP's does), and render a `ContextRejection` in their transport's shape: its `status` is the HTTP
+status code, its `detail` the only thing a client may see, and a `FORBIDDEN` rejection is a
+security event the adapter logs with `reason`, tenant, `issuer`, and `request_id` -- never the
+token. Nothing outside this module builds a request's context (`tests/test_context_resolution.py`
+greps for it) -- including the `stdio` transport's development-only environment identity
+(`resolve_stdio_env_context`, #102): `app.mcp.server`'s `_context_from_env` is a thin wrapper of
+it, so that construction site moves here too.
 
 `adapter` (`app.token_verifier.ControlPlaneReads`, #100) is the one seam for every control-plane
 read the chain makes -- identity, tenant auth settings (issuer and suspension), membership; it
@@ -80,6 +83,7 @@ __all__ = [
     "resolve_bearer_context",
     "resolve_dev_headers_context",
     "resolve_request_context",
+    "resolve_stdio_env_context",
 ]
 
 # Every forbidden rejection carries exactly this detail, whatever check failed -- the reason is
@@ -330,6 +334,26 @@ async def resolve_dev_headers_context(
     if rejection is not None:
         return rejection
     return _new_context(tenant_id, identity_id, roles, _DELEGATION, request_id)
+
+
+def resolve_stdio_env_context(settings: Settings) -> RequestContext:
+    """The `stdio` transport's development-only environment identity (ADR-0005, #102): a single,
+    process-wide `RequestContext` built from `MCP_TENANT_ID`/`MCP_IDENTITY_ID`, never per
+    connection -- `stdio` is a single local development client, unlike `streamable-http`'s one
+    context per connection (`resolve_bearer_context` above, via `actor_context`). No suspension
+    check and no means here: `app.mcp.server.resolve_context` (the MCP connection handler's own
+    entry point, #89) runs the suspension check itself for *both* the per-connection and this
+    stdio-fallback context, and a local developer's own tool calls carry no means to report.
+
+    `app.mcp.server`'s `_context_from_env` is a thin wrapper of this function -- kept under that
+    name for #89's own semantics (per-connection contextvar first, this fallback only under
+    `stdio`) -- so `RequestContext` is still constructed only inside this module
+    (`tests/test_context_resolution.py`'s construction-site allow-list)."""
+    if not (settings.mcp_tenant_id and settings.mcp_identity_id):
+        raise RuntimeError("Set MCP_TENANT_ID and MCP_IDENTITY_ID (development only).")
+    return RequestContext(
+        tenant_id=UUID(settings.mcp_tenant_id), identity_id=UUID(settings.mcp_identity_id)
+    )
 
 
 async def resolve_request_context(

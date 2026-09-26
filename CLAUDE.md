@@ -142,10 +142,12 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    Two transports, one setting (`MCP_TRANSPORT`, ADR-0005): `stdio` (default) is development-only
    — guarded like `AUTH_MODE=dev-headers`, identity from the process-wide `MCP_TENANT_ID`/
    `MCP_IDENTITY_ID` — and `streamable-http` is the production path, mounted at
-   `/v1/t/{tenant_id}/mcp` (ADR-0012) with per-connection identity from a verified bearer token
-   (`app.token_verifier`, the same module `app/deps.py` uses). A person's token resolves to
-   delegation; an agent identity's own credential (`/v1/t/{tenant_id}/agent-identities`,
-   `/agent-credentials`, `/agent-tokens`, admin-only to issue/revoke) resolves to autonomous use.
+   `/v1/t/{tenant_id}/mcp` (ADR-0012) with per-connection identity from
+   `app.context_resolution.resolve_bearer_context` (`app/mcp/server.py`'s
+   `MCPTenantAuthMiddleware` is only its adapter, exactly like `app/deps.py`'s HTTP one). A
+   person's token resolves to delegation; an agent identity's own credential
+   (`/v1/t/{tenant_id}/agent-identities`, `/agent-credentials`, `/agent-tokens`, admin-only to
+   issue/revoke) resolves to autonomous use.
    **Two independent algorithm/key settings, never one** (review finding): a person's token is
    checked against `JWT_VERIFICATION_KEY`/`JWT_ALGORITHM` (a real IdP's own, typically asymmetric,
    algorithm — this holds only its public key); an agent identity's token is minted by this
