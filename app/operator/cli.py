@@ -22,8 +22,9 @@ import os
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection
 
+from app.db.lifecycle import owner_engine
 from app.migration_settings import get_migration_settings
 from app.operator.audit import UNSCOPED_TENANT_ID, record_action
 from app.operator.create import create_tenant
@@ -157,39 +158,38 @@ _COMMANDS = {
 
 async def _run(command: str, args: argparse.Namespace) -> int:
     dsn = get_migration_settings().database_url_migrations.get_secret_value()
-    engine = create_async_engine(dsn)
     started_at = datetime.now(UTC)
     outcome = "error"
     target_tenant_id: UUID | None = None
     error: str | None = None
     exit_code = 1
-    try:
-        async with engine.begin() as conn:
-            outcome, target_tenant_id = await _COMMANDS[command](conn, args)
-        exit_code = 0
-    except Exception as exc:  # noqa: BLE001 - recorded below, then re-raised as a nonzero exit
-        # A lookup failure (TenantNotFoundError/AmbiguousTenantNameError) never resolved a real
-        # tenant, so `target_tenant_id` stays None here -- the sentinel below is the only honest
-        # target id for this row, same as any other failure.
-        error = f"{type(exc).__name__}: {exc}"
-        outcome = "error"
-    finally:
-        finished_at = datetime.now(UTC)
-        async with engine.begin() as audit_conn:
-            await record_action(
-                audit_conn,
-                operator=_operator_identity(),
-                command=command,
-                target_tenant_id=(
-                    target_tenant_id if target_tenant_id is not None else UNSCOPED_TENANT_ID
-                ),
-                args=vars(args),
-                outcome=outcome,
-                started_at=started_at,
-                finished_at=finished_at,
-                error=error,
-            )
-        await engine.dispose()
+    async with owner_engine(dsn) as engine:
+        try:
+            async with engine.begin() as conn:
+                outcome, target_tenant_id = await _COMMANDS[command](conn, args)
+            exit_code = 0
+        except Exception as exc:  # noqa: BLE001 - recorded below, then re-raised as a nonzero exit
+            # A lookup failure (TenantNotFoundError/AmbiguousTenantNameError) never resolved a
+            # real tenant, so `target_tenant_id` stays None here -- the sentinel below is the
+            # only honest target id for this row, same as any other failure.
+            error = f"{type(exc).__name__}: {exc}"
+            outcome = "error"
+        finally:
+            finished_at = datetime.now(UTC)
+            async with engine.begin() as audit_conn:
+                await record_action(
+                    audit_conn,
+                    operator=_operator_identity(),
+                    command=command,
+                    target_tenant_id=(
+                        target_tenant_id if target_tenant_id is not None else UNSCOPED_TENANT_ID
+                    ),
+                    args=vars(args),
+                    outcome=outcome,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    error=error,
+                )
     if error is not None:
         print(f"error: {error}")
     return exit_code

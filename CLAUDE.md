@@ -116,7 +116,14 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    The app connects as `app` (no superuser, `NOBYPASSRLS`); migrations and the operator tool
    (`app/operator/`, `scripts/operator.py`) run as the separate `app_owner` role (no superuser,
    `NOBYPASSRLS`, owns every object) via `DATABASE_URL_MIGRATIONS` — a DSN the API container's
-   own configuration never holds.
+   own configuration never holds. `app/repositories/control.py` (`ControlRepository`) is the only
+   module that issues SQL against the `control` schema, on either role's session — its owner-role
+   side (spec A5 / #113: `create_tenant_record`, `set_suspended`, `read_gateway_credential_alias`/
+   `write_gateway_credential_alias`, `enumerate_referenced_aliases`, `get_record`, behind the one
+   private `_set_owner_tenant_context` forced-RLS helper) is what the session router, the guard,
+   and the migration runner now read through; the operator commands and
+   `app/gateway_provisioning.py` still carry their own inline copies of that SQL until #114
+   rewires them onto it too.
 4. **Agents access data only through tools** (`app/tools/`) that check the context and return only
    what is needed. Never a DB connection or credentials to the model. **Every writing tool
    requires approval** (ADR-0007, Spec 5): mark it with `args_validator=require_approval`
