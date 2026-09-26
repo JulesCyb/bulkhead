@@ -22,8 +22,9 @@ choice against, so a credential is never minted for a model the allow-list itsel
 `provision_gateway_credential` itself raises if that list is empty, so this function does not
 re-check it.
 
-Where the two tiers diverge is the admin membership (#71, ADR-0002): a pooled tenant's first
-admin membership is written to this same pooled connection, exactly as before; a dedicated
+Where the two tiers diverge is the admin membership (#71, ADR-0002), written in both cases
+through `app.repositories.memberships.ensure_membership` (code review 2026-09-26): a pooled
+tenant's first admin membership is written to this same pooled connection; a dedicated
 tenant's can only ever live in its own database (routing sends every one of its requests there,
 never to the pooled one -- see `tests/test_tenant_session_routing_integration.py`), so it is
 written by `app.operator.dedicated_db.ensure_dedicated_admin_membership` against that database's
@@ -58,7 +59,6 @@ import uuid
 from dataclasses import dataclass
 from uuid import UUID
 
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from app.config import Settings, get_settings
@@ -75,6 +75,7 @@ from app.operator.dedicated_db import (
 )
 from app.operator.lookup import TenantNotFoundError, resolve_tenant
 from app.repositories.control import ControlRepository, IdentityRepository
+from app.repositories.memberships import ensure_membership
 from app.residency import ResidencyUnresolved
 from app.tenant_settings import TenantSettings
 
@@ -193,30 +194,6 @@ def _validate_isolation_tier(isolation_tier: str) -> None:
         )
 
 
-async def _ensure_pooled_admin_membership(
-    conn: AsyncConnection, tenant_id: UUID, identity_id: UUID
-) -> str:
-    """A pooled tenant's first admin membership lives on this same pooled connection (#71,
-    ADR-0002) -- unlike a dedicated tenant's, which `ensure_dedicated_admin_membership` writes
-    against that tenant's own database instead. `memberships` is not the control schema (no
-    repository function covers it, and none is needed: RLS already scopes it, and this insert
-    needs no forced-RLS workaround), so it stays this module's own small helper rather than a
-    repository method."""
-    existing = (
-        await conn.execute(
-            text("SELECT id FROM memberships WHERE tenant_id = :tid AND identity_id = :iid"),
-            {"tid": tenant_id, "iid": identity_id},
-        )
-    ).first()
-    if existing is not None:
-        return "already exists"
-    await conn.execute(
-        text("INSERT INTO memberships (tenant_id, identity_id, role) VALUES (:tid, :iid, 'admin')"),
-        {"tid": tenant_id, "iid": identity_id},
-    )
-    return "created"
-
-
 async def create_tenant(
     conn: AsyncConnection,
     *,
@@ -296,7 +273,10 @@ async def create_tenant(
         existing_alias = None
 
     # Admin identity + first membership (ADR-0003). `control.identities` has no tenant_id/RLS
-    # (0003) -- the upsert needs no tenant context, only the membership insert below does.
+    # (0003), so the upsert needs no tenant context. The membership does (forced RLS): on the
+    # pooled path it is the one `get_record`/`create_tenant_record` above already set on this
+    # transaction through the control repository's forced-RLS helper; on the dedicated path
+    # `ensure_dedicated_admin_membership` sets it against the tenant's own database.
     identity_id = await IdentityRepository().upsert(
         conn, id=uuid.uuid4(), issuer=issuer, subject=subject, email=admin_email
     )
@@ -322,7 +302,9 @@ async def create_tenant(
             admin_email=admin_email,
         )
     else:
-        membership_outcome = await _ensure_pooled_admin_membership(conn, tenant_id, identity_id)
+        membership_outcome = await ensure_membership(
+            conn, tenant_id=tenant_id, identity_id=identity_id, role="admin"
+        )
 
     # Gateway credential (Spec 7 / #53, ADR-0009, ADR-0011): minted, written to a secret file, and
     # recorded by alias in one call -- `provision_gateway_credential` itself raises if the
