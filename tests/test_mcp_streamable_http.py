@@ -520,7 +520,7 @@ async def test_two_concurrent_connections_each_see_only_their_own_tenant(monkeyp
     assert seen_by_tenant[tenant_a].tenant_id != seen_by_tenant[tenant_b].tenant_id
 
 
-async def test_real_wire_protocol_rejects_an_unlisted_host_header(monkeypatch, mcp_app_real):
+async def test_real_wire_protocol_rejects_an_unlisted_host_header(mcp_app_real):
     """Issue #116: `build_streamable_http_app` now passes `MCP_ALLOWED_HOSTS` through as the SDK's
     `TransportSecuritySettings.allowed_hosts` -- a Host header outside that list is rejected by the
     SDK's own DNS-rebinding middleware (421), proving the allow-list is actually enforced and not
@@ -529,7 +529,6 @@ async def test_real_wire_protocol_rejects_an_unlisted_host_header(monkeypatch, m
     tenant_id = uuid.uuid4()
     identity_id = uuid.uuid4()
     _install_fake_control_plane(
-        monkeypatch,
         auth_settings={tenant_id: (HUMAN_ISSUER, False)},
         identities={(HUMAN_ISSUER, "sub-1"): identity_id},
         memberships={(tenant_id, identity_id): "member"},
