@@ -292,6 +292,13 @@ class ApprovalAuditEvent(Base):
     `seq` is a database-generated identity column used only for ordering (see migration 0035's
     docstring for why `created_at` alone cannot be trusted to order events written in the same
     transaction).
+
+    `means_kind`/`means_id` (migration 0042, #117) are a second, distinct fact from
+    `pending_action_id`/`standing_grant_id` above: those name the *approval* means (which pending
+    action or standing grant authorized the write); these name the *delegation* means (ADR-0005) --
+    whether the request was a person acting through the assistant or an agent identity acting on
+    its own credential. Both nullable: a context with no means attached (a test, the `stdio`
+    development fallback) writes both null.
     """
 
     __tablename__ = "approval_audit_events"
@@ -312,5 +319,9 @@ class ApprovalAuditEvent(Base):
     actor_membership_id: Mapped[UUID] = mapped_column(ForeignKey("memberships.id"))
     pending_action_id: Mapped[UUID | None] = mapped_column(PGUUID(as_uuid=True), nullable=True)
     standing_grant_id: Mapped[UUID | None] = mapped_column(PGUUID(as_uuid=True), nullable=True)
+    # The delegation means (ADR-0005, migration 0042, #117) -- distinct from the approval means
+    # (pending_action_id/standing_grant_id) above. Null when the writing context carried none.
+    means_kind: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    means_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     details: Mapped[dict] = mapped_column(JSONB, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

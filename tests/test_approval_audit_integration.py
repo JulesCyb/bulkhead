@@ -6,8 +6,10 @@ Proves what a unit test on `ApprovalAuditRepository` alone cannot: that writing 
 each of the seven milestone kinds really succeeds against live Postgres, that the RLS policy from
 migration 0035 isolates one tenant's audit trail from another's, that the `app` role's own grants
 (SELECT, INSERT -- no UPDATE/DELETE) make append-only a database-enforced fact and not just a
-convention, and that a tenant-scoped read of one pending action's or standing grant's milestones
-comes back most-recent-first.
+convention, that a tenant-scoped read of one pending action's or standing grant's milestones comes
+back most-recent-first, and (migration 0042, #117) that `record()` persists the delegation means
+it reads off `ctx.means` -- or nulls, for a context that carries none -- as its own two columns,
+distinct from the approval means (`pending_action_id`/`standing_grant_id`) already covered above.
 """
 
 from __future__ import annotations
@@ -292,3 +294,126 @@ async def test_read_for_one_standing_grant_orders_most_recent_first(environment)
         )
 
     assert [record.id for record in listing] == [second.id, first.id]
+
+
+# --- #117: the delegation means (ADR-0005), read from `ctx.means`, distinct from the approval
+# means (`pending_action_id`/`standing_grant_id`) already proven above -----------------------------
+
+
+async def test_record_persists_the_delegation_means_when_the_context_carries_one(environment):
+    """`record()` reads `ctx.means` itself -- built here through `SeededTenant.ctx(role,
+    means=...)`, the same helper a real HTTP/MCP-resolved context would have gone through -- and
+    persists it as `means_kind`/`means_id`, distinct from (and set alongside) the approval means."""
+    tenant = await seed_tenant(environment, via_operator=False, roles=["member"])
+    member_membership = tenant.memberships["member"]
+    ctx = tenant.ctx("member", means=("agent", "assistant"))
+    repo = ApprovalAuditRepository()
+    pending_action_id = uuid.uuid4()
+
+    async with tenant_session(ctx) as session:
+        record = await repo.record(
+            session,
+            ctx,
+            kind=REQUESTED,
+            tool_name="send_invoice",
+            actor_membership_id=member_membership,
+            pending_action_id=pending_action_id,
+        )
+
+    assert record.means_kind == "agent"
+    assert record.means_id == "assistant"
+    assert record.pending_action_id == pending_action_id  # the approval means, untouched
+
+
+async def test_record_persists_a_credential_delegation_means(environment):
+    """The other `MeansKind` (ADR-0005): an agent identity acting on its own credential."""
+    tenant = await seed_tenant(environment, via_operator=False, roles=["agent"])
+    agent_membership = tenant.memberships["agent"]
+    ctx = tenant.ctx("agent", means=("credential", "cred_abc123"))
+    repo = ApprovalAuditRepository()
+
+    async with tenant_session(ctx) as session:
+        record = await repo.record(
+            session,
+            ctx,
+            kind=EXECUTED,
+            tool_name="send_invoice",
+            actor_membership_id=agent_membership,
+        )
+
+    assert record.means_kind == "credential"
+    assert record.means_id == "cred_abc123"
+
+
+async def test_record_persists_null_means_when_the_context_carries_none(environment):
+    """A context built without `means=` (a test, the `stdio` development fallback) records both
+    columns null -- allowed, not an error."""
+    tenant = await seed_tenant(environment, via_operator=False, roles=["member"])
+    member_membership = tenant.memberships["member"]
+    ctx = tenant.ctx("member")
+    repo = ApprovalAuditRepository()
+
+    async with tenant_session(ctx) as session:
+        record = await repo.record(
+            session,
+            ctx,
+            kind=REQUESTED,
+            tool_name="send_invoice",
+            actor_membership_id=member_membership,
+        )
+
+    assert record.means_kind is None
+    assert record.means_id is None
+
+
+async def test_list_for_pending_action_exposes_the_persisted_means(environment):
+    """`ApprovalAuditRecord` returned by `list_for_pending_action` carries the same
+    `means_kind`/`means_id` the row was written with."""
+    tenant = await seed_tenant(environment, via_operator=False, roles=["member"])
+    member_membership = tenant.memberships["member"]
+    ctx = tenant.ctx("member", means=("agent", "assistant"))
+    repo = ApprovalAuditRepository()
+    pending_action_id = uuid.uuid4()
+
+    async with tenant_session(ctx) as session:
+        await repo.record(
+            session,
+            ctx,
+            kind=REQUESTED,
+            tool_name="send_invoice",
+            actor_membership_id=member_membership,
+            pending_action_id=pending_action_id,
+        )
+        listing = await repo.list_for_pending_action(
+            session, ctx, pending_action_id=pending_action_id
+        )
+
+    assert len(listing) == 1
+    assert listing[0].means_kind == "agent"
+    assert listing[0].means_id == "assistant"
+
+
+async def test_list_for_standing_grant_exposes_the_persisted_means(environment):
+    """The same, for `list_for_standing_grant`."""
+    tenant = await seed_tenant(environment, via_operator=False, roles=["agent"])
+    agent_membership = tenant.memberships["agent"]
+    ctx = tenant.ctx("agent", means=("credential", "cred_xyz789"))
+    repo = ApprovalAuditRepository()
+    standing_grant_id = uuid.uuid4()
+
+    async with tenant_session(ctx) as session:
+        await repo.record(
+            session,
+            ctx,
+            kind=EXECUTED,
+            tool_name="send_invoice",
+            actor_membership_id=agent_membership,
+            standing_grant_id=standing_grant_id,
+        )
+        listing = await repo.list_for_standing_grant(
+            session, ctx, standing_grant_id=standing_grant_id
+        )
+
+    assert len(listing) == 1
+    assert listing[0].means_kind == "credential"
+    assert listing[0].means_id == "cred_xyz789"

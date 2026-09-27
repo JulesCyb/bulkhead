@@ -174,6 +174,30 @@ async def _audit_kinds_for_tenant(url: str, *, tenant_id: uuid.UUID) -> list[str
     return list(rows)
 
 
+async def _audit_events_for_tenant(url: str, *, tenant_id: uuid.UUID) -> list[dict]:
+    """Like `_audit_kinds_for_tenant`, plus the delegation means (#117: `means_kind`/`means_id`)
+    each row was written with -- read straight from the table, not through the repository, so a
+    reader who does not trust `ApprovalAuditRepository`'s own mapping still gets an independent
+    check."""
+    engine = create_async_engine(url)
+    async with engine.connect() as conn:
+        rows = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT kind, means_kind, means_id FROM approval_audit_events "
+                        "WHERE tenant_id = :tid ORDER BY seq"
+                    ),
+                    {"tid": tenant_id},
+                )
+            )
+            .mappings()
+            .all()
+        )
+    await engine.dispose()
+    return [dict(row) for row in rows]
+
+
 def _resolved(messages, tool_call_id: str) -> bool:
     for message in messages:
         for part in getattr(message, "parts", []):
@@ -392,6 +416,49 @@ async def test_approving_executes_exactly_once_and_response_reflects_the_change(
 
     kinds = await _audit_kinds_for_tenant(environment.superuser_url, tenant_id=tenant.tenant_id)
     assert kinds == ["requested", "approved", "executed"]
+
+
+async def test_writing_tool_approval_audit_rows_carry_the_delegation_means(
+    environment, client, use_model
+):
+    """#117: every row this round trip writes carries the delegation means (ADR-0005) read from
+    the context that produced it. A person's request -- under either `AUTH_MODE` value -- always
+    runs as delegation (`("agent", "assistant")`, `app/context_resolution.py`'s
+    `resolve_dev_headers_context`/`resolve_bearer_context`), so `requested` and `executed` (the
+    two milestones this ticket's acceptance criteria name) both carry it. Restores the acceptance
+    criterion Spec A1 originally asked for and #117's own brief calls out."""
+    tenant = await seed_tenant(environment, roles=["member"], via_operator=False)
+    identity_id = tenant.identities["member"]
+    await seed_conversation(
+        environment,
+        tenant_id=tenant.tenant_id,
+        identity_id=identity_id,
+        conversation_id=CONVERSATION_ID,
+    )
+    document_id = await seed_document(
+        environment, tenant_id=tenant.tenant_id, identity_id=identity_id, title=ORIGINAL_TITLE
+    )
+
+    model = _rename_model(document_id=document_id, title=NEW_TITLE)
+    use_model(model)
+
+    async with client:
+        await _propose(client, tenant.tenant_id, identity_id)
+        await _resume(
+            client,
+            tenant.tenant_id,
+            identity_id,
+            document_id=document_id,
+            title=NEW_TITLE,
+            approved=True,
+        )
+
+    events = await _audit_events_for_tenant(environment.superuser_url, tenant_id=tenant.tenant_id)
+    by_kind = {event["kind"]: event for event in events}
+    assert by_kind["requested"]["means_kind"] == "agent"
+    assert by_kind["requested"]["means_id"] == "assistant"
+    assert by_kind["executed"]["means_kind"] == "agent"
+    assert by_kind["executed"]["means_id"] == "assistant"
 
 
 async def test_refusing_never_executes_and_the_conversation_continues(

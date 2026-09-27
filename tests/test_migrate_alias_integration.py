@@ -12,6 +12,7 @@ from __future__ import annotations
 import uuid
 
 import pytest
+from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy import text
@@ -196,3 +197,47 @@ def test_an_in_process_migration_run_leaves_existing_loggers_enabled(migrate_env
         assert collector.messages == ["still here"]
     finally:
         survivor.removeHandler(collector)
+
+
+def test_0042_downgrade_then_upgrade_touches_exactly_the_two_delegation_means_columns(
+    migrate_env,
+):
+    """#117 AC: migration 0042 applies cleanly (`migrate_all()` already brings a fresh database
+    all the way through it, proving the "fresh database" half); this proves the other half -- a
+    real `alembic downgrade -1` from head removes exactly `means_kind`/`means_id` from
+    `approval_audit_events` and nothing else, and `upgrade head` restores exactly those two columns
+    (an already-at-0041 database upgrading cleanly is the same code path a fresh database's own
+    walk through every revision, 0042 included, already exercises)."""
+    migrate_module.migrate_all()
+    pooled = migrate_env["pooled"]
+
+    config = Config(str(migrate_module._ALEMBIC_INI))
+    config.set_main_option("script_location", str(migrate_module._REPO_ROOT / "migrations"))
+    config.attributes["migration_database_url"] = pooled.owner_url
+
+    async def _columns() -> set[str]:
+        engine = create_async_engine(pooled.owner_url)
+        try:
+            async with engine.connect() as conn:
+                rows = (
+                    await conn.execute(
+                        text(
+                            "SELECT column_name FROM information_schema.columns "
+                            "WHERE table_name = 'approval_audit_events'"
+                        )
+                    )
+                ).scalars()
+                return set(rows.all())
+        finally:
+            await engine.dispose()
+
+    before = migrate_module.asyncio.run(_columns())
+    assert {"means_kind", "means_id"} <= before
+
+    command.downgrade(config, "-1")
+    after_downgrade = migrate_module.asyncio.run(_columns())
+    assert after_downgrade == before - {"means_kind", "means_id"}
+
+    command.upgrade(config, "head")
+    after_upgrade = migrate_module.asyncio.run(_columns())
+    assert after_upgrade == before

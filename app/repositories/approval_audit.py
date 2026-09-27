@@ -15,6 +15,17 @@ removed, only ever added to.
 The seven milestone kinds the approval mechanism can reach (ADR-0007, ticket #39) are the module
 constants below and nothing else -- `record()` refuses any other string outright, the same
 fail-closed posture `PendingActionRepository.verify()` takes for its own checks.
+
+**Two distinct facts named "means" live on the same row (migration 0042, #117); never conflate
+them.** `pending_action_id`/`standing_grant_id` are the *approval* means -- which specific pending
+action or standing grant authorized this write. `means_kind`/`means_id` are the *delegation*
+means (ADR-0005) -- whether the request driving this milestone was a person acting through the
+assistant (`("agent", "assistant")`) or an agent identity acting on its own credential
+(`("credential", <public id>)`). `record()` reads the delegation means from `ctx.means` itself,
+the same posture rule 1b (CLAUDE.md) takes for `app.identity_id`: no caller passes it, and no
+caller can therefore write a means the context does not actually carry. A context with no means
+(a test built without `means=`, the `stdio` development fallback) writes both columns null --
+that is the expected, unremarkable value, not an error.
 """
 
 from __future__ import annotations
@@ -56,6 +67,8 @@ class ApprovalAuditRecord:
     actor_membership_id: UUID
     pending_action_id: UUID | None
     standing_grant_id: UUID | None
+    means_kind: str | None
+    means_id: str | None
     details: dict[str, Any]
     created_at: datetime
 
@@ -68,6 +81,8 @@ def _to_record(event: ApprovalAuditEvent) -> ApprovalAuditRecord:
         actor_membership_id=event.actor_membership_id,
         pending_action_id=event.pending_action_id,
         standing_grant_id=event.standing_grant_id,
+        means_kind=event.means_kind,
+        means_id=event.means_id,
         details=event.details,
         created_at=event.created_at,
     )
@@ -91,7 +106,13 @@ class ApprovalAuditRepository:
         same fail-closed shape `PendingActionRepository.verify()` uses. `actor_membership_id`
         names the membership the milestone is about (the asking/approving/refusing member, or
         the agent identity's own membership for an autonomous attempt); `pending_action_id`/
-        `standing_grant_id` name the specific record behind it, where one exists."""
+        `standing_grant_id` name the specific approval record behind it, where one exists (the
+        *approval* means).
+
+        The row's *delegation* means (ADR-0005, #117) is read from `ctx.means` here, not taken as
+        an argument: `means_kind`/`means_id` are set to `ctx.means.kind`/`ctx.means.id`, or both
+        null when `ctx.means is None` -- see the module docstring for why the two facts stay on
+        separate columns rather than folding one into the other."""
         if kind not in KINDS:
             raise InvalidAuditEventKind(f"unknown approval audit event kind: {kind!r}")
 
@@ -102,6 +123,8 @@ class ApprovalAuditRepository:
             actor_membership_id=actor_membership_id,
             pending_action_id=pending_action_id,
             standing_grant_id=standing_grant_id,
+            means_kind=ctx.means.kind if ctx.means is not None else None,
+            means_id=ctx.means.id if ctx.means is not None else None,
             details=details or {},
         )
         session.add(event)
