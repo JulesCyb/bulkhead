@@ -28,30 +28,47 @@ COMPOSE_YAML_TEXT = (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8
 DIGEST_RE = re.compile(r"@sha256:[0-9a-f]{64}$")
 
 
-def _dockerfile_from_lines() -> list[str]:
-    """Every `FROM` instruction's image reference, skipping a `FROM <stage>` that refers back to
-    an earlier `AS <stage>` build stage rather than pulling an image."""
+COPY_FROM_RE = re.compile(r"^COPY\s+--from=(\S+)\s")
+
+
+def _dockerfile_image_references() -> list[tuple[str, str]]:
+    """Every external image reference the Dockerfile pulls -- `FROM <image>` *and*
+    `COPY --from=<image>` alike -- paired with a label for error messages, in the order they
+    appear. A `FROM <stage>`/`COPY --from=<stage>` that names an earlier `AS <stage>` build stage
+    is not an image pull and is excluded."""
     stage_names: set[str] = set()
-    refs: list[str] = []
+    refs: list[tuple[str, str]] = []
     for raw_line in DOCKERFILE.splitlines():
         line = raw_line.strip()
-        if not line.upper().startswith("FROM "):
+        if line.upper().startswith("FROM "):
+            parts = line.split()
+            # FROM <image> [AS <stage>]
+            image_ref = parts[1]
+            if image_ref not in stage_names:
+                refs.append(("FROM", image_ref))
+            if len(parts) >= 4 and parts[2].upper() == "AS":
+                stage_names.add(parts[3])
             continue
-        parts = line.split()
-        # FROM <image> [AS <stage>]
-        image_ref = parts[1]
-        if image_ref not in stage_names:
-            refs.append(image_ref)
-        if len(parts) >= 4 and parts[2].upper() == "AS":
-            stage_names.add(parts[3])
+        match = COPY_FROM_RE.match(line)
+        if match:
+            image_ref = match.group(1)
+            if image_ref not in stage_names:
+                refs.append(("COPY --from", image_ref))
     return refs
 
 
-def test_dockerfile_from_instructions_are_digest_pinned() -> None:
-    refs = _dockerfile_from_lines()
-    assert refs, "no FROM instruction found in Dockerfile"
-    for ref in refs:
-        assert DIGEST_RE.search(ref), f"FROM image {ref!r} is not pinned with @sha256:<digest>"
+def test_dockerfile_image_references_are_digest_pinned() -> None:
+    """Every external image this Dockerfile pulls must carry a digest -- not just its `FROM`
+    base image, but every `COPY --from=<image>` reference too (issue #80 follow-up: "every
+    base/service image" includes the `uv` binary pulled via `COPY --from=ghcr.io/astral-sh/uv`).
+    A `COPY --from=<stage>` naming an earlier build stage, not an image, is excluded."""
+    refs = _dockerfile_image_references()
+    assert refs, "no image references found in Dockerfile"
+    kinds = {kind for kind, _ in refs}
+    assert "FROM" in kinds, "expected at least one FROM instruction"
+    assert "COPY --from" in kinds, "expected at least one COPY --from=<image> instruction"
+    for kind, ref in refs:
+        assert DIGEST_RE.search(ref), f"{kind} image {ref!r} is not pinned with @sha256:<digest>"
 
 
 def test_dockerfile_uv_sync_uses_locked_with_no_fallback() -> None:
