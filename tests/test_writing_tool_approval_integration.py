@@ -27,6 +27,7 @@ titled document) goes straight through `tests.support`'s `seed_tenant`/`seed_con
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 
@@ -112,6 +113,16 @@ async def _set_pending_action_expiry_in_the_past(url: str, *, tenant_id: uuid.UU
     await engine.dispose()
 
 
+async def _set_pending_action_status(url: str, *, tenant_id: uuid.UUID, status: str) -> None:
+    engine = create_async_engine(url)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE pending_actions SET status = :status WHERE tenant_id = :tid"),
+            {"status": status, "tid": tenant_id},
+        )
+    await engine.dispose()
+
+
 async def _tamper_stored_tool_call_args(
     url: str, *, tenant_id: uuid.UUID, tool_call_id: str, new_args: dict
 ) -> None:
@@ -172,6 +183,30 @@ async def _audit_kinds_for_tenant(url: str, *, tenant_id: uuid.UUID) -> list[str
         )
     await engine.dispose()
     return list(rows)
+
+
+async def _audit_events_for_tenant(url: str, *, tenant_id: uuid.UUID) -> list[dict]:
+    """Like `_audit_kinds_for_tenant`, plus the delegation means (#117: `means_kind`/`means_id`)
+    each row was written with -- read straight from the table, not through the repository, so a
+    reader who does not trust `ApprovalAuditRepository`'s own mapping still gets an independent
+    check."""
+    engine = create_async_engine(url)
+    async with engine.connect() as conn:
+        rows = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT kind, means_kind, means_id FROM approval_audit_events "
+                        "WHERE tenant_id = :tid ORDER BY seq"
+                    ),
+                    {"tid": tenant_id},
+                )
+            )
+            .mappings()
+            .all()
+        )
+    await engine.dispose()
+    return [dict(row) for row in rows]
 
 
 def _resolved(messages, tool_call_id: str) -> bool:
@@ -393,6 +428,162 @@ async def test_approving_executes_exactly_once_and_response_reflects_the_change(
     kinds = await _audit_kinds_for_tenant(environment.superuser_url, tenant_id=tenant.tenant_id)
     assert kinds == ["requested", "approved", "executed"]
 
+    # #82: the pending action itself records that it ran -- `verify()` requires `approved`, so
+    # it can never verify (and run) a second time.
+    rows = await _pending_action_rows(environment.superuser_url, tenant_id=tenant.tenant_id)
+    assert [row["status"] for row in rows] == ["executed"]
+
+
+async def test_two_concurrent_approving_resumes_execute_the_write_exactly_once(
+    environment, client, use_model, monkeypatch
+):
+    """#122: two resumes approving the same tool call, sent concurrently, execute the write
+    exactly once. The approval is claimed atomically (`approved -> executing`) in the same
+    transaction that verifies it, so only one resume may run the tool; the other is denied with
+    `status_executing` -- a 200 whose stream shows the denial, never a 5xx -- and records nothing.
+    Before the fix both passed verification and the trail read `requested, approved, executed,
+    executed`."""
+    from app.repositories.documents import DocumentRepository
+
+    tenant = await seed_tenant(environment, roles=["member"], via_operator=False)
+    identity_id = tenant.identities["member"]
+    await seed_conversation(
+        environment,
+        tenant_id=tenant.tenant_id,
+        identity_id=identity_id,
+        conversation_id=CONVERSATION_ID,
+    )
+    document_id = await seed_document(
+        environment, tenant_id=tenant.tenant_id, identity_id=identity_id, title=ORIGINAL_TITLE
+    )
+    use_model(_rename_model(document_id=document_id, title=NEW_TITLE))
+
+    # The repository-level write itself, observed (not replaced): the title alone cannot tell one
+    # rename from two, since both would write the same value.
+    renames: list[uuid.UUID] = []
+    real_rename = DocumentRepository.rename
+
+    async def counting_rename(self, session, ctx, *, document_id, title):
+        renames.append(document_id)
+        return await real_rename(self, session, ctx, document_id=document_id, title=title)
+
+    monkeypatch.setattr(DocumentRepository, "rename", counting_rename)
+
+    async with client:
+        await _propose(client, tenant.tenant_id, identity_id)
+        responses = await asyncio.gather(
+            *(
+                _resume(
+                    client,
+                    tenant.tenant_id,
+                    identity_id,
+                    document_id=document_id,
+                    title=NEW_TITLE,
+                    approved=True,
+                )
+                for _ in range(2)
+            )
+        )
+
+    assert all(response.status_code == 200 for response in responses)
+    renamed = [response for response in responses if "Renamed document" in response.text]
+    denied = [response for response in responses if "status_executing" in response.text]
+    assert len(renamed) == 1
+    assert len(denied) == 1
+    assert renamed[0] is not denied[0]
+    # The loser's tool call is denied inside a normal stream -- the same model-visible refusal a
+    # failed verification produces -- not an error chunk, and it never reports a rename.
+    assert '"type":"tool-input-error"' in denied[0].text
+    assert "approval could not be verified: status_executing" in denied[0].text
+    assert '"type":"error"' not in denied[0].text
+
+    assert renames == [document_id]
+    assert await _document_title(environment.superuser_url, document_id=document_id) == NEW_TITLE
+
+    kinds = await _audit_kinds_for_tenant(environment.superuser_url, tenant_id=tenant.tenant_id)
+    assert kinds == ["requested", "approved", "executed"]
+    assert "failed_to_execute" not in kinds
+    rows = await _pending_action_rows(environment.superuser_url, tenant_id=tenant.tenant_id)
+    assert [row["status"] for row in rows] == ["executed"]
+
+
+async def test_an_approved_write_that_finds_nothing_marks_the_action_execution_failed(
+    environment, client, use_model
+):
+    """#82: an approved call whose body does not succeed (here: `rename_document` on an id that
+    resolves to no document -- the decorator's "nothing to act on" branch) moves the pending
+    action to `execution_failed`, alongside the `failed_to_execute` audit row."""
+    tenant = await seed_tenant(environment, roles=["member"], via_operator=False)
+    identity_id = tenant.identities["member"]
+    await seed_conversation(
+        environment,
+        tenant_id=tenant.tenant_id,
+        identity_id=identity_id,
+        conversation_id=CONVERSATION_ID,
+    )
+    missing_document_id = uuid.uuid4()
+
+    use_model(_rename_model(document_id=missing_document_id, title=NEW_TITLE))
+
+    async with client:
+        await _propose(client, tenant.tenant_id, identity_id)
+        await _resume(
+            client,
+            tenant.tenant_id,
+            identity_id,
+            document_id=missing_document_id,
+            title=NEW_TITLE,
+            approved=True,
+        )
+
+    kinds = await _audit_kinds_for_tenant(environment.superuser_url, tenant_id=tenant.tenant_id)
+    assert kinds == ["requested", "approved", "failed_to_execute"]
+    rows = await _pending_action_rows(environment.superuser_url, tenant_id=tenant.tenant_id)
+    assert [row["status"] for row in rows] == ["execution_failed"]
+
+
+async def test_writing_tool_approval_audit_rows_carry_the_delegation_means(
+    environment, client, use_model
+):
+    """#117: every row this round trip writes carries the delegation means (ADR-0005) read from
+    the context that produced it. A person's request -- under either `AUTH_MODE` value -- always
+    runs as delegation (`("agent", "assistant")`, `app/context_resolution.py`'s
+    `resolve_dev_headers_context`/`resolve_bearer_context`), so `requested` and `executed` (the
+    two milestones this ticket's acceptance criteria name) both carry it. Restores the acceptance
+    criterion Spec A1 originally asked for and #117's own brief calls out."""
+    tenant = await seed_tenant(environment, roles=["member"], via_operator=False)
+    identity_id = tenant.identities["member"]
+    await seed_conversation(
+        environment,
+        tenant_id=tenant.tenant_id,
+        identity_id=identity_id,
+        conversation_id=CONVERSATION_ID,
+    )
+    document_id = await seed_document(
+        environment, tenant_id=tenant.tenant_id, identity_id=identity_id, title=ORIGINAL_TITLE
+    )
+
+    model = _rename_model(document_id=document_id, title=NEW_TITLE)
+    use_model(model)
+
+    async with client:
+        await _propose(client, tenant.tenant_id, identity_id)
+        await _resume(
+            client,
+            tenant.tenant_id,
+            identity_id,
+            document_id=document_id,
+            title=NEW_TITLE,
+            approved=True,
+        )
+
+    events = await _audit_events_for_tenant(environment.superuser_url, tenant_id=tenant.tenant_id)
+    by_kind = {event["kind"]: event for event in events}
+    assert by_kind["requested"]["means_kind"] == "agent"
+    assert by_kind["requested"]["means_id"] == "assistant"
+    assert by_kind["executed"]["means_kind"] == "agent"
+    assert by_kind["executed"]["means_id"] == "assistant"
+
 
 async def test_refusing_never_executes_and_the_conversation_continues(
     environment, client, use_model
@@ -575,6 +766,123 @@ async def test_expired_approval_is_refused_and_marked_expired(environment, clien
 
     kinds = await _audit_kinds_for_tenant(environment.superuser_url, tenant_id=tenant.tenant_id)
     assert kinds == ["requested", "approved", "expired"]
+
+    # #82: the late resume also moves the row itself to `expired` (`mark_expired`), so neither a
+    # later sweep nor a second late resume can record a second `expired` event for it.
+    rows = await _pending_action_rows(environment.superuser_url, tenant_id=tenant.tenant_id)
+    assert [row["status"] for row in rows] == ["expired"]
+
+
+async def test_late_resume_after_the_sweep_records_no_second_expired_event(
+    environment, client, use_model
+):
+    """#82: once the sweep has expired an unanswered pending action (and written its one
+    `expired` event), a late approval neither executes nor records anything new -- the resolve
+    step finds no `pending` row to approve, and the execution-time `verify()` reports
+    `status_expired`, for which `require_approval` records nothing (the sweep's event already
+    says everything true about the action). Exactly one `expired` event, never two."""
+    from app.pending_action_sweep import run_pending_action_sweep
+
+    tenant = await seed_tenant(environment, roles=["member"], via_operator=False)
+    identity_id = tenant.identities["member"]
+    await seed_conversation(
+        environment,
+        tenant_id=tenant.tenant_id,
+        identity_id=identity_id,
+        conversation_id=CONVERSATION_ID,
+    )
+    document_id = await seed_document(
+        environment, tenant_id=tenant.tenant_id, identity_id=identity_id, title=ORIGINAL_TITLE
+    )
+
+    use_model(_rename_model(document_id=document_id, title=NEW_TITLE))
+
+    async with client:
+        await _propose(client, tenant.tenant_id, identity_id)
+        await _set_pending_action_expiry_in_the_past(
+            environment.superuser_url, tenant_id=tenant.tenant_id
+        )
+
+        engine = create_async_engine(environment.owner_url)
+        try:
+            async with engine.begin() as conn:
+                await run_pending_action_sweep(conn)
+        finally:
+            await engine.dispose()
+        assert await _audit_kinds_for_tenant(
+            environment.superuser_url, tenant_id=tenant.tenant_id
+        ) == ["requested", "expired"]
+
+        resumed = await _resume(
+            client,
+            tenant.tenant_id,
+            identity_id,
+            document_id=document_id,
+            title=NEW_TITLE,
+            approved=True,
+        )
+
+    assert resumed.status_code == 200
+    assert await _document_title(environment.superuser_url, document_id=document_id) == (
+        ORIGINAL_TITLE
+    )
+    kinds = await _audit_kinds_for_tenant(environment.superuser_url, tenant_id=tenant.tenant_id)
+    assert kinds == ["requested", "expired"]
+    rows = await _pending_action_rows(environment.superuser_url, tenant_id=tenant.tenant_id)
+    assert [row["status"] for row in rows] == ["expired"]
+
+
+async def test_late_resume_of_an_executing_action_is_denied_and_records_nothing(
+    environment, client, use_model
+):
+    """#122: a resume that arrives while the action is `executing` -- another resume claimed it
+    and is running it, or a process crashed mid-execution and left it there -- is denied with
+    `status_executing`, executes nothing, records no audit event, and leaves the row `executing`
+    (only the outcome path ever leaves that state; no resume, sweep, or timeout does)."""
+    tenant = await seed_tenant(environment, roles=["member"], via_operator=False)
+    identity_id = tenant.identities["member"]
+    await seed_conversation(
+        environment,
+        tenant_id=tenant.tenant_id,
+        identity_id=identity_id,
+        conversation_id=CONVERSATION_ID,
+    )
+    document_id = await seed_document(
+        environment, tenant_id=tenant.tenant_id, identity_id=identity_id, title=ORIGINAL_TITLE
+    )
+    use_model(_rename_model(document_id=document_id, title=NEW_TITLE))
+
+    async with client:
+        await _propose(client, tenant.tenant_id, identity_id)
+        # Approved and claimed by someone else -- written directly, as the state a concurrent
+        # winner (or a crashed one) leaves behind; the approval itself is already on record.
+        await _set_pending_action_status(
+            environment.superuser_url, tenant_id=tenant.tenant_id, status="executing"
+        )
+        before = await _audit_kinds_for_tenant(
+            environment.superuser_url, tenant_id=tenant.tenant_id
+        )
+
+        resumed = await _resume(
+            client,
+            tenant.tenant_id,
+            identity_id,
+            document_id=document_id,
+            title=NEW_TITLE,
+            approved=True,
+        )
+
+    assert "approval could not be verified: status_executing" in resumed.text
+    assert '"type":"error"' not in resumed.text
+    assert await _document_title(environment.superuser_url, document_id=document_id) == (
+        ORIGINAL_TITLE
+    )
+    assert (
+        await _audit_kinds_for_tenant(environment.superuser_url, tenant_id=tenant.tenant_id)
+        == before
+    )
+    rows = await _pending_action_rows(environment.superuser_url, tenant_id=tenant.tenant_id)
+    assert [row["status"] for row in rows] == ["executing"]
 
 
 async def test_writing_tool_goes_through_the_shared_repository_layer(

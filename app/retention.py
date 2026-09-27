@@ -23,10 +23,21 @@ context resolution uses: `ControlRepository.get_tenant_record`, #104/#105), the 
 object `content_tracing_opt_in` and `model` are read from, so the setting is actually honored
 rather than merely readable.
 
+That raw stored value is never used as-is: it is passed through `app.tenant_settings.
+effective_retention_days`, which clamps it to `Settings.max_retention_days` (#84, ADR-0006; GDPR
+Art. 5(1)(e)) -- the read-side fail-safe for a row whose stored value predates a later, lower cap,
+or was written before the cap existed at all (the write side,
+`TenantSettings.require_retention_within_cap`, already refuses anything above the *current* cap
+as `app.operator.create` writes, but cannot protect
+a row written under a previous, higher one). A clamp is logged once, naming the tenant and the
+stored value, so the sweep stays quiet for every tenant it does not have to correct.
+
 A suspended tenant is skipped outright (#106, ADR-0010): its record is read (the same one read
 every tenant gets), `record.suspended` is checked before anything else, and a suspended tenant
 gets one log line and no `tenant_session()` -- never `TenantSuspendedError` raised mid-sweep, which
 would otherwise abort the whole job's `for` loop at whichever tenant happened to be suspended.
+The enumerate / read-record / skip-suspended / build-job-context loop itself lives in
+`app/tenant_jobs.py` (`visit_active_tenants`, #82), shared with the pending-action sweep.
 The reason is CONTEXT.md's definition of suspension -- a state in which "nothing is deleted"
 (ADR-0010) -- and it is the one deliberate exception to CLAUDE.md rule 2's "with no exception"
 for retention; `app/db/session.py`'s module docstring lists where suspension itself is refused.
@@ -41,21 +52,18 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from app.context import RequestContext
-from app.db.session import tenant_record_session, tenant_session
-from app.operator.listing import list_tenants
-from app.repositories.control import ControlRepository
+from app.config import Settings, get_settings
+from app.db.session import tenant_session
 from app.repositories.conversations import ConversationsRepository
-from app.tenant_settings import DEFAULT_RETENTION_DAYS
+from app.tenant_jobs import JOB_IDENTITY_ID, visit_active_tenants
+from app.tenant_settings import effective_retention_days
 
 log = logging.getLogger(__name__)
 
-# This job has no acting person or agent identity behind it -- it is a scheduled sweep, not a
-# request on anyone's behalf. It is only ever used as the per-transaction `app.identity_id`
-# setting; `ConversationsRepository.delete_expired` issues a DELETE, never an INSERT, so no
-# `created_by` default (a NOT NULL foreign key to `control.identities`) is ever consulted for it.
-# Same nil-UUID-as-sentinel convention as `app/operator/audit.py`'s `UNSCOPED_TENANT_ID`.
-JOB_IDENTITY_ID = UUID(int=0)
+# Re-exported for existing importers; defined once in `app/tenant_jobs.py`.
+# `ConversationsRepository.delete_expired` issues a DELETE, never an INSERT, so no `created_by`
+# default is ever consulted for it.
+__all__ = ["JOB_IDENTITY_ID", "RetentionOutcome", "run_retention_job"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,27 +75,43 @@ class RetentionOutcome:
     deleted: int
 
 
-async def run_retention_job(conn: AsyncConnection) -> list[RetentionOutcome]:
+async def run_retention_job(
+    conn: AsyncConnection, *, settings: Settings | None = None
+) -> list[RetentionOutcome]:
     """Visits every tenant the control plane currently knows about (`conn`, an `app_owner`
     connection, used only to enumerate them) and deletes that tenant's conversations -- and their
     messages, via cascade -- whose `last_activity_at` is older than that tenant's own retention
     cutoff. A suspended tenant is skipped (one log line, no `tenant_session()` opened for it --
     module docstring) rather than counted as visited. Returns one `RetentionOutcome` per
     non-suspended tenant visited, in the order `list_tenants` returns them.
+
+    `settings` (default: `get_settings()`) supplies `max_retention_days` (#84, ADR-0006) -- the
+    read-side clamp `effective_retention_days` applies to every tenant's own stored value below.
+    A test that needs a specific cap without touching process env/the cached `get_settings()`
+    passes its own `Settings(...)` here, the same seam `app.operator.create.create_tenant` uses.
     """
+    settings = settings or get_settings()
     outcomes: list[RetentionOutcome] = []
-    for tenant in await list_tenants(conn):
-        async with tenant_record_session(tenant.tenant_id) as record_session:
-            record = await ControlRepository().get_tenant_record(
-                record_session, tenant_id=tenant.tenant_id
-            )
-        if record.suspended:
-            log.info("retention: skipping suspended tenant %s (%r)", tenant.tenant_id, tenant.name)
-            continue
-        ctx = RequestContext(
-            tenant_id=tenant.tenant_id, identity_id=JOB_IDENTITY_ID, tenant_record=record
+    async for visit in visit_active_tenants(conn, job="retention"):
+        tenant, record, ctx = visit.tenant, visit.record, visit.ctx
+        stored_retention_days = record.settings.retention_days
+        retention_days = effective_retention_days(
+            record.settings, max_days=settings.max_retention_days
         )
-        retention_days = record.settings.retention_days or DEFAULT_RETENTION_DAYS
+        exceeds_cap = (
+            stored_retention_days is not None
+            and stored_retention_days > settings.max_retention_days
+        )
+        if exceeds_cap:
+            log.warning(
+                "retention: tenant %s (%r) stored retention_days=%s exceeds "
+                "MAX_RETENTION_DAYS=%s; clamping to %s",
+                tenant.tenant_id,
+                tenant.name,
+                stored_retention_days,
+                settings.max_retention_days,
+                retention_days,
+            )
         cutoff = datetime.now(UTC) - timedelta(days=retention_days)
         async with tenant_session(ctx) as session:
             deleted = await ConversationsRepository().delete_expired(

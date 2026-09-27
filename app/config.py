@@ -20,6 +20,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.jwt_verifier import HS_ALGORITHMS, MIN_HS_SECRET_BYTES, SUPPORTED_JWT_ALGORITHMS
 from app.residency import DEFAULT_RESIDENCY_CONFIG_PATH, ResidencyAllowList, ResidencyRoute
+from app.tenant_settings import DEFAULT_RETENTION_DAYS
 
 
 class Settings(BaseSettings):
@@ -161,6 +162,37 @@ class Settings(BaseSettings):
     # Backup-retention window (Spec 9 / #72, ADR-0010): days backups keep a tenant's last copy
     # after `erase` -- only computes the backup-horizon date an erasure record documents.
     backup_retention_days: int = 30
+
+    # Deployment-level cap on a tenant's own `tenants.settings["retention_days"]` (#84, ADR-0006;
+    # GDPR Art. 5(1)(e), storage limitation): a tenant may shorten its own conversation-retention
+    # period freely, but never lengthen it past this. `TenantSettings` itself cannot know this
+    # value (it is a plain Pydantic model with no access to `Settings`), so it is enforced twice,
+    # in the same write-then-read shape rule 6 of CLAUDE.md uses for the `model` setting: on
+    # write, by `TenantSettings.require_retention_within_cap(max_days=...)`, which whichever code
+    # path sets `retention_days` calls first (today: `app.operator.create`) -- rejected
+    # before any write ever happens, naming this maximum; on read, as the fail-safe for a
+    # pre-existing row written under a higher, earlier cap (or before this field existed at all),
+    # `app.tenant_settings.effective_retention_days` clamps a stored value above this maximum down
+    # to it, one log line naming the tenant and the stored value, so a stale row can never make a
+    # conversation outlive the deployment's current cap.
+    max_retention_days: int = 365
+
+    @model_validator(mode="after")
+    def _require_sane_max_retention_days(self) -> "Settings":
+        """Fails closed (#84, ADR-0006 / GDPR Art. 5(1)(e)): a maximum below 1 day is nonsensical,
+        and a maximum below `DEFAULT_RETENTION_DAYS` would put the documented default itself over
+        the cap for every tenant that has never set its own value -- refused at construction,
+        never silently reconciled later by the read-side clamp."""
+        if self.max_retention_days < 1:
+            raise ValueError(f"MAX_RETENTION_DAYS={self.max_retention_days} must be at least 1.")
+        if self.max_retention_days < DEFAULT_RETENTION_DAYS:
+            raise ValueError(
+                f"MAX_RETENTION_DAYS={self.max_retention_days} is below "
+                f"DEFAULT_RETENTION_DAYS={DEFAULT_RETENTION_DAYS}: every tenant that has never "
+                "set its own retention_days uses that default, so the deployment maximum can "
+                "never be configured below it."
+            )
+        return self
 
     @model_validator(mode="after")
     def _require_gateway_configured(self) -> "Settings":

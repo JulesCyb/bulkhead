@@ -640,6 +640,128 @@ async def test_create_rejects_unrecognized_model_before_any_write(environment, t
     assert count == 0
 
 
+async def test_create_rejects_retention_days_above_the_maximum_before_any_write(
+    environment, tmp_path
+):
+    """#84 (ADR-0006, GDPR Art. 5(1)(e)): a per-tenant `retention_days` override above this
+    deployment's `MAX_RETENTION_DAYS` is refused before the control-plane record, the credential,
+    or the membership is touched -- same shape as the model-allow-list rejection above."""
+    from app.config import Settings
+    from app.operator.create import create_tenant
+    from app.tenant_settings import RetentionDaysExceedsMaximumError
+
+    settings = Settings(gateway_credentials_dir=str(tmp_path), max_retention_days=365)
+    engine = create_async_engine(environment.owner_url)
+    try:
+        async with engine.begin() as conn:
+            with pytest.raises(RetentionDaysExceedsMaximumError):
+                await create_tenant(
+                    conn,
+                    tenant_name="Should Not Exist Retention",
+                    residency="eu",
+                    admin_email="nobody3@example.test",
+                    retention_days=10_000,
+                    settings=settings,
+                    admin_client=fake_gateway_admin_client(),
+                )
+    finally:
+        await engine.dispose()
+
+    verify_engine = create_async_engine(environment.superuser_url)
+    try:
+        async with verify_engine.connect() as conn:
+            count = (
+                await conn.execute(
+                    text("SELECT count(*) FROM tenants WHERE name = 'Should Not Exist Retention'")
+                )
+            ).scalar_one()
+    finally:
+        await verify_engine.dispose()
+    assert count == 0
+
+
+async def test_create_accepts_a_retention_days_override_at_or_below_the_maximum(
+    environment, tmp_path
+):
+    """The write side only rejects *above* the cap -- a value at or below it is written through
+    to `tenants.settings['retention_days']` like any other tenant setting."""
+    from app.operator.create import create_tenant
+
+    engine = create_async_engine(environment.owner_url)
+    try:
+        async with engine.begin() as conn:
+            result = await create_tenant(
+                conn,
+                tenant_name="Fine Retention Co",
+                residency="eu",
+                admin_email="fine@example.test",
+                retention_days=30,
+                admin_client=fake_gateway_admin_client(),
+            )
+    finally:
+        await engine.dispose()
+
+    verify_engine = create_async_engine(environment.superuser_url)
+    try:
+        async with verify_engine.connect() as conn:
+            stored = (
+                await conn.execute(
+                    text("SELECT settings FROM tenants WHERE id = :tid"),
+                    {"tid": result.tenant_id},
+                )
+            ).scalar_one()
+    finally:
+        await verify_engine.dispose()
+    assert stored["retention_days"] == 30
+
+
+async def test_cli_create_rejects_retention_days_above_the_maximum(
+    environment, tmp_path, monkeypatch
+):
+    """The write seam through the real CLI dispatch (`run_operator`, spec A5 / #115):
+    `--retention-days` above `MAX_RETENTION_DAYS` fails the command (nonzero exit) and leaves no
+    tenant behind, same as an unrecognized `--model` or `--residency` would."""
+    from app import config
+    from app.operator.cli import run_operator
+
+    monkeypatch.setenv("GATEWAY_CREDENTIALS_DIR", str(tmp_path))
+    config.get_settings.cache_clear()
+
+    engine = create_async_engine(environment.owner_url)
+    try:
+        exit_code = await run_operator(
+            [
+                "create",
+                "CLI Retention Reject Co",
+                "--residency",
+                "eu",
+                "--admin-email",
+                "reject@cli.test",
+                "--retention-days",
+                "9999",
+            ],
+            engine=engine,
+            admin_client=fake_gateway_admin_client(key="sk-cli-reject"),
+        )
+    finally:
+        await engine.dispose()
+        config.get_settings.cache_clear()
+
+    assert exit_code != 0
+
+    verify_engine = create_async_engine(environment.superuser_url)
+    try:
+        async with verify_engine.connect() as conn:
+            count = (
+                await conn.execute(
+                    text("SELECT count(*) FROM tenants WHERE name = 'CLI Retention Reject Co'")
+                )
+            ).scalar_one()
+    finally:
+        await verify_engine.dispose()
+    assert count == 0
+
+
 async def test_cli_create_records_the_invocation_in_the_operator_action_log(
     environment, tmp_path, monkeypatch, capsys
 ):

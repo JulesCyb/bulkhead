@@ -255,6 +255,11 @@ def test_main_still_serves_stdio_unchanged_in_development(monkeypatch):
     monkeypatch.setattr(mcp_server, "get_settings", lambda: settings)
     monkeypatch.setattr(mcp_server, "run_startup_checks", lambda s: None)
 
+    async def _passing_guard() -> None:
+        return None
+
+    monkeypatch.setattr(mcp_server, "run_role_rls_guard", _passing_guard)
+
     calls: list[str] = []
     monkeypatch.setattr(mcp_server.server, "run", lambda transport: calls.append(transport))
 
@@ -265,6 +270,60 @@ def test_main_still_serves_stdio_unchanged_in_development(monkeypatch):
     # `_connection_context`, so `resolve_context()` still falls back to the process-wide
     # env identity -- never something only the networked transport should use.
     assert mcp_server._connection_context.get() is None
+
+
+# --- run_role_rls_guard runs before `main()` ever serves a tool call (issue #81) ---
+
+
+def _dev_stdio_settings() -> Settings:
+    return Settings(
+        _env_file=None,
+        environment="dev",
+        auth_mode="dev-headers",
+        mcp_transport="stdio",
+        **_VALID_KWARGS,
+    )
+
+
+def test_main_runs_the_role_rls_guard_before_serving(monkeypatch):
+    """A fake `run_role_rls_guard` that only records being called proves `main()` runs it, and
+    the ordering of `calls` proves it runs before `server.run` -- never a real stdio server ever
+    starting inside this test."""
+    monkeypatch.setattr(mcp_server, "get_settings", _dev_stdio_settings)
+    monkeypatch.setattr(mcp_server, "run_startup_checks", lambda s: None)
+
+    calls: list[str] = []
+
+    async def recording_guard() -> None:
+        calls.append("guard")
+
+    monkeypatch.setattr(mcp_server, "run_role_rls_guard", recording_guard)
+    monkeypatch.setattr(mcp_server.server, "run", lambda transport: calls.append("serve"))
+
+    mcp_server.main()
+
+    assert calls == ["guard", "serve"]
+
+
+def test_main_refuses_to_start_when_the_role_rls_guard_fails(monkeypatch):
+    """A substituted, failing role/RLS guard makes `main()` refuse to start -- `server.run` (the
+    stdio serving loop) must never be reached, and the exception must propagate rather than being
+    swallowed."""
+    monkeypatch.setattr(mcp_server, "get_settings", _dev_stdio_settings)
+    monkeypatch.setattr(mcp_server, "run_startup_checks", lambda s: None)
+
+    async def failing_guard() -> None:
+        raise RuntimeError("substituted role/RLS guard failure")
+
+    monkeypatch.setattr(mcp_server, "run_role_rls_guard", failing_guard)
+
+    calls: list[str] = []
+    monkeypatch.setattr(mcp_server.server, "run", lambda transport: calls.append(transport))
+
+    with pytest.raises(RuntimeError, match="substituted role/RLS guard failure"):
+        mcp_server.main()
+
+    assert calls == []
 
 
 def test_check_mcp_mode_raises_for_streamable_http_with_mcp_tenant_id_set(monkeypatch):

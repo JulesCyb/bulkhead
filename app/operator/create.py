@@ -27,7 +27,7 @@ through `app.repositories.memberships.ensure_membership` (code review 2026-09-26
 tenant's first admin membership is written to this same pooled connection; a dedicated
 tenant's can only ever live in its own database (routing sends every one of its requests there,
 never to the pooled one -- see `tests/test_tenant_session_routing_integration.py`), so it is
-written by `app.operator.dedicated_db.ensure_dedicated_admin_membership` against that database's
+written by `app.operator.dedicated_db.ensure_dedicated_membership` against that database's
 own owner-role connection instead, after `app.operator.dedicated_db.ensure_dedicated_database`
 has provisioned the database itself (CREATE DATABASE, roles and grants, migrated to head) and
 written both of its tenant-secret files. Both of those steps live outside this function's own
@@ -47,9 +47,11 @@ database it belongs to for this tenant's tier.
 Residency and an optional per-tenant model override are validated against
 `settings.residency_allow_list` (`app.residency.ResidencyAllowList`) before any write happens at
 all -- an unrecognized selection never leaves the control plane, a secret file, or a membership
-half-written. `--dedicated-db-admin-url` is only required, and only checked, at the point a fresh
-dedicated database actually needs provisioning (see `ensure_dedicated_database`) -- a pooled
-`create`, or a re-run against an already-provisioned dedicated tenant, never needs it.
+half-written. An optional per-tenant `retention_days` override is validated the same way, against
+`settings.max_retention_days` (#84, ADR-0006, `TenantSettings.require_retention_within_cap`).
+`--dedicated-db-admin-url` is only required, and only checked, at the point a fresh dedicated
+database actually needs provisioning (see `ensure_dedicated_database`) -- a pooled `create`, or a
+re-run against an already-provisioned dedicated tenant, never needs it.
 """
 
 from __future__ import annotations
@@ -69,8 +71,8 @@ from app.gateway_provisioning import (
     provision_gateway_credential,
 )
 from app.operator.dedicated_db import (
-    ensure_dedicated_admin_membership,
     ensure_dedicated_database,
+    ensure_dedicated_membership,
     generate_database_alias,
 )
 from app.operator.lookup import TenantNotFoundError, resolve_tenant
@@ -204,6 +206,7 @@ async def create_tenant(
     residency: str,
     admin_email: str,
     model: str | None = None,
+    retention_days: int | None = None,
     isolation_tier: str = "pooled",
     dedicated_db_admin_url: str | None = None,
     issuer: str = "dev-seed",
@@ -222,12 +225,20 @@ async def create_tenant(
     repo = ControlRepository()
 
     # Validated before any write, in this order, per acceptance criteria: an unrecognized
-    # residency, model-allow-list, or isolation-tier selection must reject before the
-    # control-plane record, the credential, or the membership is touched.
+    # residency, model-allow-list, isolation-tier, or retention-days-over-the-cap (#84) selection
+    # must reject before the control-plane record, the credential, or the membership is touched.
     _validate_residency(residency, settings)
     _validate_model(model, residency, settings)
     _validate_isolation_tier(isolation_tier)
-    tenant_settings = TenantSettings(model=model) if model is not None else None
+    tenant_settings = (
+        TenantSettings(model=model, retention_days=retention_days)
+        if model is not None or retention_days is not None
+        else None
+    )
+    if tenant_settings is not None:
+        # The write-side half of the retention cap (#84) lives on the model itself; the cap is
+        # passed in because `TenantSettings` cannot see process configuration.
+        tenant_settings.require_retention_within_cap(max_days=settings.max_retention_days)
     tenant_settings_json = json.dumps(
         tenant_settings.model_dump(exclude_none=True) if tenant_settings else {}
     )
@@ -279,7 +290,7 @@ async def create_tenant(
     # (0003), so the upsert needs no tenant context. The membership does (forced RLS): on the
     # pooled path it is the one `get_record`/`create_tenant_record` above already set on this
     # transaction through the control repository's forced-RLS helper; on the dedicated path
-    # `ensure_dedicated_admin_membership` sets it against the tenant's own database.
+    # `ensure_dedicated_membership` sets it against the tenant's own database.
     identity_id = await IdentityRepository().upsert(
         conn, id=uuid.uuid4(), issuer=issuer, subject=subject, email=admin_email
     )
@@ -294,7 +305,7 @@ async def create_tenant(
             alias=database_alias, admin_url=dedicated_db_admin_url
         )
         dedicated_database_outcome = dedicated.outcome
-        membership_outcome = await ensure_dedicated_admin_membership(
+        membership_outcome = await ensure_dedicated_membership(
             owner_dsn=dedicated.owner_dsn,
             tenant_id=tenant_id,
             tenant_name=tenant_name,
@@ -302,7 +313,8 @@ async def create_tenant(
             identity_id=identity_id,
             issuer=issuer,
             subject=subject,
-            admin_email=admin_email,
+            email=admin_email,
+            role="admin",
         )
     else:
         membership_outcome = await ensure_membership(

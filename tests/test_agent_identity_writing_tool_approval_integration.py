@@ -9,6 +9,18 @@ approvals.py`) never defers: the `membership.role == "agent"` branch either deni
 standing grant covers this tool) or authorizes execution immediately (an active grant does) --
 there is no pending action and no second, resumed request either way. So every test here is a
 single `POST /api/chat`, not a propose/resume pair.
+
+The tests above authenticate with `AUTH_MODE=dev-headers` (`X-Identity-Id` naming a plain,
+directly seeded `agent`-role membership) -- under dev-headers every context resolves as delegation
+(`app/context_resolution.py`'s `resolve_dev_headers_context`), so those rows carry
+`("agent", "assistant")` as their delegation means, not a credential. The two tests at the bottom
+of this file (#117) instead drive the real credential chain end to end --
+`AgentIdentityRepository`/`AgentCredentialRepository` create the identity and issue it a
+credential, `POST /agent-tokens` exchanges it for a real, signed token
+(`AUTH_MODE=jwt`), and that token authenticates the `/api/chat` call -- so `require_approval()`'s
+context there really is `RequestContext.acting_through("credential", <public id>)`
+(`app.context_resolution.actor_context`), the means ADR-0005 assigns an agent identity acting on
+its own credential with no person present.
 """
 
 from __future__ import annotations
@@ -23,10 +35,14 @@ from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from app.config import Settings, get_settings
 from app.context import RequestContext
 from app.db.session import tenant_session
 from app.main import app
+from app.repositories.agent_credentials import AgentCredentialRepository
+from app.repositories.agent_identities import AgentIdentityRepository
 from app.repositories.standing_grants import StandingGrantRepository
+from app.token_verifier import set_default_adapter_for_tests
 
 pgserver = pytest.importorskip("pgserver")
 
@@ -39,6 +55,28 @@ from tests.support import (  # noqa: E402
 )
 
 _ = (cluster, environment)
+
+# A real, signed-token settings object for the two credential-means tests at the bottom of this
+# file (#117) -- same shape as `tests/test_context_resolution_integration.py`'s own `_jwt_settings`
+# helper, kept local since this file needs it for exactly two tests, not every test in it.
+_JWT_SECRET = "agent-identity-writing-tool-human-secret-32b"
+_AGENT_SECRET = "agent-identity-writing-tool-agent-secret-32b"
+
+
+def _jwt_settings() -> Settings:
+    return Settings(
+        _env_file=None,
+        environment="test",
+        auth_mode="jwt",
+        embedding_provider="openai",
+        embedding_model="text-embedding-3-small",
+        default_identity_issuer="seed",
+        jwt_verification_key=_JWT_SECRET,
+        jwt_algorithm="HS256",
+        agent_token_signing_key=_AGENT_SECRET,
+        agent_token_ttl_seconds=300,
+    )
+
 
 CONVERSATION_ID = "conv-agent-1"
 TOOL_CALL_ID = "call-rename-agent-1"
@@ -105,7 +143,7 @@ async def _audit_events_for_tenant(url: str, *, tenant_id: uuid.UUID) -> list[di
             (
                 await conn.execute(
                     text(
-                        "SELECT kind, standing_grant_id, pending_action_id "
+                        "SELECT kind, standing_grant_id, pending_action_id, means_kind, means_id "
                         "FROM approval_audit_events WHERE tenant_id = :tid ORDER BY seq"
                     ),
                     {"tid": tenant_id},
@@ -320,3 +358,152 @@ async def test_agent_identity_is_refused_when_the_only_grant_names_a_different_t
     events = await _audit_events_for_tenant(environment.superuser_url, tenant_id=tenant.tenant_id)
     assert [e["kind"] for e in events] == ["denied_for_lack_of_grant"]
     assert events[0]["standing_grant_id"] is None
+
+
+# --- #117: the same mechanism, authenticated through a real credential (not dev-headers) --------
+
+
+async def _issue_agent_credential_and_grant(
+    admin_ctx: RequestContext, *, admin_membership_id: uuid.UUID, grant: bool
+):
+    """Creates a real agent identity and issues it a real credential
+    (`AgentIdentityRepository`/`AgentCredentialRepository`, exactly as
+    `tests/test_agent_identity_end_to_end_integration.py` does), and, when `grant` is true, a
+    standing grant for `TOOL_NAME` naming that identity's own membership. Returns
+    `(identity_id, issued_credential, grant_id_or_None)`."""
+    async with tenant_session(admin_ctx) as session:
+        created = await AgentIdentityRepository().create(session, admin_ctx, name="nightly sync")
+        issued = await AgentCredentialRepository().create(
+            session, admin_ctx, identity_id=created.identity_id, name="nightly sync cred"
+        )
+        grant_id = None
+        if grant:
+            standing_grant = await StandingGrantRepository().create(
+                session,
+                admin_ctx,
+                agent_membership_id=created.membership_id,
+                tool_name=TOOL_NAME,
+                granted_by=admin_membership_id,
+            )
+            grant_id = standing_grant.id
+    return created.identity_id, issued, grant_id
+
+
+async def _exchange_and_call_chat(
+    tenant_id: uuid.UUID, *, public_id: str, secret: str, settings: Settings
+) -> httpx.Response:
+    """Exchanges a real credential for a real access token through `POST /agent-tokens`
+    (`app/api/agent_tokens.py`), then uses that token to authenticate one `POST /api/chat` --
+    the same real bearer path `app.deps.get_context`/
+    `app.context_resolution.resolve_bearer_context` resolve any other bearer request through,
+    never a shortcut construction of `RequestContext`."""
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            token_response = await client.post(
+                f"/v1/t/{tenant_id}/agent-tokens", json={"public_id": public_id, "secret": secret}
+            )
+            assert token_response.status_code == 200, token_response.text
+            access_token = token_response.json()["access_token"]
+            return await client.post(
+                _chat_path(tenant_id),
+                json=_propose_body(),
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+
+async def test_agent_identity_writing_tool_audit_rows_carry_the_credential_means(
+    environment, use_model
+):
+    """AC (#117): an agent identity authenticated by its own real credential -- not dev-headers'
+    `X-Identity-Id` shortcut -- executes a writing tool under a standing grant, and the resulting
+    `executed` row carries `means_kind = 'credential'` / `means_id = <the credential's own public
+    id>`, alongside (not instead of) the approval means (`standing_grant_id` set,
+    `pending_action_id` null)."""
+    set_default_adapter_for_tests(None)
+    tenant = await seed_tenant(environment, roles=["admin"], via_operator=False)
+    admin_ctx = RequestContext(
+        tenant_id=tenant.tenant_id,
+        identity_id=tenant.identities["admin"],
+        roles=frozenset({"admin"}),
+    )
+    identity_id, issued, grant_id = await _issue_agent_credential_and_grant(
+        admin_ctx, admin_membership_id=tenant.memberships["admin"], grant=True
+    )
+    await seed_conversation(
+        environment,
+        tenant_id=tenant.tenant_id,
+        identity_id=identity_id,
+        conversation_id=CONVERSATION_ID,
+    )
+    document_id = await seed_document(
+        environment, tenant_id=tenant.tenant_id, identity_id=identity_id, title=ORIGINAL_TITLE
+    )
+
+    model = _rename_model(document_id=document_id, title=NEW_TITLE)
+    use_model(model)
+
+    response = await _exchange_and_call_chat(
+        tenant.tenant_id, public_id=issued.public_id, secret=issued.secret, settings=_jwt_settings()
+    )
+    assert response.status_code == 200, response.text
+
+    title = await _document_title(environment.superuser_url, document_id=document_id)
+    assert title == NEW_TITLE
+
+    events = await _audit_events_for_tenant(environment.superuser_url, tenant_id=tenant.tenant_id)
+    executed = [e for e in events if e["kind"] == "executed"]
+    assert len(executed) == 1
+    assert executed[0]["means_kind"] == "credential"
+    assert executed[0]["means_id"] == issued.public_id
+    assert executed[0]["standing_grant_id"] == grant_id
+    assert executed[0]["pending_action_id"] is None
+
+
+async def test_agent_identity_denied_for_lack_of_grant_audit_row_carries_the_credential_means(
+    environment, use_model
+):
+    """AC (#117): the means is known even when no grant exists -- an agent identity refused
+    outright for lack of a standing grant still produces a `denied_for_lack_of_grant` row naming
+    its own credential as the delegation means."""
+    set_default_adapter_for_tests(None)
+    tenant = await seed_tenant(environment, roles=["admin"], via_operator=False)
+    admin_ctx = RequestContext(
+        tenant_id=tenant.tenant_id,
+        identity_id=tenant.identities["admin"],
+        roles=frozenset({"admin"}),
+    )
+    identity_id, issued, grant_id = await _issue_agent_credential_and_grant(
+        admin_ctx, admin_membership_id=tenant.memberships["admin"], grant=False
+    )
+    assert grant_id is None
+    await seed_conversation(
+        environment,
+        tenant_id=tenant.tenant_id,
+        identity_id=identity_id,
+        conversation_id=CONVERSATION_ID,
+    )
+    document_id = await seed_document(
+        environment, tenant_id=tenant.tenant_id, identity_id=identity_id, title=ORIGINAL_TITLE
+    )
+
+    model = _rename_model(document_id=document_id, title=NEW_TITLE)
+    use_model(model)
+
+    response = await _exchange_and_call_chat(
+        tenant.tenant_id, public_id=issued.public_id, secret=issued.secret, settings=_jwt_settings()
+    )
+    assert response.status_code == 200, response.text
+
+    title = await _document_title(environment.superuser_url, document_id=document_id)
+    assert title == ORIGINAL_TITLE  # never executed
+
+    events = await _audit_events_for_tenant(environment.superuser_url, tenant_id=tenant.tenant_id)
+    assert [e["kind"] for e in events] == ["denied_for_lack_of_grant"]
+    assert events[0]["means_kind"] == "credential"
+    assert events[0]["means_id"] == issued.public_id
+    assert events[0]["standing_grant_id"] is None
+    assert events[0]["pending_action_id"] is None

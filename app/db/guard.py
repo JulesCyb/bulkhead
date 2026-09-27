@@ -23,6 +23,15 @@ Reuses `app.db.models.TENANT_ISOLATION_EXCEPTIONS`, the same exception list the 
 test (`tests/test_rls_integration.py::test_public_schema_tenant_isolation_invariant`) enforces,
 so a legitimately tenant-less table is a one-line addition to a single list, never a second one
 that can silently drift apart from it.
+
+Every engine the process might ever open is now guarded before its first use (issue #81): the
+pooled engine here, at ASGI lifespan startup and on every `/ready` call; every dedicated engine
+inside `app.db.engine_registry.get_engine_for_alias` itself, the moment it is first built --
+before it is ever cached or handed to a caller, so a request never reaches a newly opened
+dedicated engine ahead of the next `run_role_rls_guard()`/`/ready` cycle; and the MCP server's own
+`stdio` entrypoint (`app.mcp.server.main`), which calls this module's `run_role_rls_guard` before
+it ever serves a tool call. The streamable-http MCP mount needs no guard call of its own: it is
+mounted inside the same ASGI process `app.main.lifespan` already guards once at startup.
 """
 
 from __future__ import annotations

@@ -636,6 +636,56 @@ def test_readme_table_states_the_default_retention_period() -> None:
     assert "ADR-0006" in row
 
 
+# --- #84: a deployment-wide cap on a tenant's own retention_days ---------------------------------
+
+
+def test_adr_0006_states_the_retention_maximum_and_why() -> None:
+    """#84: the ADR names the deployment maximum (not only the default), the setting that
+    configures it, and the GDPR storage-limitation reasoning -- not just "a safe default"."""
+    decision_section = " ".join(
+        ADR_0006.split("## Decision", 1)[1].split("## Consequences", 1)[0].split()
+    )
+    assert "365 days" in decision_section
+    assert "MAX_RETENTION_DAYS" in decision_section
+    assert "GDPR" in decision_section
+    assert "Art. 5(1)(e)" in decision_section
+    assert "effective_retention_days" in decision_section
+
+
+def test_readme_table_states_the_retention_maximum() -> None:
+    row = next(line for line in README.splitlines() if line.startswith("| Retention |"))
+    assert "365 days" in row
+    assert "MAX_RETENTION_DAYS" in row
+
+
+def test_claude_md_retention_sentence_mentions_the_cap() -> None:
+    """CLAUDE.md rule 2's retention sentence names the cap in a few words (#84) -- the maximum
+    setting, the default cap value, and that it is enforced on both write and read."""
+    rule_2 = next(line for line in CLAUDE_MD.splitlines() if line.strip().startswith("2. **Every"))
+    section_start = CLAUDE_MD.index(rule_2)
+    section_end = CLAUDE_MD.index("\n3. ", section_start)
+    section = " ".join(CLAUDE_MD[section_start:section_end].split())
+
+    assert "max_retention_days" in section
+    assert "MAX_RETENTION_DAYS" in section
+    assert "365 days" in section
+
+
+def test_env_example_documents_max_retention_days() -> None:
+    assert "MAX_RETENTION_DAYS=365" in ENV_EXAMPLE
+    assert "#84" in ENV_EXAMPLE.split("MAX_RETENTION_DAYS=365", 1)[0][-500:]
+
+
+def test_tenant_settings_catalog_documents_retention_days_write_and_read_split() -> None:
+    """app/tenant_settings.py's own catalog (the one place every tenants.settings field is
+    documented) names the write-side validator and the read-side clamp for retention_days (#84),
+    mirroring how it already documents the split for `model`."""
+    source = (REPO_ROOT / "app" / "tenant_settings.py").read_text(encoding="utf-8")
+    assert "require_retention_within_cap" in source
+    assert "effective_retention_days" in source
+    assert "max_retention_days" in source.lower()
+
+
 # --- Spec 6's closing ticket (#50): connecting to and administering the tools server ---
 
 MCP_JSON_EXAMPLE_PATH = REPO_ROOT / ".mcp.json.example"
@@ -896,3 +946,62 @@ def test_adr_0007_points_at_the_run_module_and_the_decorator() -> None:
     assert "app/agents/run.py" in ADR_0007
     assert "writing_tool" in ADR_0007
     assert "app/agents/writing_tools.py" in ADR_0007
+
+
+# --- Issue #83's closing ticket: `add-membership`, and ADR-0003/ADR-0012 flip to accepted --------
+
+ADR_0003 = (REPO_ROOT / "docs" / "adr" / "0003-identity-and-membership.md").read_text(
+    encoding="utf-8"
+)
+
+
+def test_adr_0003_is_accepted_not_proposed() -> None:
+    status_line = next(line for line in ADR_0003.splitlines() if line.startswith("- **Status:**"))
+    assert "accepted" in status_line
+    assert "proposed" not in status_line
+
+
+def test_adr_0012_is_accepted_not_proposed() -> None:
+    status_line = next(line for line in ADR_0012.splitlines() if line.startswith("- **Status:**"))
+    assert "accepted" in status_line
+    assert "proposed" not in status_line
+
+
+def test_claude_md_commands_lists_add_membership() -> None:
+    commands_block = CLAUDE_MD.split("## Commands", 1)[1].split("## Architecture rules", 1)[0]
+    assert "scripts/operator.py add-membership" in commands_block
+    assert "idempotent" in commands_block
+
+
+# --- #82: the pending-action sweep ----------------------------------------------------------------
+
+
+def test_claude_md_commands_and_readme_list_the_pending_action_sweep_script() -> None:
+    commands_block = CLAUDE_MD.split("## Commands", 1)[1].split("## Architecture rules", 1)[0]
+    assert "uv run python scripts/sweep_pending_actions.py" in commands_block
+    assert "scripts/sweep_pending_actions.py" in README
+    assert "scripts/sweep_pending_actions.py" in ADR_0007
+
+
+# --- #122: an approved pending action is claimed atomically before the tool runs ----------------
+
+
+def test_claude_md_writing_tool_rule_says_the_approval_is_claimed_before_it_runs() -> None:
+    """Rule 4 names the claim (one clause) and lists `executing` in the status transitions, so an
+    agent deriving a project never adds a path that runs an `approved` action without it."""
+    rule_4 = " ".join(
+        CLAUDE_MD.split("4. **Agents access data only through tools**", 1)[1]
+        .split("\n5. ", 1)[0]
+        .split()
+    )
+    assert "claimed atomically before it runs, so a concurrent resume is refused" in rule_4
+    assert "`approved → executing | expired`" in rule_4
+    assert "`executing → executed | execution_failed`" in rule_4
+
+
+def test_adr_0007_consequences_mention_the_claim_and_the_executing_status() -> None:
+    consequences = " ".join(ADR_0007.split("## Consequences", 1)[1].split("\n## ", 1)[0].split())
+    assert "#122" in consequences
+    assert "`executing`" in consequences
+    assert "claimed" in consequences
+    assert "migration 0044" in consequences

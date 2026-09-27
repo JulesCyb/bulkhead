@@ -398,10 +398,14 @@ async def seed_conversation(
 
 async def set_tenant_retention_days(cluster: Cluster, tenant_id: uuid.UUID, days: int) -> None:
     """Sets this tenant's own `tenants.settings['retention_days']` (ADR-0006) directly, as the
-    cluster's own superuser -- no operator command exposes a way to set it, and `tenants`' own
-    self-only RLS policy would otherwise block the update with no `app.tenant_id` context in
-    scope. For a test proving a tenant's own (shorter) retention period is honored over the
-    documented default (`app/tenant_settings.py`)."""
+    cluster's own superuser, bypassing whatever `TenantSettings.require_retention_within_cap`
+    (#84) would otherwise reject -- `tenants`' own self-only RLS policy would otherwise block the
+    update with no `app.tenant_id` context in scope, and going straight to the row is also the
+    only way to get a value the write-side cap would refuse (e.g. one written under an earlier,
+    higher `MAX_RETENTION_DAYS`, or before the cap existed at all) into the database for a test.
+    Used both to prove a tenant's own (shorter) retention period is honored over the documented
+    default, and to prove the retention job's read-side clamp on an over-the-cap stored value
+    (`app.tenant_settings.effective_retention_days`)."""
     engine = create_async_engine(cluster.superuser_url)
     try:
         async with engine.begin() as conn:

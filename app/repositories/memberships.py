@@ -9,7 +9,11 @@ property, not on an allow-list of roles this repository would otherwise have to 
 `ensure_membership` is the owner-role side (code review 2026-09-26): the one function the
 operator's `create` command writes a tenant's first admin membership through, on its own
 owner-role connection -- pooled and dedicated alike -- so no operator module issues SQL against
-`memberships` itself (CLAUDE.md rule 3).
+`memberships` itself (CLAUDE.md rule 3). `get_role_owner` and `MembershipRoleConflictError`
+(issue #83) are the same owner-role side's read: `app.operator.add_membership` reads an existing
+membership's role before deciding whether `ensure_membership` is safe to call, so a re-run that
+asks for a *different* role than an existing membership already has is refused rather than
+silently changed -- changing an existing membership's role is out of scope for that command.
 """
 
 from __future__ import annotations
@@ -93,7 +97,7 @@ async def ensure_membership(
     and the insert would fail its `WITH CHECK`. On the pooled path the control repository's own
     forced-RLS helper has already set it (`ControlRepository.create_tenant_record`/`get_record`,
     one of which `app.operator.create.create_tenant` always calls first on the same transaction);
-    on the dedicated path `app.operator.dedicated_db.ensure_dedicated_admin_membership` sets it
+    on the dedicated path `app.operator.dedicated_db.ensure_dedicated_membership` sets it
     itself against the dedicated database, where the control repository has no connection. This
     function checks that precondition and raises `RuntimeError` when the connection's tenant
     context names a different tenant or none, rather than answering for a tenant it cannot see."""
@@ -118,3 +122,52 @@ async def ensure_membership(
         insert(Membership).values(tenant_id=tenant_id, identity_id=identity_id, role=role)
     )
     return "created"
+
+
+async def get_role_owner(
+    conn: AsyncConnection, *, tenant_id: UUID, identity_id: UUID
+) -> str | None:
+    """Owner-role counterpart of `MembershipRepository.get_role` (issue #83): the current role of
+    `identity_id`'s membership in `tenant_id`, or `None` if no such membership exists, read on the
+    caller's own open owner-role connection. Same forced-RLS precondition as `ensure_membership`
+    (the caller must have set `app.tenant_id` to `tenant_id` on this transaction first) -- this
+    function checks it the same way and raises the same `RuntimeError` if it is missing.
+
+    The seam `app.operator.add_membership` reads before deciding whether `ensure_membership` is
+    safe to call: an existing membership whose role differs from the one requested is a conflict
+    (`MembershipRoleConflictError` below), never a silent role change.
+    """
+    current = (
+        await conn.execute(text("SELECT current_setting('app.tenant_id', true)"))
+    ).scalar_one()
+    if current != str(tenant_id):
+        raise RuntimeError(
+            f"get_role_owner for tenant {tenant_id} needs that tenant context set on the "
+            f"connection first; it is {current or 'unset'!r}"
+        )
+    return (
+        await conn.execute(
+            select(Membership.role).where(
+                Membership.tenant_id == tenant_id, Membership.identity_id == identity_id
+            )
+        )
+    ).scalar_one_or_none()
+
+
+class MembershipRoleConflictError(RuntimeError):
+    """Raised when an existing membership for `(tenant_id, identity_id)` already carries a role
+    different from the one requested (issue #83) -- `app.operator.add_membership`'s own refusal:
+    changing an existing membership's role is out of scope for that command, so this is reported
+    and refused, unchanged, rather than silently applied."""
+
+    def __init__(
+        self, tenant_id: UUID, identity_id: UUID, existing_role: str, requested_role: str
+    ) -> None:
+        self.tenant_id = tenant_id
+        self.identity_id = identity_id
+        self.existing_role = existing_role
+        self.requested_role = requested_role
+        super().__init__(
+            f"identity {identity_id} already has a {existing_role!r} membership in tenant "
+            f"{tenant_id}; refusing to change it to {requested_role!r}"
+        )
