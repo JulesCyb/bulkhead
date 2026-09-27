@@ -1,6 +1,6 @@
 # ADR-0003: Global identities with per-tenant memberships
 
-- **Status:** proposed
+- **Status:** accepted
 - **Date:** 2026-09-12
 - **Deciders:** JulesCyb
 - **Skill version:** ai-app-blueprints v2.0.0 (research 2026-08)

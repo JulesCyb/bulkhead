@@ -52,9 +52,11 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from app.context import ROLES
 from app.db.lifecycle import owner_engine
 from app.gateway_provisioning import GatewayAdminClient
 from app.migration_settings import get_migration_settings
+from app.operator.add_membership import add_membership
 from app.operator.audit import UNSCOPED_TENANT_ID, record_action
 from app.operator.create import create_tenant
 from app.operator.erase import erase_tenant, record_erasure
@@ -143,6 +145,22 @@ async def _dispatch_create(
     return result, result.tenant_id
 
 
+async def _dispatch_add_membership(
+    conn: AsyncConnection,
+    args: argparse.Namespace,
+    admin_client: GatewayAdminClient | None,
+) -> tuple[CommandResult, UUID]:
+    result = await add_membership(
+        conn,
+        args.identifier,
+        role=args.role,
+        email=args.email,
+        issuer=args.issuer,
+        subject=args.subject,
+    )
+    return result, result.tenant_id
+
+
 async def _dispatch_erase(
     conn: AsyncConnection,
     args: argparse.Namespace,
@@ -170,6 +188,7 @@ _COMMANDS: dict[str, CommandFn] = {
     "suspend": _dispatch_suspend,
     "unsuspend": _dispatch_unsuspend,
     "create": _dispatch_create,
+    "add-membership": _dispatch_add_membership,
     "erase": _dispatch_erase,
 }
 
@@ -193,10 +212,17 @@ async def _run(
         exit_code = 0
     except Exception as exc:  # noqa: BLE001 - recorded below, then re-raised as a nonzero exit
         # A lookup failure (TenantNotFoundError/AmbiguousTenantNameError) never resolved a
-        # real tenant, so `target_tenant_id` stays None here -- the sentinel below is the
-        # only honest target id for this row, same as any other failure.
+        # real tenant, so `target_tenant_id` stays None -- the sentinel below is the only
+        # honest target id for that row. A failure raised *after* the tenant was already
+        # resolved (e.g. `add_membership`'s own `TenantSuspendedError`, or
+        # `MembershipRoleConflictError`, issue #83) carries that resolved id as its own
+        # `tenant_id` attribute -- read generically here, via `getattr`, rather than adding a
+        # second return path out of `_COMMANDS[command]` just for the failure case: an
+        # exception with no such attribute (every pre-existing one) leaves this `None`,
+        # unchanged from today's behaviour.
         error = f"{type(exc).__name__}: {exc}"
         outcome = "error"
+        target_tenant_id = getattr(exc, "tenant_id", None)
     finally:
         finished_at = datetime.now(UTC)
         async with engine.begin() as audit_conn:
@@ -287,6 +313,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--subject",
         default=None,
         help="identity subject to match/create (default: the admin email)",
+    )
+
+    add_membership_parser = sub.add_parser(
+        "add-membership",
+        help="Attach an additional membership to an already-provisioned tenant, idempotently: "
+        "find-or-create the identity by (issuer, subject) and add the membership. Refuses to "
+        "change an existing membership to a different role, and refuses a suspended tenant.",
+    )
+    add_membership_parser.add_argument("identifier", help="tenant id or unambiguous name")
+    add_membership_parser.add_argument(
+        "role", choices=sorted(ROLES), help="one of app.context.ROLES"
+    )
+    add_membership_parser.add_argument("email", help="the member's email")
+    add_membership_parser.add_argument(
+        "--issuer",
+        default="dev-seed",
+        help="identity issuer to match/create for this membership (default: dev-seed, same as "
+        "create)",
+    )
+    add_membership_parser.add_argument(
+        "--subject",
+        default=None,
+        help="identity subject to match/create (default: the email, same as create)",
     )
 
     erase_parser = sub.add_parser(

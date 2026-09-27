@@ -1,6 +1,6 @@
 # ADR-0012: A request names its tenant in the URL path, and path, token audience, and membership must agree
 
-- **Status:** proposed
+- **Status:** accepted
 - **Date:** 2026-09-12
 - **Deciders:** JulesCyb
 - **Skill version:** ai-app-blueprints v2.0.0 (research 2026-08)
