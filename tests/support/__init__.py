@@ -27,7 +27,6 @@ from tests.support.cluster import (  # noqa: E402
     cluster,
     create_database,
     environment,
-    migration_run_without_disrupting_logging,
 )
 from tests.support.gateway import (  # noqa: E402
     FakeGatewayAdmin,
@@ -58,7 +57,6 @@ __all__ = [
     "create_database",
     "environment",
     "fake_gateway_admin_client",
-    "migration_run_without_disrupting_logging",
     "seed_conversation",
     "seed_dedicated_control_row",
     "seed_document",

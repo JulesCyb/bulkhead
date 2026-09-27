@@ -22,13 +22,11 @@ so both need to be real on this shared cluster, not just the timeout.
 from __future__ import annotations
 
 import dataclasses
-import logging.config
 import os
 import subprocess
 import sys
 import tempfile
 from collections.abc import Iterator
-from contextlib import contextmanager
 from urllib.parse import parse_qs, urlparse
 
 import pgserver
@@ -211,32 +209,3 @@ async def create_database(cluster: Cluster, name: str) -> Cluster:
         await bootstrap_engine.dispose()
 
     return fresh
-
-
-@contextmanager
-def migration_run_without_disrupting_logging() -> Iterator[None]:
-    """Wrap any in-process call into the real migration runner (`scripts.migrate.migrate_alias`/
-    `migrate_all`, or anything that itself calls `alembic.command.upgrade`) in this, every time.
-
-    `migrations/env.py` calls `logging.config.fileConfig(config.config_file_name)` on every real
-    migration run (`command.upgrade()` re-executes `env.py` fresh each call, not a one-time
-    import, so this fires on every single call, not just the first). By default that disables
-    every logger that already exists at that moment, process-wide -- harmless across a
-    subprocess boundary (every private per-file bootstrap this package replaced shelled out to
-    `alembic upgrade head` as a *subprocess*, exactly to keep this contained, and so does this
-    package's own session-scoped `cluster` fixture above), but running the real migration runner
-    in-process instead (this package's dedicated-tier seeding, deliberately, to exercise the
-    exact code path `app.operator.dedicated_db.ensure_dedicated_database` uses) would otherwise
-    silently disable module-level `log = logging.getLogger(__name__)` objects created once, at
-    import time, and reused for the rest of the pytest session -- breaking every later test in
-    the *same session* that asserts against `caplog` for one of them, with no exception raised
-    anywhere to explain why. `env.py`'s own `from logging.config import fileConfig` re-binds
-    fresh from this attribute on every run, so patching it here, only for the duration of one
-    migration call, is enough -- never touches `migrations/env.py` itself.
-    """
-    original = logging.config.fileConfig
-    logging.config.fileConfig = lambda *args, **kwargs: None
-    try:
-        yield
-    finally:
-        logging.config.fileConfig = original

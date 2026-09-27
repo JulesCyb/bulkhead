@@ -34,7 +34,6 @@ from tests.support import (  # noqa: E402
     cluster,
     create_database,
     environment,
-    migration_run_without_disrupting_logging,
     seed_tenant,
 )
 
@@ -61,8 +60,7 @@ async def guard_env(environment, monkeypatch):
 
     migrations_secret = migrate_module._migrations_secrets_dir() / alias
     migrations_secret.write_text(fresh_pooled.owner_url)
-    with migration_run_without_disrupting_logging():
-        await asyncio.to_thread(migrate_module.migrate_alias, alias)
+    await asyncio.to_thread(migrate_module.migrate_alias, alias)
 
     monkeypatch.setenv("DATABASE_URL", fresh_pooled.app_url)
     monkeypatch.setenv("DATABASE_URL_MIGRATIONS", fresh_pooled.owner_url)

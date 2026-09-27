@@ -21,7 +21,11 @@ from app.migration_settings import get_migration_settings
 
 config = context.config
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # `disable_existing_loggers=False` (#118): this file runs on *every* migration call, and the
+    # runner is invoked in-process by the operator tool (`app.operator.dedicated_db`) and by the
+    # test suite. The stdlib default would silently disable every logger created before the
+    # run, so nothing the operator logs after provisioning a dedicated database would appear.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 _url_override = config.attributes.get("migration_database_url")
 config.set_main_option(
