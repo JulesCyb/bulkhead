@@ -20,6 +20,16 @@ is assigned. The documented triggers for actually provisioning the first dedicat
 when it becomes worth exercising the path this module keeps ready -- are ADR-0002's own
 "Revisit when" list (`docs/adr/0002-hybrid-tenant-isolation.md`); they are not repeated here so
 the two can never drift apart.
+
+Every dedicated engine is guarded (issue #81, ADR-0002) the moment it is first built, inside the
+same per-alias lock that serializes concurrent first requests: `app.db.guard.check_role_and_rls`
+runs against a connection from the brand-new engine before it is ever cached in `_engines` or
+handed back to a caller. A failing check disposes the engine, never caches it, and propagates --
+the request that triggered the first open fails closed, and the next call rebuilds and rechecks
+from scratch rather than serving anything from a bad cache entry. This closes the gap where a
+dedicated alias, opened lazily by a real request, would otherwise go unchecked until the next
+`run_role_rls_guard()`/`/ready` cycle. The pooled alias is unaffected: it is guarded the same way
+it always was, by `run_role_rls_guard`/`/ready`, never by this module.
 """
 
 from __future__ import annotations
@@ -116,7 +126,16 @@ async def get_engine_for_alias(alias: str) -> AsyncEngine:
     """Return the engine that serves `alias`, building and caching it if this is the first
     request for it. The pooled alias is pre-registered (via app.db.session.get_engine()) and
     never reads a secret file; any other alias is built once, lazily, from that alias's
-    tenant-secret file and cached for the life of the process."""
+    tenant-secret file and cached for the life of the process.
+
+    A brand-new dedicated engine is guarded (`app.db.guard.check_role_and_rls`, issue #81) before
+    it is cached or returned: a connected superuser/BYPASSRLS role, or a public-schema table
+    missing forced Row-Level Security, disposes the engine and raises
+    `PrivilegedRoleOrMissingRLSError` instead of caching or handing back a bad engine. The next
+    call for the same alias starts over -- re-reading the secret file, rebuilding the engine, and
+    re-running the check -- rather than ever serving a cached engine that failed its check. The
+    pooled alias is never checked here; its own guarding is `run_role_rls_guard`/`/ready`,
+    unchanged."""
     if alias == POOLED_ALIAS:
         return get_engine()
 
@@ -131,6 +150,17 @@ async def get_engine_for_alias(alias: str) -> AsyncEngine:
             return cached
         dsn = _read_dsn(alias)
         engine = _build_engine(dsn)
+        # Guard before caching or returning (issue #81): imported lazily to avoid a module-level
+        # import cycle with app.db.guard, which itself imports this module's
+        # get_engine_for_alias lazily inside its own functions.
+        from app.db.guard import check_role_and_rls
+
+        try:
+            async with engine.connect() as conn:
+                await check_role_and_rls(conn)
+        except Exception:
+            await engine.dispose()
+            raise
         _engines[alias] = engine
         return engine
 

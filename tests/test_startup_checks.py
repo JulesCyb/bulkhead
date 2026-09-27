@@ -261,11 +261,22 @@ async def test_lifespan_also_raises_for_mismatched_residency_configuration(monke
 
 def test_mcp_server_main_runs_startup_checks_before_serving(monkeypatch):
     """A valid configuration: the MCP server's entry point runs the same startup checks and then
-    starts the transport."""
+    starts the transport.
+
+    `run_role_rls_guard` (issue #81) is substituted with a no-op fake: this module's own tests
+    are configuration-property tests only (module docstring above) -- no network call, no
+    database -- and the guard itself has its own dedicated tests
+    (`tests/test_mcp_context.py::test_main_runs_the_role_rls_guard_before_serving` and
+    `::test_main_refuses_to_start_when_the_role_rls_guard_fails`)."""
     from app.mcp import server as mcp_server
 
     good_settings = Settings(residency="eu", **_VALID_KWARGS)
     monkeypatch.setattr(mcp_server, "get_settings", lambda: good_settings)
+
+    async def _passing_guard() -> None:
+        return None
+
+    monkeypatch.setattr(mcp_server, "run_role_rls_guard", _passing_guard)
 
     calls: list[str] = []
     monkeypatch.setattr(
