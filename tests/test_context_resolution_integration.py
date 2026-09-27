@@ -23,16 +23,16 @@ conversation directly (the one seeding step below that isn't just `seed_tenant`)
 through `tests.support.seed_conversation`, exactly like the file it borrows the rest of the
 round-trip from.
 
-**#117's caveat, which applies to every test below that touches an audit table:**
-`approval_audit_events` (the only audit table `app/repositories/approval_audit.py` writes)
-records the *actor* membership (ADR-0007's sense: who asked, approved, or was denied) but not the
-*means* (ADR-0005's sense: delegation vs. an agent identity's own credential) -- that gap is
-tracked, not fixed, by #117. So "the audit row's actor and means" (#103's acceptance criterion) is
-provable here only in two separate pieces: the *means* is asserted directly on the
-`RequestContext` a tool actually received (`ctx.means`) and, for the HTTP adapter, was already
-proven on every span's attributes by `tests/test_context_resolution.py`'s
+**Audit rows and the delegation means (#117, migration 0042):** `approval_audit_events` (the only
+audit table `app/repositories/approval_audit.py` writes) records both the *actor* membership
+(ADR-0007's sense: who asked, approved, or was denied) and the *delegation* means (ADR-0005's
+sense: delegation vs. an agent identity's own credential, `means_kind`/`means_id`) on the same
+row. So "the audit row's actor and means" (#103's acceptance criterion) is provable directly on
+that row, test (d) below -- alongside (not instead of) the means asserted directly on the
+`RequestContext` a tool actually received (`ctx.means`) and, for the HTTP adapter, on every
+span's attributes, proven by `tests/test_context_resolution.py`'s
 `test_every_span_of_an_http_run_records_the_person_as_actor_and_the_agent_as_means` -- exactly
-what #101 did; the *actor* is proven here on a real `approval_audit_events` row.
+what #101 did.
 """
 
 from __future__ import annotations
@@ -308,24 +308,21 @@ async def test_mcp_agent_identity_reaches_the_tool_naming_its_credential(
     assert ctx.means == Means(kind="credential", id=issued.public_id)
 
 
-# --- (d) audit row: the actor is real; the means is only ever a context/span fact (#117) ---------
+# --- (d) audit row: the actor and the delegation means are both real, database-readable facts ---
 
 
 async def test_writing_tool_approval_audit_row_names_the_acting_membership(environment, use_model):
     """AC (d): drives one real writing-tool approval round-trip on `/api/chat`
     (`tests/test_writing_tool_approval_integration.py`'s own machinery -- a cheap, already-proven
     path, reused rather than rebuilt) against a seeded tenant, then reads the resulting
-    `approval_audit_events` row back directly: its `actor_membership_id` is the seeded member's
-    own membership.
-
-    Per the module docstring's #117 caveat: this table has no `means` column at all today (only
-    the *approval* means -- a pending action or standing grant id, neither asked for by this
-    ticket's criterion -- and the acting membership). The *delegation* means (ADR-0005:
-    `("agent", "assistant")` for this same request) is not persisted anywhere a database query
-    could read back; it is instead a fact of the `RequestContext`/trace span, proven for the HTTP
-    adapter by `tests/test_context_resolution.py`'s
-    `test_every_span_of_an_http_run_records_the_person_as_actor_and_the_agent_as_means`. This test
-    only proves the actor half of #103's "actor and means" criterion, on purpose.
+    `approval_audit_events` rows back directly: `actor_membership_id` is the seeded member's own
+    membership, and (#117, migration 0042) `means_kind`/`means_id` are `("agent", "assistant")` --
+    the delegation means ADR-0005 assigns a person's request under `AUTH_MODE=dev-headers` -- on
+    every row, both `requested` and `executed` included. #103's "actor and means" criterion is
+    now provable in one place, directly on the row, rather than split across this table and a
+    trace span (`tests/test_context_resolution.py`'s own
+    `test_every_span_of_an_http_run_records_the_person_as_actor_and_the_agent_as_means` still
+    proves the span carries it too -- the two are complementary, not exclusive).
     """
     tenant = await seed_tenant(environment, residency="eu", roles=["member"], documents=1)
     identity_id = tenant.identities["member"]
@@ -364,8 +361,8 @@ async def test_writing_tool_approval_audit_row_names_the_acting_membership(envir
         rows = (
             await conn.execute(
                 text(
-                    "SELECT kind, actor_membership_id FROM approval_audit_events "
-                    "WHERE tenant_id = :tid ORDER BY seq"
+                    "SELECT kind, actor_membership_id, means_kind, means_id "
+                    "FROM approval_audit_events WHERE tenant_id = :tid ORDER BY seq"
                 ),
                 {"tid": tenant.tenant_id},
             )
@@ -376,6 +373,8 @@ async def test_writing_tool_approval_audit_row_names_the_acting_membership(envir
     assert "approved" in kinds
     assert "executed" in kinds
     assert all(row.actor_membership_id == membership_id for row in rows)
+    assert all(row.means_kind == "agent" for row in rows)
+    assert all(row.means_id == "assistant" for row in rows)
 
 
 # --- Also: a suspended seeded tenant is refused on both transports, with the same body -----------
