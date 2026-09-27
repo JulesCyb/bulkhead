@@ -134,6 +134,7 @@ async def _dispatch_create(
         residency=args.residency,
         admin_email=args.admin_email,
         model=args.model,
+        retention_days=args.retention_days,
         isolation_tier=args.isolation_tier,
         dedicated_db_admin_url=args.dedicated_db_admin_url,
         issuer=args.issuer,
@@ -259,6 +260,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="optional tenants.settings['model'] override, validated against the residency's "
         "model allow-list before anything is written",
+    )
+    create_parser.add_argument(
+        "--retention-days",
+        dest="retention_days",
+        type=int,
+        default=None,
+        help="optional tenants.settings['retention_days'] override (#84, ADR-0006), validated "
+        "against this deployment's MAX_RETENTION_DAYS before anything is written; unset means "
+        "the documented DEFAULT_RETENTION_DAYS applies",
     )
     create_parser.add_argument(
         "--isolation-tier",

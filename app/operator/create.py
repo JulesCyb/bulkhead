@@ -47,9 +47,11 @@ database it belongs to for this tenant's tier.
 Residency and an optional per-tenant model override are validated against
 `settings.residency_allow_list` (`app.residency.ResidencyAllowList`) before any write happens at
 all -- an unrecognized selection never leaves the control plane, a secret file, or a membership
-half-written. `--dedicated-db-admin-url` is only required, and only checked, at the point a fresh
-dedicated database actually needs provisioning (see `ensure_dedicated_database`) -- a pooled
-`create`, or a re-run against an already-provisioned dedicated tenant, never needs it.
+half-written. An optional per-tenant `retention_days` override is validated the same way, against
+`settings.max_retention_days` (#84, ADR-0006, `_validate_retention_days`).
+`--dedicated-db-admin-url` is only required, and only checked, at the point a fresh dedicated
+database actually needs provisioning (see `ensure_dedicated_database`) -- a pooled `create`, or a
+re-run against an already-provisioned dedicated tenant, never needs it.
 """
 
 from __future__ import annotations
@@ -96,6 +98,15 @@ class UnrecognizedModelError(ValueError, ResidencyUnresolved):
 
 class UnrecognizedIsolationTierError(ValueError):
     """`isolation_tier` is not one of `ISOLATION_TIERS` -- rejected before any write."""
+
+
+class RetentionDaysExceedsMaximumError(ValueError):
+    """`retention_days` is above `Settings.max_retention_days` -- rejected before any write (#84,
+    ADR-0006). The write-side half of the cap: `TenantSettings` itself only ever checks "a
+    positive integer" (it has no access to `Settings`, see `app.tenant_settings`'s catalog entry
+    for `retention_days`), so this is where a tenant's own choice is actually held to the
+    deployment maximum, the same shape `UnrecognizedModelError` above uses for the model
+    allow-list."""
 
 
 class TenantConflictError(ValueError):
@@ -197,6 +208,20 @@ def _validate_isolation_tier(isolation_tier: str) -> None:
         )
 
 
+def _validate_retention_days(retention_days: int | None, settings: Settings) -> None:
+    """Rejects a `retention_days` above `settings.max_retention_days` before any write (#84,
+    ADR-0006) -- same reasoning as `_validate_model` above. `TenantSettings`'s own `PositiveInt`
+    check already refused a non-positive value by the time this runs (`TenantSettings(...)`
+    construction below), so this only ever needs to check the upper bound."""
+    if retention_days is None:
+        return
+    if retention_days > settings.max_retention_days:
+        raise RetentionDaysExceedsMaximumError(
+            f"retention_days={retention_days} exceeds this deployment's maximum of "
+            f"{settings.max_retention_days} days (MAX_RETENTION_DAYS, see app.config.Settings)"
+        )
+
+
 async def create_tenant(
     conn: AsyncConnection,
     *,
@@ -204,6 +229,7 @@ async def create_tenant(
     residency: str,
     admin_email: str,
     model: str | None = None,
+    retention_days: int | None = None,
     isolation_tier: str = "pooled",
     dedicated_db_admin_url: str | None = None,
     issuer: str = "dev-seed",
@@ -222,12 +248,17 @@ async def create_tenant(
     repo = ControlRepository()
 
     # Validated before any write, in this order, per acceptance criteria: an unrecognized
-    # residency, model-allow-list, or isolation-tier selection must reject before the
-    # control-plane record, the credential, or the membership is touched.
+    # residency, model-allow-list, isolation-tier, or retention-days-over-the-cap (#84) selection
+    # must reject before the control-plane record, the credential, or the membership is touched.
     _validate_residency(residency, settings)
     _validate_model(model, residency, settings)
     _validate_isolation_tier(isolation_tier)
-    tenant_settings = TenantSettings(model=model) if model is not None else None
+    _validate_retention_days(retention_days, settings)
+    tenant_settings = (
+        TenantSettings(model=model, retention_days=retention_days)
+        if model is not None or retention_days is not None
+        else None
+    )
     tenant_settings_json = json.dumps(
         tenant_settings.model_dump(exclude_none=True) if tenant_settings else {}
     )

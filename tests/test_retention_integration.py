@@ -327,3 +327,77 @@ async def test_a_suspended_tenants_conversations_are_untouched_by_the_job(enviro
         "conv-suspended-expired"
     ]
     assert await _conversation_ids(environment.superuser_url, active.tenant_id) == []
+
+
+async def test_a_stored_retention_days_far_above_the_maximum_is_clamped_by_the_job(
+    environment, caplog
+):
+    """#84 (ADR-0006; GDPR Art. 5(1)(e), storage limitation): a tenant whose stored
+    `retention_days` is far above the deployment maximum (simulating a row written under an
+    earlier, higher cap -- or before the cap existed at all, since no write path could produce
+    this value today) has its cutoff clamped to that maximum by `effective_retention_days`, not
+    honored as-is -- a conversation older than the maximum but nowhere near the enormous stored
+    value is deleted anyway, proving the clamp (not the tenant's own setting) governs. A second
+    tenant whose stored value is legitimately below the maximum is completely untouched by the
+    clamp -- its own (still-honored) setting keeps governing exactly as before (#84 does not
+    change the already-covered "own setting wins over the default" behavior)."""
+    from app.config import Settings
+
+    now = datetime.now(UTC)
+    max_days = 100
+
+    over_cap = await seed_tenant(environment, name="OverCap", via_operator=False)
+    await set_tenant_retention_days(environment, over_cap.tenant_id, 10_000)
+    identity_over, _ = await seed_membership(
+        environment, tenant_id=over_cap.tenant_id, role="member"
+    )
+    # Older than max_days (100) but nowhere near the tenant's own stored 10,000-day setting --
+    # expired only once the clamp actually applies.
+    await seed_conversation(
+        environment,
+        tenant_id=over_cap.tenant_id,
+        identity_id=identity_over,
+        conversation_id="conv-over-cap-expired",
+        last_activity_at=now - timedelta(days=max_days + 10),
+        with_message=True,
+    )
+
+    under_cap = await seed_tenant(environment, name="UnderCap", via_operator=False)
+    await set_tenant_retention_days(environment, under_cap.tenant_id, 30)
+    identity_under, _ = await seed_membership(
+        environment, tenant_id=under_cap.tenant_id, role="member"
+    )
+    # 20 days old: inside its own 30-day setting, and well inside max_days too -- must survive.
+    await seed_conversation(
+        environment,
+        tenant_id=under_cap.tenant_id,
+        identity_id=identity_under,
+        conversation_id="conv-under-cap-fresh",
+        last_activity_at=now - timedelta(days=20),
+        with_message=True,
+    )
+
+    settings = Settings(max_retention_days=max_days)
+    engine = create_async_engine(environment.owner_url)
+    try:
+        async with engine.begin() as conn:
+            with caplog.at_level("WARNING"):
+                outcomes = await run_retention_job(conn, settings=settings)
+    finally:
+        await engine.dispose()
+
+    by_tenant = {o.tenant_id: o.deleted for o in outcomes}
+    assert by_tenant[over_cap.tenant_id] == 1
+    assert by_tenant[under_cap.tenant_id] == 0
+
+    assert await _conversation_ids(environment.superuser_url, over_cap.tenant_id) == []
+    assert await _conversation_ids(environment.superuser_url, under_cap.tenant_id) == [
+        "conv-under-cap-fresh"
+    ]
+
+    # One log line names the clamped tenant and its stored value; the under-cap tenant (never
+    # clamped) is never mentioned by it.
+    assert caplog.text.count("clamping") == 1
+    assert str(over_cap.tenant_id) in caplog.text
+    assert "10000" in caplog.text
+    assert str(under_cap.tenant_id) not in caplog.text

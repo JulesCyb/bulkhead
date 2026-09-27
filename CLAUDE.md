@@ -104,7 +104,9 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    governed, with no exception but the one below (suspension), by the tenant's own retention
    period (ADR-0006): a tenant's own `settings["retention_days"]`, or the documented default of
    `DEFAULT_RETENTION_DAYS` (90 days, `app/tenant_settings.py`) when it has never set one,
-   measured from `last_activity_at`. The
+   measured from `last_activity_at` -- capped at `Settings.max_retention_days` (365 days by
+   default, `MAX_RETENTION_DAYS`, #84): rejected above the cap on write, clamped to it on read
+   (`app.tenant_settings.effective_retention_days`). The
    retention job (`app/retention.py`, run via `scripts/retention.py`) deletes what that period
    expires, one tenant at a time, through the same `tenant_session(ctx)` every other request uses
    — never a superuser or bypass-RLS statement against either table. It builds each tenant's own
