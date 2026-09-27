@@ -118,6 +118,10 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    context resolution (on the tenant record); a caller without a record is refused by the
    session layer's routing read (`tenant_session()`'s `_resolve_tenant_alias`); a context with a
    suspended record is refused by `tenant_session()` itself.
+   Every engine is guarded before first use (issue #81): the pooled engine at process startup by
+   `run_role_rls_guard` (`app/db/guard.py`), every dedicated engine on its first
+   `get_engine_for_alias` call inside the registry (`app/db/engine_registry.py`), and the MCP
+   server's `stdio` entrypoint (`app/mcp/server.py`'s `main()`) before it ever serves a tool call.
 3. **DB access only through repositories** (`app/repositories/`) with sessions from
    `tenant_session(ctx)`. `tenant_session(ctx)` resolves which engine to use internally, from the
    tenant's isolation tier and database alias in the control plane (ADR-0002) — pooled by

@@ -2,6 +2,13 @@
 ticket #74). A second database on the same embedded cluster (`tests.support.create_database`)
 stands in for "a tenant's dedicated database"; the property under test is routing and caching,
 not RLS (RLS is out of scope for this ticket -- see #73/#75).
+
+Issue #81 extends the property under test: a brand-new dedicated engine is now itself guarded
+(`app.db.guard.check_role_and_rls`) before `get_engine_for_alias` ever caches or returns it, so
+the tests at the bottom of this file build a real dedicated database with a table missing forced
+Row-Level Security -- exactly the shape `tests/test_guard_multi_engine_integration.py` uses for
+`run_role_rls_guard` itself -- and drive `get_engine_for_alias` directly, never
+`run_role_rls_guard`.
 """
 
 from __future__ import annotations
@@ -11,13 +18,16 @@ import uuid
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.db import engine_registry
+from app.db import guard as guard_module
 from app.db import session as db_session
 from app.db.engine_registry import _secrets_dir
 
 pgserver = pytest.importorskip("pgserver")
 
+import scripts.migrate as migrate_module  # noqa: E402
 from tests.support import cluster, create_database, environment  # noqa: E402
 
 # `cluster`/`environment` are imported only so pytest can discover them as fixtures from this
@@ -106,3 +116,74 @@ async def test_unknown_alias_raises_instead_of_falling_back_to_pooled(registry_e
     pooled = await engine_registry.get_engine_for_alias(engine_registry.POOLED_ALIAS)
     assert await _select_1(pooled) == 1
     assert "no-such-alias" not in engine_registry._engines
+
+
+# --- issue #81: a brand-new dedicated engine is guarded before it is cached or returned ---
+
+
+async def test_dedicated_alias_with_a_table_missing_forced_rls_is_refused_and_not_cached(
+    environment,
+):
+    """Acceptance (#81): a dedicated alias whose database has a table without forced Row-Level
+    Security is refused on the very first `get_engine_for_alias` call -- not only on the next
+    `/ready` probe or `run_role_rls_guard()` sweep -- and the failing engine is never cached. A
+    second call re-runs the check from scratch rather than serving anything cached; once the
+    table is fixed, the alias becomes healthy, cached, and stable."""
+    from app.db.models import TENANT_ISOLATION_EXCEPTIONS
+
+    assert "scratch_unforced" not in TENANT_ISOLATION_EXCEPTIONS
+
+    alias = f"registry-unforced-{uuid.uuid4().hex[:8]}"
+    dedicated = await create_database(environment, alias)
+
+    (migrate_module._migrations_secrets_dir() / alias).write_text(dedicated.owner_url)
+    await asyncio.to_thread(migrate_module.migrate_alias, alias)
+    (_secrets_dir() / alias).write_text(dedicated.app_url)
+
+    admin_engine = create_async_engine(dedicated.owner_url)
+    try:
+        async with admin_engine.begin() as conn:
+            await conn.execute(text("CREATE TABLE scratch_unforced (id int)"))
+
+        with pytest.raises(guard_module.PrivilegedRoleOrMissingRLSError):
+            await engine_registry.get_engine_for_alias(alias)
+        assert alias not in engine_registry._engines
+
+        # A later call retries from scratch: still non-compliant, still refused, still uncached
+        # -- never a cached bad engine served on a second try.
+        with pytest.raises(guard_module.PrivilegedRoleOrMissingRLSError):
+            await engine_registry.get_engine_for_alias(alias)
+        assert alias not in engine_registry._engines
+
+        async with admin_engine.begin() as conn:
+            await conn.execute(text("DROP TABLE scratch_unforced"))
+    finally:
+        await admin_engine.dispose()
+
+    # Now compliant: the alias builds cleanly, is cached, and a second call returns the exact
+    # same engine instance -- a healthy alias is cached and returned, unlike a failing one.
+    healthy = await engine_registry.get_engine_for_alias(alias)
+    again = await engine_registry.get_engine_for_alias(alias)
+    assert healthy is again
+    assert await _select_1(healthy) == 1
+
+
+async def test_dedicated_alias_connected_as_a_bypassrls_role_is_refused_and_not_cached(
+    environment,
+):
+    """Acceptance (#81), the other half of `check_role_and_rls`: a dedicated alias whose secret
+    file names a privileged (BYPASSRLS) role is refused on first use and never cached, exactly
+    like the missing-forced-RLS case above."""
+    alias = f"registry-bypassrls-{uuid.uuid4().hex[:8]}"
+    dedicated = await create_database(environment, alias)
+
+    (migrate_module._migrations_secrets_dir() / alias).write_text(dedicated.owner_url)
+    await asyncio.to_thread(migrate_module.migrate_alias, alias)
+    # The dedicated database's own bootstrap superuser stands in for a misconfigured deployment
+    # (the same substitution `test_guard_multi_engine_integration.py` uses for
+    # `run_role_rls_guard`).
+    (_secrets_dir() / alias).write_text(dedicated.superuser_url)
+
+    with pytest.raises(guard_module.PrivilegedRoleOrMissingRLSError):
+        await engine_registry.get_engine_for_alias(alias)
+    assert alias not in engine_registry._engines

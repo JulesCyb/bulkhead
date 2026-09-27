@@ -67,6 +67,7 @@ of destination is the existing snippet cap: `search_documents` never returns mor
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import functools
 import logging
@@ -83,6 +84,7 @@ from starlette.responses import JSONResponse
 from app import context_resolution
 from app.config import Settings, get_settings
 from app.context import RequestContext
+from app.db.guard import run_role_rls_guard
 from app.db.session import TenantSuspendedError
 from app.startup_checks import run_startup_checks
 from app.tools import documents as document_tools
@@ -399,11 +401,27 @@ def main() -> None:
     first, fail-closed, then the same fail-closed residency/model-allow-list checks the HTTP API
     runs at construction and lifespan (issue #59 / ADR-0008,
     `app.startup_checks.run_startup_checks`) -- one startup-checks function, not a second
-    validation this entry point would otherwise have to reconcile by hand -- before this process
-    ever accepts a tool call on either transport."""
+    validation this entry point would otherwise have to reconcile by hand -- and finally the
+    fail-closed role/RLS guard (issue #81, ADR-0002/ADR-0005; `app.db.guard.run_role_rls_guard`),
+    against every database alias currently referenced, before this process ever accepts a tool
+    call on either transport.
+
+    This entry point is the `stdio` (development) path's own guard call. The `streamable-http`
+    mount (`build_streamable_http_app`, below) needs no guard call here: it is mounted inside the
+    same FastAPI/ASGI process whose `app.main.lifespan` already runs `run_role_rls_guard` once at
+    startup, so a `streamable-http` deployment is guarded exactly once, by that lifespan, not
+    twice.
+
+    Looked up by name (`run_role_rls_guard`, imported at module level but never rebound), not
+    called directly by a hardcoded reference, so a test can monkeypatch
+    `app.mcp.server.run_role_rls_guard` with a fake and drive `main()` directly -- the same
+    technique `app/main.py`'s own lifespan tests use for this same guard -- to prove both that a
+    failing guard refuses to start (`server.run` is never reached) and that a passing guard runs
+    before `server.run` is called."""
     settings = get_settings()
     check_mcp_mode(settings)
     run_startup_checks(settings)
+    asyncio.run(run_role_rls_guard())
     server.run(transport=settings.mcp_transport)
 
 
