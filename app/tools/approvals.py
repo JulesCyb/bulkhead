@@ -35,7 +35,10 @@ membership's *current* role from the database, fresh, both independently of what
 `resolve_incoming_decisions()` already recorded for the same request. A membership downgraded
 between the two passes is refused here, in addition to (not instead of) whatever check ran when
 the write was first proposed -- exactly the ordering ADR-0007 and #40's acceptance criteria ask
-for.
+for. Only once all of that holds does it *claim* the action (`PendingActionRepository.
+claim_for_execution()`, `approved -> executing`) in the same transaction as the verification, and
+only a caller whose claim moved the row may run the tool (#122): a second resume of the same
+approval racing the first is refused with `status_executing` and records nothing.
 """
 
 from __future__ import annotations
@@ -202,6 +205,16 @@ async def require_approval(ctx: RunContext[AssistantDeps], **arguments: Any) -> 
                         details={"reason": "role_not_permitted", "role": membership.role},
                     )
                     denial = f"role {membership.role!r} is no longer permitted to write"
+                elif not await PendingActionRepository().claim_for_execution(
+                    session, rc, pending_action_id=pending.id
+                ):
+                    # #122: verification passed, but the claim (`approved -> executing`, in this
+                    # same transaction) found the row no longer `approved` -- a concurrent resume
+                    # of the same approval claimed it first (its row lock made this `UPDATE` wait
+                    # and then match nothing). Denied exactly like a failed verification with
+                    # that status, and like it records nothing: the winner's own `executed`/
+                    # `failed_to_execute` is the one true outcome of this action.
+                    denial = f"approval could not be verified: status_{pending_statuses.EXECUTING}"
                 else:
                     ctx.deps.pending_approval = ApprovalContext(
                         actor_membership_id=membership.id,
@@ -233,6 +246,10 @@ async def _audit_kind_for_failed_verification(
       That event already says everything true about the action; recording `failed_to_execute`
       here would claim an execution attempt against a proposal that had already lapsed, and a
       second `expired` would break "exactly one `expired` per action". The call is still denied.
+    - `status_executing` -- another resume of this same approval has already claimed it and is
+      running it (#122): nothing is recorded; that resume's own `executed`/`failed_to_execute`
+      is the action's one outcome, and a `failed_to_execute` here would claim a second execution
+      attempt that never happened. The call is still denied.
     - anything else (hash mismatch, not yet approved, already executed) -- `FAILED_TO_EXECUTE`,
       unchanged from before #82."""
     if reason == "expired":
@@ -240,7 +257,7 @@ async def _audit_kind_for_failed_verification(
             session, rc, pending_action_id=pending_action_id
         )
         return audit_kinds.EXPIRED if moved else None
-    if reason == f"status_{pending_statuses.EXPIRED}":
+    if reason in (f"status_{pending_statuses.EXPIRED}", f"status_{pending_statuses.EXECUTING}"):
         return None
     return audit_kinds.FAILED_TO_EXECUTE
 
@@ -256,8 +273,9 @@ async def record_write_outcome(
     add).
 
     For a member-approved call (`approval.pending_action_id` set) the pending action itself moves
-    `approved -> executed | execution_failed` in the same transaction as the audit row (#82), so
-    the stored record says the call ran and `verify()` never lets it run again. A standing-grant
+    `executing -> executed | execution_failed` (it was claimed `approved -> executing` by
+    `require_approval()`, #122) in the same transaction as the audit row (#82), so the stored
+    record says the call ran and `verify()` never lets it run again. A standing-grant
     call has no pending action; only its audit row is written."""
     if approval is None:
         return

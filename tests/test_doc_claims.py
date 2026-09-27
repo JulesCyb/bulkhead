@@ -981,3 +981,27 @@ def test_claude_md_commands_and_readme_list_the_pending_action_sweep_script() ->
     assert "uv run python scripts/sweep_pending_actions.py" in commands_block
     assert "scripts/sweep_pending_actions.py" in README
     assert "scripts/sweep_pending_actions.py" in ADR_0007
+
+
+# --- #122: an approved pending action is claimed atomically before the tool runs ----------------
+
+
+def test_claude_md_writing_tool_rule_says_the_approval_is_claimed_before_it_runs() -> None:
+    """Rule 4 names the claim (one clause) and lists `executing` in the status transitions, so an
+    agent deriving a project never adds a path that runs an `approved` action without it."""
+    rule_4 = " ".join(
+        CLAUDE_MD.split("4. **Agents access data only through tools**", 1)[1]
+        .split("\n5. ", 1)[0]
+        .split()
+    )
+    assert "claimed atomically before it runs, so a concurrent resume is refused" in rule_4
+    assert "`approved → executing | expired`" in rule_4
+    assert "`executing → executed | execution_failed`" in rule_4
+
+
+def test_adr_0007_consequences_mention_the_claim_and_the_executing_status() -> None:
+    consequences = " ".join(ADR_0007.split("## Consequences", 1)[1].split("\n## ", 1)[0].split())
+    assert "#122" in consequences
+    assert "`executing`" in consequences
+    assert "claimed" in consequences
+    assert "migration 0044" in consequences

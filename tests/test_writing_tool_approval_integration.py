@@ -27,6 +27,7 @@ titled document) goes straight through `tests.support`'s `seed_tenant`/`seed_con
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 
@@ -108,6 +109,16 @@ async def _set_pending_action_expiry_in_the_past(url: str, *, tenant_id: uuid.UU
                 "WHERE tenant_id = :tid"
             ),
             {"tid": tenant_id},
+        )
+    await engine.dispose()
+
+
+async def _set_pending_action_status(url: str, *, tenant_id: uuid.UUID, status: str) -> None:
+    engine = create_async_engine(url)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE pending_actions SET status = :status WHERE tenant_id = :tid"),
+            {"status": status, "tid": tenant_id},
         )
     await engine.dispose()
 
@@ -419,6 +430,79 @@ async def test_approving_executes_exactly_once_and_response_reflects_the_change(
 
     # #82: the pending action itself records that it ran -- `verify()` requires `approved`, so
     # it can never verify (and run) a second time.
+    rows = await _pending_action_rows(environment.superuser_url, tenant_id=tenant.tenant_id)
+    assert [row["status"] for row in rows] == ["executed"]
+
+
+async def test_two_concurrent_approving_resumes_execute_the_write_exactly_once(
+    environment, client, use_model, monkeypatch
+):
+    """#122: two resumes approving the same tool call, sent concurrently, execute the write
+    exactly once. The approval is claimed atomically (`approved -> executing`) in the same
+    transaction that verifies it, so only one resume may run the tool; the other is denied with
+    `status_executing` -- a 200 whose stream shows the denial, never a 5xx -- and records nothing.
+    Before the fix both passed verification and the trail read `requested, approved, executed,
+    executed`."""
+    from app.repositories.documents import DocumentRepository
+
+    tenant = await seed_tenant(environment, roles=["member"], via_operator=False)
+    identity_id = tenant.identities["member"]
+    await seed_conversation(
+        environment,
+        tenant_id=tenant.tenant_id,
+        identity_id=identity_id,
+        conversation_id=CONVERSATION_ID,
+    )
+    document_id = await seed_document(
+        environment, tenant_id=tenant.tenant_id, identity_id=identity_id, title=ORIGINAL_TITLE
+    )
+    use_model(_rename_model(document_id=document_id, title=NEW_TITLE))
+
+    # The repository-level write itself, observed (not replaced): the title alone cannot tell one
+    # rename from two, since both would write the same value.
+    renames: list[uuid.UUID] = []
+    real_rename = DocumentRepository.rename
+
+    async def counting_rename(self, session, ctx, *, document_id, title):
+        renames.append(document_id)
+        return await real_rename(self, session, ctx, document_id=document_id, title=title)
+
+    monkeypatch.setattr(DocumentRepository, "rename", counting_rename)
+
+    async with client:
+        await _propose(client, tenant.tenant_id, identity_id)
+        responses = await asyncio.gather(
+            *(
+                _resume(
+                    client,
+                    tenant.tenant_id,
+                    identity_id,
+                    document_id=document_id,
+                    title=NEW_TITLE,
+                    approved=True,
+                )
+                for _ in range(2)
+            )
+        )
+
+    assert all(response.status_code == 200 for response in responses)
+    renamed = [response for response in responses if "Renamed document" in response.text]
+    denied = [response for response in responses if "status_executing" in response.text]
+    assert len(renamed) == 1
+    assert len(denied) == 1
+    assert renamed[0] is not denied[0]
+    # The loser's tool call is denied inside a normal stream -- the same model-visible refusal a
+    # failed verification produces -- not an error chunk, and it never reports a rename.
+    assert '"type":"tool-input-error"' in denied[0].text
+    assert "approval could not be verified: status_executing" in denied[0].text
+    assert '"type":"error"' not in denied[0].text
+
+    assert renames == [document_id]
+    assert await _document_title(environment.superuser_url, document_id=document_id) == NEW_TITLE
+
+    kinds = await _audit_kinds_for_tenant(environment.superuser_url, tenant_id=tenant.tenant_id)
+    assert kinds == ["requested", "approved", "executed"]
+    assert "failed_to_execute" not in kinds
     rows = await _pending_action_rows(environment.superuser_url, tenant_id=tenant.tenant_id)
     assert [row["status"] for row in rows] == ["executed"]
 
@@ -746,6 +830,59 @@ async def test_late_resume_after_the_sweep_records_no_second_expired_event(
     assert kinds == ["requested", "expired"]
     rows = await _pending_action_rows(environment.superuser_url, tenant_id=tenant.tenant_id)
     assert [row["status"] for row in rows] == ["expired"]
+
+
+async def test_late_resume_of_an_executing_action_is_denied_and_records_nothing(
+    environment, client, use_model
+):
+    """#122: a resume that arrives while the action is `executing` -- another resume claimed it
+    and is running it, or a process crashed mid-execution and left it there -- is denied with
+    `status_executing`, executes nothing, records no audit event, and leaves the row `executing`
+    (only the outcome path ever leaves that state; no resume, sweep, or timeout does)."""
+    tenant = await seed_tenant(environment, roles=["member"], via_operator=False)
+    identity_id = tenant.identities["member"]
+    await seed_conversation(
+        environment,
+        tenant_id=tenant.tenant_id,
+        identity_id=identity_id,
+        conversation_id=CONVERSATION_ID,
+    )
+    document_id = await seed_document(
+        environment, tenant_id=tenant.tenant_id, identity_id=identity_id, title=ORIGINAL_TITLE
+    )
+    use_model(_rename_model(document_id=document_id, title=NEW_TITLE))
+
+    async with client:
+        await _propose(client, tenant.tenant_id, identity_id)
+        # Approved and claimed by someone else -- written directly, as the state a concurrent
+        # winner (or a crashed one) leaves behind; the approval itself is already on record.
+        await _set_pending_action_status(
+            environment.superuser_url, tenant_id=tenant.tenant_id, status="executing"
+        )
+        before = await _audit_kinds_for_tenant(
+            environment.superuser_url, tenant_id=tenant.tenant_id
+        )
+
+        resumed = await _resume(
+            client,
+            tenant.tenant_id,
+            identity_id,
+            document_id=document_id,
+            title=NEW_TITLE,
+            approved=True,
+        )
+
+    assert "approval could not be verified: status_executing" in resumed.text
+    assert '"type":"error"' not in resumed.text
+    assert await _document_title(environment.superuser_url, document_id=document_id) == (
+        ORIGINAL_TITLE
+    )
+    assert (
+        await _audit_kinds_for_tenant(environment.superuser_url, tenant_id=tenant.tenant_id)
+        == before
+    )
+    rows = await _pending_action_rows(environment.superuser_url, tenant_id=tenant.tenant_id)
+    assert [row["status"] for row in rows] == ["executing"]
 
 
 async def test_writing_tool_goes_through_the_shared_repository_layer(

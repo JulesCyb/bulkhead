@@ -250,7 +250,10 @@ def test_0043_widens_the_pending_action_status_check_and_downgrade_refuses_new_v
     """#82: migration 0043 widens `pending_actions_status_check` to the six lifecycle states; a
     downgrade on an empty table restores exactly the three-value constraint, and `upgrade head`
     widens it again. With a row carrying one of the new values, the downgrade refuses (its
-    documented limitation) and leaves the schema at 0043 -- nothing is silently rewritten."""
+    documented limitation) and leaves the schema at 0043 -- nothing is silently rewritten.
+
+    Pinned to 0043 itself (explicit targets, not "head"): head moved past it (0044, #122), and a
+    refused downgrade from head would roll back 0044's step too in the same transaction."""
     migrate_module.migrate_all()
     pooled = migrate_env["pooled"]
 
@@ -291,9 +294,11 @@ def test_0043_widens_the_pending_action_status_check_and_downgrade_refuses_new_v
         finally:
             await engine.dispose()
 
+    command.downgrade(config, "0043")
     widened = migrate_module.asyncio.run(_check_definition())
     for status in ("pending", "approved", "refused", "expired", "executed", "execution_failed"):
         assert f"'{status}'" in widened
+    assert "'executing'" not in widened
 
     command.downgrade(config, "0042")
     narrowed = migrate_module.asyncio.run(_check_definition())
@@ -301,11 +306,84 @@ def test_0043_widens_the_pending_action_status_check_and_downgrade_refuses_new_v
     for status in ("expired", "executed", "execution_failed"):
         assert f"'{status}'" not in narrowed
 
-    command.upgrade(config, "head")
+    command.upgrade(config, "0043")
     assert migrate_module.asyncio.run(_check_definition()) == widened
 
     migrate_module.asyncio.run(_plant_executed_row())
     with pytest.raises(Exception, match="cannot downgrade 0043"):
         command.downgrade(config, "0042")
     assert migrate_module.asyncio.run(_alembic_version(pooled.owner_url)) == "0043"
+    assert migrate_module.asyncio.run(_check_definition()) == widened
+
+
+def test_0044_adds_executing_to_the_pending_action_status_check_and_downgrade_refuses_it(
+    cluster, migrate_env
+):
+    """#122: migration 0044 adds `executing` (the claim before a writing tool runs) to
+    `pending_actions_status_check`, on a fresh database (`migrate_all()` walks every revision) and
+    on one already at 0043 (`downgrade 0043` then `upgrade head`). A downgrade on a table without
+    `executing` rows restores exactly 0043's six-value constraint; with an `executing` row the
+    downgrade refuses (its documented limitation) and leaves the schema at 0044."""
+    migrate_module.migrate_all()
+    pooled = migrate_env["pooled"]
+    assert migrate_module.asyncio.run(_alembic_version(pooled.owner_url)) == "0044"
+
+    config = Config(str(migrate_module._ALEMBIC_INI))
+    config.set_main_option("script_location", str(migrate_module._REPO_ROOT / "migrations"))
+    config.attributes["migration_database_url"] = pooled.owner_url
+
+    async def _check_definition() -> str:
+        engine = create_async_engine(pooled.superuser_url)
+        try:
+            async with engine.connect() as conn:
+                return (
+                    await conn.execute(
+                        text(
+                            "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                            "WHERE conname = 'pending_actions_status_check'"
+                        )
+                    )
+                ).scalar_one()
+        finally:
+            await engine.dispose()
+
+    async def _plant_row(status: str) -> None:
+        # Superuser with FK triggers off: this test is about the CHECK constraint, not the
+        # tenant/conversation/membership rows a real pending action hangs off.
+        engine = create_async_engine(pooled.superuser_url)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text("SET LOCAL session_replication_role = replica"))
+                await conn.execute(
+                    text(
+                        "INSERT INTO pending_actions (tenant_id, conversation_id, tool_name, "
+                        "args_hash, tool_call_id, asking_membership_id, status, expires_at) "
+                        "VALUES (gen_random_uuid(), 'c', 't', 'h', 'call', gen_random_uuid(), "
+                        ":status, now())"
+                    ),
+                    {"status": status},
+                )
+        finally:
+            await engine.dispose()
+
+    lifecycle = ("pending", "approved", "refused", "expired", "executed", "execution_failed")
+    widened = migrate_module.asyncio.run(_check_definition())
+    for status in (*lifecycle, "executing"):
+        assert f"'{status}'" in widened
+
+    # A row carrying one of 0043's values does not block going back to 0043.
+    migrate_module.asyncio.run(_plant_row("executed"))
+    command.downgrade(config, "0043")
+    narrowed = migrate_module.asyncio.run(_check_definition())
+    for status in lifecycle:
+        assert f"'{status}'" in narrowed
+    assert "'executing'" not in narrowed
+
+    command.upgrade(config, "head")
+    assert migrate_module.asyncio.run(_check_definition()) == widened
+
+    migrate_module.asyncio.run(_plant_row("executing"))
+    with pytest.raises(Exception, match="cannot downgrade 0044"):
+        command.downgrade(config, "0043")
+    assert migrate_module.asyncio.run(_alembic_version(pooled.owner_url)) == "0044"
     assert migrate_module.asyncio.run(_check_definition()) == widened
