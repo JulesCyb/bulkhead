@@ -36,6 +36,7 @@ from tests.test_writing_tool_approval_integration import (  # noqa: E402
     _audit_kinds_for_tenant,
     _chat_path,
     _headers,
+    _pending_action_rows,
 )
 
 _ = (cluster, environment)
@@ -234,6 +235,9 @@ async def test_throwaway_writing_tool_that_raises_is_recorded_as_failed_to_execu
 
     kinds = await _audit_kinds_for_tenant(environment.superuser_url, tenant_id=tenant.tenant_id)
     assert kinds == ["requested", "approved", "failed_to_execute"]
+    # #82: the pending action records the failed execution too, not only the audit trail.
+    rows = await _pending_action_rows(environment.superuser_url, tenant_id=tenant.tenant_id)
+    assert [row["status"] for row in rows] == ["execution_failed"]
 
 
 async def test_throwaway_writing_tool_nothing_found_is_also_failed_to_execute(

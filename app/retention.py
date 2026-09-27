@@ -35,6 +35,8 @@ A suspended tenant is skipped outright (#106, ADR-0010): its record is read (the
 every tenant gets), `record.suspended` is checked before anything else, and a suspended tenant
 gets one log line and no `tenant_session()` -- never `TenantSuspendedError` raised mid-sweep, which
 would otherwise abort the whole job's `for` loop at whichever tenant happened to be suspended.
+The enumerate / read-record / skip-suspended / build-job-context loop itself lives in
+`app/tenant_jobs.py` (`visit_active_tenants`, #82), shared with the pending-action sweep.
 The reason is CONTEXT.md's definition of suspension -- a state in which "nothing is deleted"
 (ADR-0010) -- and it is the one deliberate exception to CLAUDE.md rule 2's "with no exception"
 for retention; `app/db/session.py`'s module docstring lists where suspension itself is refused.
@@ -50,21 +52,17 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from app.config import Settings, get_settings
-from app.context import RequestContext
-from app.db.session import tenant_record_session, tenant_session
-from app.operator.listing import list_tenants
-from app.repositories.control import ControlRepository
+from app.db.session import tenant_session
 from app.repositories.conversations import ConversationsRepository
+from app.tenant_jobs import JOB_IDENTITY_ID, visit_active_tenants
 from app.tenant_settings import effective_retention_days
 
 log = logging.getLogger(__name__)
 
-# This job has no acting person or agent identity behind it -- it is a scheduled sweep, not a
-# request on anyone's behalf. It is only ever used as the per-transaction `app.identity_id`
-# setting; `ConversationsRepository.delete_expired` issues a DELETE, never an INSERT, so no
-# `created_by` default (a NOT NULL foreign key to `control.identities`) is ever consulted for it.
-# Same nil-UUID-as-sentinel convention as `app/operator/audit.py`'s `UNSCOPED_TENANT_ID`.
-JOB_IDENTITY_ID = UUID(int=0)
+# Re-exported for existing importers; defined once in `app/tenant_jobs.py`.
+# `ConversationsRepository.delete_expired` issues a DELETE, never an INSERT, so no `created_by`
+# default is ever consulted for it.
+__all__ = ["JOB_IDENTITY_ID", "RetentionOutcome", "run_retention_job"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,17 +91,8 @@ async def run_retention_job(
     """
     settings = settings or get_settings()
     outcomes: list[RetentionOutcome] = []
-    for tenant in await list_tenants(conn):
-        async with tenant_record_session(tenant.tenant_id) as record_session:
-            record = await ControlRepository().get_tenant_record(
-                record_session, tenant_id=tenant.tenant_id
-            )
-        if record.suspended:
-            log.info("retention: skipping suspended tenant %s (%r)", tenant.tenant_id, tenant.name)
-            continue
-        ctx = RequestContext(
-            tenant_id=tenant.tenant_id, identity_id=JOB_IDENTITY_ID, tenant_record=record
-        )
+    async for visit in visit_active_tenants(conn, job="retention"):
+        tenant, record, ctx = visit.tenant, visit.record, visit.ctx
         stored_retention_days = record.settings.retention_days
         retention_days = effective_retention_days(
             record.settings, max_days=settings.max_retention_days

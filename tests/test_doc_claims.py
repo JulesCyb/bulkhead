@@ -971,3 +971,13 @@ def test_claude_md_commands_lists_add_membership() -> None:
     commands_block = CLAUDE_MD.split("## Commands", 1)[1].split("## Architecture rules", 1)[0]
     assert "scripts/operator.py add-membership" in commands_block
     assert "idempotent" in commands_block
+
+
+# --- #82: the pending-action sweep ----------------------------------------------------------------
+
+
+def test_claude_md_commands_and_readme_list_the_pending_action_sweep_script() -> None:
+    commands_block = CLAUDE_MD.split("## Commands", 1)[1].split("## Architecture rules", 1)[0]
+    assert "uv run python scripts/sweep_pending_actions.py" in commands_block
+    assert "scripts/sweep_pending_actions.py" in README
+    assert "scripts/sweep_pending_actions.py" in ADR_0007

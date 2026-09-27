@@ -234,10 +234,78 @@ def test_0042_downgrade_then_upgrade_touches_exactly_the_two_delegation_means_co
     before = migrate_module.asyncio.run(_columns())
     assert {"means_kind", "means_id"} <= before
 
-    command.downgrade(config, "-1")
+    # An explicit target, not "-1": head moved past 0042 (0043, #82).
+    command.downgrade(config, "0041")
     after_downgrade = migrate_module.asyncio.run(_columns())
     assert after_downgrade == before - {"means_kind", "means_id"}
 
     command.upgrade(config, "head")
     after_upgrade = migrate_module.asyncio.run(_columns())
     assert after_upgrade == before
+
+
+def test_0043_widens_the_pending_action_status_check_and_downgrade_refuses_new_values(
+    cluster, migrate_env
+):
+    """#82: migration 0043 widens `pending_actions_status_check` to the six lifecycle states; a
+    downgrade on an empty table restores exactly the three-value constraint, and `upgrade head`
+    widens it again. With a row carrying one of the new values, the downgrade refuses (its
+    documented limitation) and leaves the schema at 0043 -- nothing is silently rewritten."""
+    migrate_module.migrate_all()
+    pooled = migrate_env["pooled"]
+
+    config = Config(str(migrate_module._ALEMBIC_INI))
+    config.set_main_option("script_location", str(migrate_module._REPO_ROOT / "migrations"))
+    config.attributes["migration_database_url"] = pooled.owner_url
+
+    async def _check_definition() -> str:
+        engine = create_async_engine(pooled.superuser_url)
+        try:
+            async with engine.connect() as conn:
+                return (
+                    await conn.execute(
+                        text(
+                            "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                            "WHERE conname = 'pending_actions_status_check'"
+                        )
+                    )
+                ).scalar_one()
+        finally:
+            await engine.dispose()
+
+    async def _plant_executed_row() -> None:
+        # Superuser with FK triggers off: this test is about the CHECK constraint, not the
+        # tenant/conversation/membership rows a real pending action hangs off.
+        engine = create_async_engine(pooled.superuser_url)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text("SET LOCAL session_replication_role = replica"))
+                await conn.execute(
+                    text(
+                        "INSERT INTO pending_actions (tenant_id, conversation_id, tool_name, "
+                        "args_hash, tool_call_id, asking_membership_id, status, expires_at) "
+                        "VALUES (gen_random_uuid(), 'c', 't', 'h', 'call', gen_random_uuid(), "
+                        "'executed', now())"
+                    )
+                )
+        finally:
+            await engine.dispose()
+
+    widened = migrate_module.asyncio.run(_check_definition())
+    for status in ("pending", "approved", "refused", "expired", "executed", "execution_failed"):
+        assert f"'{status}'" in widened
+
+    command.downgrade(config, "0042")
+    narrowed = migrate_module.asyncio.run(_check_definition())
+    assert "'refused'" in narrowed
+    for status in ("expired", "executed", "execution_failed"):
+        assert f"'{status}'" not in narrowed
+
+    command.upgrade(config, "head")
+    assert migrate_module.asyncio.run(_check_definition()) == widened
+
+    migrate_module.asyncio.run(_plant_executed_row())
+    with pytest.raises(Exception, match="cannot downgrade 0043"):
+        command.downgrade(config, "0042")
+    assert migrate_module.asyncio.run(_alembic_version(pooled.owner_url)) == "0043"
+    assert migrate_module.asyncio.run(_check_definition()) == widened

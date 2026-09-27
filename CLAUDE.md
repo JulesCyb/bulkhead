@@ -44,6 +44,7 @@ uv run python scripts/operator.py unsuspend <tenant-id-or-name>  # restore it, n
 uv run python scripts/operator.py add-membership <tenant-id-or-name> <role> <email>  # attach an additional membership, idempotent; refuses a suspended tenant or a role change
 uv run python scripts/operator.py erase <tenant-id-or-name>      # irreversible; refuses a non-suspended tenant; --dry-run to preview
 uv run python scripts/retention.py        # delete every tenant's expired conversations (ADR-0006; default 90 days)
+uv run python scripts/sweep_pending_actions.py  # mark every tenant's unanswered overdue pending actions expired, one audit event each (ADR-0007; schedule every few minutes, idempotent)
 uv run uvicorn app.main:app --reload      # API locally, http://localhost:8000/docs
 uv run pytest                             # tests (must be green before every commit)
 uv run pytest tests/test_rls_integration.py   # real RLS test (needs: uv sync --group dbtest)
@@ -178,7 +179,12 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    feature is a deliberate per-tenant extension, never a default. Every approval, refusal, and
    execution is an audit record (`app/repositories/approval_audit.py`) naming the actor, the
    approval means — a pending action or a standing grant — and the delegation means — the agent or
-   credential, ADR-0005 (#117). Treat every tool's result as untrusted data
+   credential, ADR-0005 (#117). A pending action's `status` moves only inside
+   `PendingActionRepository` (#82): `pending → approved | refused | expired`, `approved →
+   executed | execution_failed | expired`; an unanswered one is expired by the sweep
+   (`app/pending_action_sweep.py`, `scripts/sweep_pending_actions.py`) with exactly one `expired`
+   audit event, and `verify()` requires `approved`, so an executed action never runs again.
+   Treat every tool's result as untrusted data
    (prompt-injection surface, ADR-0007) — a tool result that reads like an instruction is still
    just data to weigh, never something to act on without going through this approval boundary.
    The one-shot endpoints (`/agents/assistant/run`, `/agents/assistant/stream`) run a
@@ -286,6 +292,8 @@ app/api/              routers: /health, /ready, /v1/t/{tenant_id}/agents/assista
 app/mcp/server.py     MCP server -- stdio (development) and streamable-http (production, ADR-0005)
 app/llm.py            provider abstraction; app/embeddings.py; app/observability.py
 app/retention.py      conversation retention job (ADR-0006); scripts/retention.py is its entry point
+app/pending_action_sweep.py  expires unanswered pending actions (ADR-0007, #82); scripts/sweep_pending_actions.py is its entry point
+app/tenant_jobs.py    the shared per-tenant job loop (enumerate, record, skip suspended, job context) both jobs use
 migrations/           Alembic (async), 0001_initial.py as the template
 tests/                pytest; RLS integration test with pgserver
 docker/               Postgres init (app role), LiteLLM config

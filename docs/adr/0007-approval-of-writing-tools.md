@@ -50,6 +50,11 @@ per-tenant extension if a customer demands it.
   `app/agents/run.py`, with the `writing_tool` decorator it re-exports
   (`app/agents/writing_tools.py`); a second writing tool applies that decorator instead of
   copying `rename_document`'s former hand-written wrapper.
+- Positive (#82): a pending action records its whole lifecycle -- `expired`, `executed`,
+  `execution_failed` beside `pending`/`approved`/`refused` (migration 0043) -- so an executed
+  action can never verify again, and a proposal nobody answers still leaves an `expired` audit
+  record: a sweep (`app/pending_action_sweep.py`, `scripts/sweep_pending_actions.py`) expires
+  overdue pending actions per tenant under RLS, skipping suspended tenants (ADR-0010).
 - Negative / costs: a pending-action table (tenant-scoped, RLS) and a standing-grant table in
   the tenant; two agents instead of one; every writing tool needs a test that the approval
   binding and the role check hold.
