@@ -3,6 +3,11 @@ error mapping, and the secret-file half, exercised without a real database or a 
 call -- `GatewayAdminClient` is built on `httpx.MockTransport`, so this is the "ASGI application
 plus Settings, gateway call faked" seam. The control-plane read/write half is covered by the
 embedded-Postgres tests in tests/test_gateway_provisioning_integration.py.
+
+Since #85 / spec A4 / #111: the minted credential's usable models come from
+`settings.residency_allow_list.model_aliases(residency)` (`app.residency.ResidencyAllowList`),
+never a second, hand-maintained Python literal -- the retired `GATEWAY_MODEL_ALIASES_BY_RESIDENCY`
+must never come back.
 """
 
 from __future__ import annotations
@@ -15,7 +20,6 @@ import pytest
 from app.config import Settings
 from app.gateway_credentials import GatewayCredentialUnavailable
 from app.gateway_provisioning import (
-    GATEWAY_MODEL_ALIASES_BY_RESIDENCY,
     GatewayAdminClient,
     GatewayCredentialLimits,
     GatewayProvisioningError,
@@ -25,6 +29,8 @@ from app.gateway_provisioning import (
     revoke_gateway_credential,
     write_gateway_credential_file,
 )
+from app.llm import validate_model_for_residency
+from app.residency import ResidencyAllowList
 
 
 @pytest.fixture
@@ -155,13 +161,13 @@ async def test_unknown_residency_is_rejected_before_any_gateway_call():
             residency="mars",
             limits=LIMITS,
             admin_client=_admin_client(handler),
-            owner_engine=object(),  # never reached
         )
     assert called is False
 
 
-def test_eu_and_us_residencies_have_distinct_model_lists():
-    assert GATEWAY_MODEL_ALIASES_BY_RESIDENCY["eu"] != GATEWAY_MODEL_ALIASES_BY_RESIDENCY["us"]
+def test_eu_and_us_residencies_have_distinct_model_lists(settings):
+    allow_list = settings.residency_allow_list
+    assert allow_list.model_aliases("eu") != allow_list.model_aliases("us")
 
 
 # --- Secret-file helpers ----------------------------------------------------------------------
@@ -191,28 +197,35 @@ def test_generated_aliases_are_unique_even_for_the_same_tenant():
 
 
 class _FakeControlPlane:
-    """Stands in for the control-plane read/write helpers so this module's orchestration is
-    testable with no real database -- the real control-plane behavior (owner-only write, RLS,
-    the resolver reading it back) is covered by the embedded-Postgres integration test.
+    """Stands in for `ControlRepository`'s own gateway-alias read/write so this module's
+    orchestration is testable with no real database -- the real control-plane behavior
+    (owner-only write, RLS, the resolver reading it back) is covered by the embedded-Postgres
+    integration test.
     """
 
     def __init__(self) -> None:
         self.aliases: dict[uuid.UUID, str | None] = {}
 
-    async def record(self, tenant_id: uuid.UUID, alias: str | None, *, owner_engine) -> None:
+    async def record(self, tenant_id: uuid.UUID, alias: str | None) -> None:
         self.aliases[tenant_id] = alias
 
-    async def read(self, tenant_id: uuid.UUID, *, owner_engine) -> str | None:
+    async def read(self, tenant_id: uuid.UUID) -> str | None:
         return self.aliases.get(tenant_id)
 
 
 @pytest.fixture
 def control_plane(monkeypatch):
     fake = _FakeControlPlane()
-    import app.gateway_provisioning as module
+    from app.repositories.control import ControlRepository
 
-    monkeypatch.setattr(module, "_record_alias_in_control_plane", fake.record)
-    monkeypatch.setattr(module, "_read_alias_from_control_plane", fake.read)
+    async def fake_write(self, conn, tenant_id, alias):
+        await fake.record(tenant_id, alias)
+
+    async def fake_read(self, conn, tenant_id):
+        return await fake.read(tenant_id)
+
+    monkeypatch.setattr(ControlRepository, "write_gateway_credential_alias", fake_write)
+    monkeypatch.setattr(ControlRepository, "read_gateway_credential_alias", fake_read)
     return fake
 
 
@@ -227,10 +240,65 @@ async def test_provision_writes_file_and_records_alias(settings, control_plane, 
         limits=LIMITS,
         settings=settings,
         admin_client=_admin_client(handler),
-        owner_engine=object(),
+        conn=object(),
     )
     assert (tmp_path / alias).read_text() == "sk-acme"
     assert control_plane.aliases[tenant_id] == alias
+
+
+async def test_model_added_to_the_allow_list_is_both_allowed_and_mintable_with_no_second_edit(
+    control_plane, tmp_path
+):
+    """#85 (spec A4 / #111): a model added to a residency's allow-list in the TOML/in-memory data
+    is both allowed by model resolution (`app.llm.validate_model_for_residency`) and included in
+    a freshly minted credential's usable models -- one edit to the allow-list data, never a
+    second, hand-maintained Python literal (the retired `GATEWAY_MODEL_ALIASES_BY_RESIDENCY`) to
+    keep in sync with it.
+    """
+    allow_list = ResidencyAllowList.from_data(
+        {
+            "residency": {
+                "eu": {
+                    "model_host_patterns": ["litellm.internal"],
+                    "embedding_endpoint": "https://litellm.internal/v1",
+                    "trace_sink_host": "eu.cloud.langfuse.com",
+                    "models": ["claude-eu", "embeddings", "claude-eu-mini"],
+                }
+            }
+        }
+    )
+    settings = Settings(
+        database_url="postgresql+asyncpg://app:app@localhost:5432/app",
+        gateway_credentials_dir=str(tmp_path),
+        litellm_base_url="http://litellm.internal:4000",
+        litellm_master_key="sk-master-test",
+        residency_allow_list=allow_list,
+    )
+
+    # Allowed: the freshly added model resolves for its residency with no second edit anywhere.
+    assert validate_model_for_residency("claude-eu-mini", "eu", settings=settings) == (
+        "claude-eu-mini"
+    )
+
+    captured: dict[str, list[str]] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        captured["models"] = json.loads(request.content)["models"]
+        return httpx.Response(200, json={"key": "sk-acme"})
+
+    await provision_gateway_credential(
+        uuid.uuid4(),
+        residency="eu",
+        limits=LIMITS,
+        settings=settings,
+        admin_client=_admin_client(handler),
+        conn=object(),
+    )
+
+    # Mintable: the same freshly added model was actually sent to the gateway as a usable model.
+    assert "claude-eu-mini" in captured["models"]
 
 
 async def test_two_tenants_get_distinct_aliases_and_credentials(settings, control_plane, tmp_path):
@@ -247,7 +315,7 @@ async def test_two_tenants_get_distinct_aliases_and_credentials(settings, contro
         limits=LIMITS,
         settings=settings,
         admin_client=_admin_client(make_handler("sk-a")),
-        owner_engine=object(),
+        conn=object(),
     )
     alias_b = await provision_gateway_credential(
         tenant_b,
@@ -255,7 +323,7 @@ async def test_two_tenants_get_distinct_aliases_and_credentials(settings, contro
         limits=LIMITS,
         settings=settings,
         admin_client=_admin_client(make_handler("sk-b")),
-        owner_engine=object(),
+        conn=object(),
     )
     assert alias_a != alias_b
     assert (tmp_path / alias_a).read_text() != (tmp_path / alias_b).read_text()
@@ -274,7 +342,7 @@ async def test_revoke_calls_gateway_once_and_removes_the_file(settings, control_
         limits=LIMITS,
         settings=settings,
         admin_client=_admin_client(mint_handler),
-        owner_engine=object(),
+        conn=object(),
     )
     assert (tmp_path / alias).exists()
 
@@ -286,7 +354,7 @@ async def test_revoke_calls_gateway_once_and_removes_the_file(settings, control_
         tenant_id,
         settings=settings,
         admin_client=_admin_client(revoke_handler),
-        owner_engine=object(),
+        conn=object(),
     )
     assert revoked is True
     assert revoke_calls == ["/key/delete"]
@@ -308,7 +376,7 @@ async def test_second_revoke_is_a_noop_and_never_calls_the_gateway_again(
         limits=LIMITS,
         settings=settings,
         admin_client=_admin_client(mint_handler),
-        owner_engine=object(),
+        conn=object(),
     )
 
     revoke_calls: list[str] = []
@@ -321,13 +389,13 @@ async def test_second_revoke_is_a_noop_and_never_calls_the_gateway_again(
         tenant_id,
         settings=settings,
         admin_client=_admin_client(revoke_handler),
-        owner_engine=object(),
+        conn=object(),
     )
     second = await revoke_gateway_credential(
         tenant_id,
         settings=settings,
         admin_client=_admin_client(revoke_handler),
-        owner_engine=object(),
+        conn=object(),
     )
     assert first is True
     assert second is False
@@ -343,7 +411,7 @@ async def test_revoking_a_tenant_with_no_credential_is_a_noop(settings, control_
         return httpx.Response(200, json={"deleted_keys": []})
 
     revoked = await revoke_gateway_credential(
-        uuid.uuid4(), settings=settings, admin_client=_admin_client(handler), owner_engine=object()
+        uuid.uuid4(), settings=settings, admin_client=_admin_client(handler), conn=object()
     )
     assert revoked is False
     assert called is False
@@ -360,7 +428,7 @@ async def test_revoke_handles_a_missing_secret_file_gracefully(settings, control
         return httpx.Response(200, json={"deleted_keys": []})
 
     revoked = await revoke_gateway_credential(
-        tenant_id, settings=settings, admin_client=_admin_client(handler), owner_engine=object()
+        tenant_id, settings=settings, admin_client=_admin_client(handler), conn=object()
     )
     assert revoked is True
     assert control_plane.aliases[tenant_id] is None
@@ -387,7 +455,7 @@ async def test_provisioning_without_a_base_url_raises_before_any_call(tmp_path):
     settings.litellm_base_url = None
     with pytest.raises(GatewayProvisioningError):
         await provision_gateway_credential(
-            uuid.uuid4(), residency="eu", limits=LIMITS, settings=settings, owner_engine=object()
+            uuid.uuid4(), residency="eu", limits=LIMITS, settings=settings
         )
 
 
@@ -400,5 +468,5 @@ async def test_provisioning_without_a_master_key_raises_before_any_call(tmp_path
     )
     with pytest.raises(GatewayProvisioningError):
         await provision_gateway_credential(
-            uuid.uuid4(), residency="eu", limits=LIMITS, settings=settings, owner_engine=object()
+            uuid.uuid4(), residency="eu", limits=LIMITS, settings=settings
         )

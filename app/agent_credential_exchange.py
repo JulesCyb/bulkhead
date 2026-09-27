@@ -11,18 +11,24 @@ single module (`app/token_verifier.py`) verifies both kinds later.
 **Gap fix (Spec 6 / #49):** the minted token's issuer is the agent identity's *own* issuer
 (`token_verifier.AGENT_IDENTITY_ISSUER`, the fixed literal `control.create_agent_identity`
 synthesizes every agent identity's `issuer` column as) -- never the requesting tenant's own
-human-IdP issuer. The two used to be conflated here, which meant a real agent token could never
-verify: `verify_tenant_token` resolved the tenant's human issuer and checked the token's signature
-against `jwt_verification_key`, while this module signed with the separate
+human identity provider's issuer. The two used to be conflated here, which meant a real agent
+token could never verify: `verify_tenant_token` resolved the tenant's human issuer and checked the
+token's signature against `jwt_verification_key`, while this module signed with the separate
 `agent_token_signing_key`. Signing under the agent identity's real issuer lets the shared verifier
 recognize it (by peeking `iss`, see `app/token_verifier.py`) and check it against the matching key
-instead. The credential's own public id travels along as an extra `cred` claim so a caller
-resolving the token later (the MCP transport, #49) can name it as `RequestContext`'s means without
-a second lookup.
+instead. The credential's own public id travels along as an extra `cred` claim so a caller resolving
+the token later (the MCP transport, #49) can name it as `RequestContext`'s means without a second
+lookup.
 
 This module raises exactly one exception, `AgentCredentialExchangeError`, for every way an
 exchange can fail -- the caller (`app/api/agent_tokens.py`) maps it to one generic response,
 never revealing which part of a bad attempt was wrong. The exception message is for logs only.
+
+`derive_public_key_pem` below (relocated here by spec A4 / #94, #112) is the pure PEM
+private-key -> public-key derivation `Settings._require_consistent_agent_token_key`
+(`app/config.py`) needs for an asymmetric `AGENT_TOKEN_ALGORITHM`: this module -- the one that
+actually mints agent tokens -- is its home, not the settings module, which now only *checks*
+consistency by calling it. No PEM parsing happens in `app/config.py` itself.
 """
 
 from __future__ import annotations
@@ -30,6 +36,8 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from uuid import UUID
+
+from cryptography.hazmat.primitives import serialization
 
 from app.config import Settings
 from app.context import RequestContext
@@ -50,6 +58,45 @@ class AgentCredentialExchangeError(Exception):
     """Raised for every way an exchange can fail: an unknown public id, a wrong secret, a revoked
     credential, or a tenant/identity that cannot be resolved to a usable issuer. Callers map this
     to a single generic response -- see module docstring."""
+
+
+class AgentTokenKeyDerivationError(ValueError):
+    """`derive_public_key_pem`'s argument is not a usable PEM-encoded private key."""
+
+
+def derive_public_key_pem(private_key_pem: str) -> str:
+    """Pure PEM private-key -> public-key derivation (review finding, Spec 6 / ADR-0005;
+    relocated from `app.config.Settings._require_consistent_agent_token_key` by spec A4 / #94,
+    #112).
+
+    Used for an asymmetric `AGENT_TOKEN_ALGORITHM` (RS*/ES*/PS*): minting needs the private key
+    (`AGENT_TOKEN_SIGNING_KEY`); this derives the matching public half for verification
+    (`AGENT_TOKEN_VERIFICATION_KEY`) when a deployment did not set one explicitly, so it only
+    ever has to manage the one private-key secret. `Settings` construction calls this only to
+    *check* that the configured signing key is a real private key and to populate the derived
+    verification key -- no PEM parsing happens in `app/config.py` itself.
+
+    Raises `AgentTokenKeyDerivationError` if `private_key_pem` cannot be parsed as a PEM private
+    key.
+    """
+    try:
+        private_key = serialization.load_pem_private_key(
+            private_key_pem.encode("utf-8"), password=None
+        )
+    except Exception as exc:
+        raise AgentTokenKeyDerivationError(
+            "must be a PEM-encoded private key so its public key can be derived for "
+            "verification, or set AGENT_TOKEN_VERIFICATION_KEY explicitly to the matching "
+            "public key."
+        ) from exc
+    return (
+        private_key.public_key()
+        .public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        .decode("utf-8")
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,9 +134,9 @@ async def exchange_agent_credential(
         raise AgentCredentialExchangeError("credential's identity does not resolve")
 
     # Gap fix (see module docstring): the agent identity's own issuer, never the tenant's
-    # human-IdP one -- `control.create_agent_identity` (migration 0032) is the only writer of
-    # `identity.issuer` for an identity of kind agent, and it always synthesizes exactly this
-    # value. A mismatch here would mean this credential does not actually belong to an agent
+    # human identity provider's -- `control.create_agent_identity` (migration 0032) is the only
+    # writer of `identity.issuer` for an identity of kind agent, and it always synthesizes exactly
+    # this value. A mismatch here would mean this credential does not actually belong to an agent
     # identity at all -- fail closed rather than mint a token nothing can later verify correctly.
     if identity.issuer != AGENT_IDENTITY_ISSUER:
         raise AgentCredentialExchangeError("credential's identity is not an agent identity")

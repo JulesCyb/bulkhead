@@ -9,9 +9,9 @@ import uuid
 
 import httpx
 import pytest
+from pydantic_ai.models.test import TestModel
 
 from app import config
-from app.agents import assistant as assistant_module
 from app.main import app
 from app.request_limit import RequestLimiter, RequestLimitExceeded, _limiter_for
 
@@ -71,11 +71,8 @@ def low_limit(monkeypatch):
 
 
 @pytest.fixture
-def client(monkeypatch, fake_search, fake_history, test_model, low_limit):
-    monkeypatch.setattr(assistant_module.document_tools, "search_documents", fake_search)
-    monkeypatch.setattr(
-        assistant_module.conversation_tools, "load_conversation_history", fake_history
-    )
+def client(route_run, low_limit):
+    route_run(TestModel(call_tools=["search_documents"]))
     transport = httpx.ASGITransport(app=app)
     return httpx.AsyncClient(transport=transport, base_url="http://test")
 

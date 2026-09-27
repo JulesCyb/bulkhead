@@ -9,19 +9,16 @@ from __future__ import annotations
 
 import time
 import uuid
-from contextlib import asynccontextmanager
-from types import SimpleNamespace
 
 import httpx
 import jwt
 import pytest
 
 import app.deps as deps_module
-import app.tenant_suspension as tenant_suspension_module
-import app.token_verifier as token_verifier_module
 from app.config import Settings, get_settings
-from app.context import RequestContext
 from app.main import app
+from app.token_verifier import set_default_adapter_for_tests
+from tests.conftest import FakeControlPlaneReads
 
 SECRET = "asgi-jwt-test-shared-secret-at-least-32-bytes"
 ISSUER = "https://idp.example.com"
@@ -60,53 +57,21 @@ def _jwt_settings() -> Settings:
     )
 
 
-@asynccontextmanager
-async def _fake_session():
-    yield None
-
-
-def _install_fake_control_plane(monkeypatch, *, auth_settings, identities, memberships):
+def _install_fake_control_plane(*, auth_settings, identities, memberships):
     """`auth_settings`: {tenant_id: (issuer, suspended)} — a missing key means no control-plane
     row (falls back to the default issuer, not suspended), mirroring the real repository.
     `identities`: {(issuer, subject): identity_id}. `memberships`: {(tenant_id, identity_id): role}.
 
-    Installed on both `app.tenant_suspension` (the one shared suspension check every
-    context-resolution seam calls, issue #69) and `app.token_verifier` (the shared
-    signature/audience/identity/membership check, issue #44) — `app.deps` no longer keeps its own
-    copy of either.
+    Installs one `FakeControlPlaneReads` (#100) as the default adapter both
+    `app.token_verifier.verify_tenant_token` (issue #44) and `app.context_resolution`'s own
+    tenant-record read fall back to — `app.deps` calls into both, and keeps no copy of either
+    check itself.
     """
-
-    class FakeTenantAuthSettingsRepository:
-        async def get(self, session, *, tenant_id, default_issuer=None):
-            if tenant_id not in auth_settings:
-                return None
-            issuer, suspended = auth_settings[tenant_id]
-            return SimpleNamespace(issuer=issuer or default_issuer, suspended=suspended)
-
-    class FakeIdentityRepository:
-        async def find_by_issuer_and_subject(self, session, *, issuer, subject):
-            identity_id = identities.get((issuer, subject))
-            if identity_id is None:
-                return None
-            return SimpleNamespace(id=identity_id, issuer=issuer, subject=subject)
-
-    class FakeMembershipRepository:
-        async def get_role(self, session, ctx: RequestContext, *, identity_id):
-            return memberships.get((ctx.tenant_id, identity_id))
-
-    monkeypatch.setattr(tenant_suspension_module, "control_session", _fake_session)
-    monkeypatch.setattr(
-        tenant_suspension_module,
-        "TenantAuthSettingsRepository",
-        FakeTenantAuthSettingsRepository,
+    set_default_adapter_for_tests(
+        FakeControlPlaneReads(
+            auth_settings=auth_settings, identities=identities, memberships=memberships
+        )
     )
-    monkeypatch.setattr(token_verifier_module, "control_session", _fake_session)
-    monkeypatch.setattr(
-        token_verifier_module, "TenantAuthSettingsRepository", FakeTenantAuthSettingsRepository
-    )
-    monkeypatch.setattr(token_verifier_module, "tenant_session", lambda ctx: _fake_session())
-    monkeypatch.setattr(token_verifier_module, "IdentityRepository", FakeIdentityRepository)
-    monkeypatch.setattr(token_verifier_module, "MembershipRepository", FakeMembershipRepository)
 
 
 @pytest.fixture
@@ -132,7 +97,7 @@ async def _post_run(tenant_id: uuid.UUID, token: str | None) -> httpx.Response:
 
 async def test_missing_authorization_header_is_unauthenticated(jwt_client, monkeypatch):
     tenant_id = uuid.uuid4()
-    _install_fake_control_plane(monkeypatch, auth_settings={}, identities={}, memberships={})
+    _install_fake_control_plane(auth_settings={}, identities={}, memberships={})
     response = await _post_run(tenant_id, token=None)
     assert response.status_code == 401
 
@@ -140,7 +105,6 @@ async def test_missing_authorization_header_is_unauthenticated(jwt_client, monke
 async def test_bad_signature_is_unauthenticated(jwt_client, monkeypatch):
     tenant_id = uuid.uuid4()
     _install_fake_control_plane(
-        monkeypatch,
         auth_settings={tenant_id: (ISSUER, False)},
         identities={(ISSUER, "sub-1"): uuid.uuid4()},
         memberships={},
@@ -153,7 +117,6 @@ async def test_bad_signature_is_unauthenticated(jwt_client, monkeypatch):
 async def test_expired_token_is_unauthenticated(jwt_client, monkeypatch):
     tenant_id = uuid.uuid4()
     _install_fake_control_plane(
-        monkeypatch,
         auth_settings={tenant_id: (ISSUER, False)},
         identities={(ISSUER, "sub-1"): uuid.uuid4()},
         memberships={},
@@ -170,7 +133,6 @@ async def test_audience_naming_wrong_tenant_is_forbidden_with_generic_body(
     other_tenant = uuid.uuid4()
     identity_id = uuid.uuid4()
     _install_fake_control_plane(
-        monkeypatch,
         auth_settings={tenant_id: (ISSUER, False)},
         identities={(ISSUER, "sub-1"): identity_id},
         memberships={(tenant_id, identity_id): "member"},
@@ -187,7 +149,6 @@ async def test_audience_naming_wrong_tenant_is_forbidden_with_generic_body(
 async def test_unknown_identity_is_forbidden_with_generic_body(jwt_client, monkeypatch, caplog):
     tenant_id = uuid.uuid4()
     _install_fake_control_plane(
-        monkeypatch,
         auth_settings={tenant_id: (ISSUER, False)},
         identities={},
         memberships={},
@@ -205,7 +166,6 @@ async def test_suspended_tenant_is_forbidden_with_generic_body(jwt_client, monke
     tenant_id = uuid.uuid4()
     identity_id = uuid.uuid4()
     _install_fake_control_plane(
-        monkeypatch,
         auth_settings={tenant_id: (ISSUER, True)},
         identities={(ISSUER, "sub-1"): identity_id},
         memberships={(tenant_id, identity_id): "member"},
@@ -223,7 +183,6 @@ async def test_missing_membership_is_forbidden_with_generic_body(jwt_client, mon
     tenant_id = uuid.uuid4()
     identity_id = uuid.uuid4()
     _install_fake_control_plane(
-        monkeypatch,
         auth_settings={tenant_id: (ISSUER, False)},
         identities={(ISSUER, "sub-1"): identity_id},
         memberships={},
@@ -246,7 +205,6 @@ async def test_nonexistent_tenant_gets_the_identical_forbidden_response_as_a_non
     tenant_id = uuid.uuid4()
     identity_id = uuid.uuid4()
     _install_fake_control_plane(
-        monkeypatch,
         auth_settings={},  # no control-plane row at all
         identities={(ISSUER, "sub-1"): identity_id},
         memberships={},  # and so, naturally, no membership either
@@ -267,7 +225,6 @@ async def test_nonexistent_tenant_gets_the_identical_forbidden_response_as_a_non
 
     other_tenant = uuid.uuid4()
     _install_fake_control_plane(
-        monkeypatch,
         auth_settings={other_tenant: (ISSUER, False)},
         identities={(ISSUER, "sub-1"): identity_id},
         memberships={},
@@ -282,60 +239,64 @@ async def test_nonexistent_tenant_gets_the_identical_forbidden_response_as_a_non
 async def test_a_change_fed_only_into_the_shared_module_is_observed_at_the_http_layer(
     jwt_client, monkeypatch, caplog
 ):
-    """Proves delegation (#44 acceptance criterion 3): `app/deps.py` no longer contains its own
-    copy of the audience check. Patching `verify_tenant_token` itself -- the shared module's only
-    entry point -- to always report a wrong-audience failure, with no other part of the control
-    plane faked, is enough to make the HTTP layer reject the request. If `app/deps.py` still ran
-    its own audience check, this patch alone could not produce a 403 here."""
-    import app.token_verifier as token_verifier_module
+    """Proves delegation (#44, #101): `app/deps.py` keeps no copy of the chain. A valid token for
+    a real member, yet substituting `app.context_resolution.resolve_request_context` -- the one
+    function the HTTP adapter calls -- with one that reports a wrong-audience rejection is enough
+    to make the HTTP layer answer 403 with the generic body and the one security-event line. If
+    `app/deps.py` still resolved the context itself, this substitution could not produce a 403."""
+    import app.context_resolution as context_resolution_module
 
     tenant_id = uuid.uuid4()
+    identity_id = uuid.uuid4()
+    _install_fake_control_plane(
+        auth_settings={tenant_id: (ISSUER, False)},
+        identities={(ISSUER, "sub-1"): identity_id},
+        memberships={(tenant_id, identity_id): "member"},
+    )
 
-    async def _always_audience_mismatch(*args, **kwargs):
-        raise token_verifier_module.TenantTokenVerificationError(
-            token_verifier_module.VerificationFailureReason.AUDIENCE_MISMATCH, issuer=ISSUER
+    async def _always_audience_mismatch(**kwargs):
+        return context_resolution_module.ContextRejection(
+            status=context_resolution_module.RejectionStatus.FORBIDDEN,
+            reason=context_resolution_module.RejectionReason.AUDIENCE_MISMATCH,
+            detail=context_resolution_module.FORBIDDEN_DETAIL,
+            request_id="req-substituted",
+            issuer=ISSUER,
         )
 
-    monkeypatch.setattr(deps_module, "verify_tenant_token", _always_audience_mismatch)
+    monkeypatch.setattr(
+        context_resolution_module, "resolve_request_context", _always_audience_mismatch
+    )
     token = _make_token(audience=str(tenant_id))
     with caplog.at_level("WARNING"):
         response = await _post_run(tenant_id, token)
     assert response.status_code == 403
     assert response.json()["detail"] == deps_module.FORBIDDEN_DETAIL
-    reasons = [r.reason for r in caplog.records if hasattr(r, "reason")]
-    assert "audience_mismatch" in reasons
+    events = [r for r in caplog.records if getattr(r, "event", None) == "jwt_auth_forbidden"]
+    assert [(e.reason, e.tenant_id, e.issuer, e.request_id) for e in events] == [
+        ("audience_mismatch", str(tenant_id), ISSUER, "req-substituted")
+    ]
 
 
 async def test_valid_token_succeeds_and_roles_come_from_the_membership_row(
-    jwt_client, monkeypatch, fake_search, test_model
+    jwt_client, route_run, contexts
 ):
-    import app.agents.assistant as assistant_module
+    from pydantic_ai.models.test import TestModel
 
-    monkeypatch.setattr(assistant_module.document_tools, "search_documents", fake_search)
+    route_run(TestModel(call_tools=["search_documents"]))
 
     tenant_id = uuid.uuid4()
     identity_id = uuid.uuid4()
     _install_fake_control_plane(
-        monkeypatch,
         auth_settings={tenant_id: (ISSUER, False)},
         identities={(ISSUER, "sub-1"): identity_id},
         memberships={(tenant_id, identity_id): "support"},
     )
 
-    captured_contexts: list[RequestContext] = []
-    original_run_assistant = assistant_module.run_assistant
-
-    async def _capturing_run_assistant(prompt, deps):
-        captured_contexts.append(deps.ctx)
-        return await original_run_assistant(prompt, deps)
-
-    monkeypatch.setattr("app.api.agents.run_assistant", _capturing_run_assistant)
-
     token = _make_token(audience=str(tenant_id))
     response = await _post_run(tenant_id, token)
     assert response.status_code == 200, response.text
-    assert captured_contexts, "run_assistant should have been called with a context"
-    ctx = captured_contexts[0]
+    assert contexts, "the run's search tool should have been called with a context"
+    ctx = contexts[0]
     assert ctx.tenant_id == tenant_id
     assert ctx.identity_id == identity_id
     assert ctx.roles == frozenset({"support"})

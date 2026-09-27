@@ -1,14 +1,17 @@
-"""The `erase` command (Spec 9 / #72, ADR-0010): the operator tool's one irreversible command,
-removing a suspended tenant from every place its data lives and writing a permanent record of
-exactly what was removed.
+"""The `erase` command (Spec 9 / #72, ADR-0010, #114): the operator tool's one irreversible
+command, removing a suspended tenant from every place its data lives and writing a permanent
+record of exactly what was removed.
 
-Refuses to run against a tenant that is not currently suspended (`TenantNotSuspendedError`),
-changing nothing -- suspension precedes erasure by construction, not by convention. Otherwise, per
-tenant, in order:
+Reads the tenant's suspension state and isolation tier through
+`app.repositories.control.ControlRepository.get_record` -- never SQL of its own against
+`control.tenants` -- and refuses to run against one that is not currently suspended
+(`TenantNotSuspendedError`), changing nothing: suspension precedes erasure by construction, not
+by convention. Otherwise, per tenant, in order:
 
 1. Revoke the tenant's gateway credential and delete its secret file
-   (`app.gateway_provisioning.revoke_gateway_credential`, Spec 7 / #53) -- a no-op, not an error,
-   if already revoked.
+   (`app.gateway_provisioning.revoke_gateway_credential`, Spec 7 / #53, called with `conn=conn` so
+   its own control-plane write joins this function's transaction) -- a no-op, not an error, if
+   already revoked.
 2. Request deletion of the tenant's traces by tenant id -- a per-tenant deletion capability Spec 8
    has not yet built a real backend for; `app.observability.delete_tenant_traces` is the stub this
    calls through by default (see that module's docstring), replaceable by a test's own fake via
@@ -51,13 +54,14 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection
 
 from app.config import Settings, get_settings
 from app.gateway_provisioning import GatewayAdminClient, revoke_gateway_credential
 from app.observability import delete_tenant_traces
 from app.operator.dedicated_db import drop_dedicated_database
 from app.operator.lookup import resolve_tenant
+from app.repositories.control import ControlRepository
 
 TraceDeleter = Callable[[UUID], Awaitable[None]]
 
@@ -88,6 +92,26 @@ class EraseResult:
     def any_step_failed(self) -> bool:
         return any(step.outcome.startswith(_FAILED_PREFIX) for step in self.steps)
 
+    def render(self) -> str:
+        """Byte-identical to what `app.operator.cli`'s retired `_run_erase` printed (spec A5 /
+        #115): one line per step, then -- for a real (non-dry-run) erasure -- the backup horizon.
+        Never the `audit_outcome` line below; that one was never printed by `_run_erase` either,
+        only written to the operator-action log."""
+        lines = [f"{step.step}: {step.outcome}" for step in self.steps]
+        if not self.dry_run:
+            assert self.backup_horizon is not None
+            lines.append(f"backup horizon: {self.backup_horizon.isoformat()}")
+        return "\n".join(lines)
+
+    @property
+    def audit_outcome(self) -> str:
+        """The one line `app.operator.cli` writes to the operator-action log for this command."""
+        if self.dry_run:
+            return f"dry-run: {self.name!r} ({self.tenant_id}) -- no changes made"
+        prefix = "partial" if self.any_step_failed else "ok"
+        verb = "partially erased (see steps above)" if self.any_step_failed else "erased"
+        return f"{prefix}: {verb} {self.name!r} ({self.tenant_id})"
+
     def as_details(self) -> dict[str, object]:
         """The JSON-shaped payload `app.operator.cli` writes into
         `control.tenant_erasures.details` -- never called for a dry run."""
@@ -114,13 +138,13 @@ async def erase_tenant(
     settings: Settings | None = None,
     admin_client: GatewayAdminClient | None = None,
     trace_deleter: TraceDeleter | None = None,
-    gateway_owner_engine: AsyncEngine | None = None,
 ) -> EraseResult:
     """Erase (or dry-run erase) the tenant named by `identifier` (id or unambiguous name). See
     module docstring for the full contract.
 
-    `admin_client`/`gateway_owner_engine` are forwarded verbatim to
-    `app.gateway_provisioning.revoke_gateway_credential` as its own test seams. `trace_deleter`
+    `admin_client` is forwarded verbatim to `app.gateway_provisioning.revoke_gateway_credential`
+    as its own test seam; that call also gets this function's own `conn` (#114), so its
+    control-plane write shares this transaction rather than opening a second one. `trace_deleter`
     replaces `app.observability.delete_tenant_traces` -- the test seam for Spec 8's not-yet-built
     per-tenant trace deletion. `dedicated_db_admin_url` is only consulted, and only required, when
     this tenant is on the dedicated tier and its database has not already been dropped (see
@@ -130,33 +154,15 @@ async def erase_tenant(
     settings = settings or get_settings()
     trace_deleter = trace_deleter or delete_tenant_traces
 
-    # Needed even to *read* control.tenants below: FORCE ROW LEVEL SECURITY applies to app_owner
-    # too (see app.operator.create's identical comment on this same statement).
-    await conn.execute(
-        text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": str(ref.tenant_id)}
-    )
-    row = (
-        (
-            await conn.execute(
-                text(
-                    "SELECT suspended, isolation_tier, database_alias "
-                    "FROM control.tenants WHERE tenant_id = :tid"
-                ),
-                {"tid": ref.tenant_id},
-            )
-        )
-        .mappings()
-        .one()
-    )
-
-    if not row["suspended"]:
+    record = await ControlRepository().get_record(conn, ref.tenant_id)
+    if not record.suspended:
         raise TenantNotSuspendedError(
             f"tenant {ref.name!r} ({ref.tenant_id}) is not suspended; erase refuses to run "
             "against an active tenant -- suspend it first (see app.operator.suspend)."
         )
 
-    isolation_tier: str = row["isolation_tier"]
-    database_alias: str | None = row["database_alias"]
+    isolation_tier: str = record.isolation_tier
+    database_alias: str | None = record.database_alias
 
     if dry_run:
         steps = [
@@ -196,7 +202,7 @@ async def erase_tenant(
             ref.tenant_id,
             settings=settings,
             admin_client=admin_client,
-            owner_engine=gateway_owner_engine,
+            conn=conn,
         )
         steps.append(
             ErasureStepResult("gateway_credential", "removed" if revoked else "already absent")
@@ -258,17 +264,13 @@ async def erase_tenant(
 
 
 async def record_erasure(conn: AsyncConnection, result: EraseResult) -> None:
-    """Write one row to `control.tenant_erasures` (migration 0004) for a completed (successful or
-    partial) `erase_tenant` run -- never called for a dry run. Deliberately takes `tenant_id` as a
-    plain value, not a foreign key: this row must document and outlive the tenant row `erase_tenant`
-    may have just deleted, exactly as migration 0004 requires."""
-    await conn.execute(
-        text(
-            "INSERT INTO control.tenant_erasures (tenant_id, details) "
-            "VALUES (:tenant_id, CAST(:details AS jsonb))"
-        ),
-        {
-            "tenant_id": str(result.tenant_id),
-            "details": json.dumps(result.as_details(), default=str),
-        },
+    """Write one row to `control.tenant_erasures` (migration 0004, #114) for a completed
+    (successful or partial) `erase_tenant` run -- never called for a dry run. Delegates to
+    `ControlRepository.record_erasure`, which takes `tenant_id` as a plain value, not a foreign
+    key: the row must document and outlive the tenant row `erase_tenant` may have just deleted,
+    exactly as migration 0004 requires."""
+    await ControlRepository().record_erasure(
+        conn,
+        tenant_id=result.tenant_id,
+        details_json=json.dumps(result.as_details(), default=str),
     )

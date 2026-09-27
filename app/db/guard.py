@@ -9,7 +9,8 @@ there prevents the process from ever accepting traffic) and again, live, on ever
 `/ready` endpoint — never cached from the boot-time result.
 
 `run_role_rls_guard` no longer checks only the one pooled `DATABASE_URL`: it first asks the control
-plane (`control.enumerate_database_aliases()`, via `DatabaseAliasRepository`) which database aliases
+plane (`control.enumerate_database_aliases()`, via `ControlRepository.enumerate_referenced_aliases`,
+spec A5 / #113) which database aliases
 are currently referenced -- the pooled default, always, plus every dedicated alias at least one
 tenant is assigned to (ADR-0002's hybrid-isolation seam, `app/db/engine_registry.py`) -- and then
 runs the identical check against each one's engine in turn. A dangling or misconfigured
@@ -34,6 +35,16 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from app.db.models import TENANT_ISOLATION_EXCEPTIONS
 
 log = logging.getLogger(__name__)
+
+
+# Role-level settings for the `app` role (Spec 7 / #55; relocated next to this guard, the
+# module that actually cares about the `app` role's privileges, by spec A4 / #94, #112): applied
+# once in docker/postgres/01-init.sh, mirrored here so the embedded-Postgres integration test can
+# assert them without duplicating literals. Independent of `Settings.db_statement_timeout_ms`
+# (`app/config.py`), which is the per-transaction timeout the application sets on every
+# tenant_session().
+ROLE_STATEMENT_TIMEOUT_MS = 60_000
+ROLE_CONNECTION_LIMIT = 50
 
 
 class PrivilegedRoleOrMissingRLSError(RuntimeError):
@@ -96,10 +107,10 @@ async def _referenced_aliases() -> list[str]:
     plane still guards the one engine it actually opens."""
     from app.db.engine_registry import POOLED_ALIAS
     from app.db.session import control_session
-    from app.repositories.control import DatabaseAliasRepository
+    from app.repositories.control import ControlRepository
 
     async with control_session() as session:
-        referenced = await DatabaseAliasRepository().list_referenced_aliases(session)
+        referenced = await ControlRepository().enumerate_referenced_aliases(session)
     return sorted({POOLED_ALIAS, *referenced})
 
 

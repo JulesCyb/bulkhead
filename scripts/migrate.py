@@ -36,11 +36,11 @@ from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.db.engine_registry import POOLED_ALIAS
+from app.db.lifecycle import owner_engine
 from app.migration_settings import get_migration_settings
+from app.repositories.control import ControlRepository
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _ALEMBIC_INI = _REPO_ROOT / "alembic.ini"
@@ -93,7 +93,8 @@ async def _dedicated_aliases_from_control_plane() -> set[str]:
     """Every alias currently referenced by a tenant in the pooled database's control plane,
     minus the pooled alias itself (that one is always migrated regardless -- see `migrate_all`).
 
-    Reads through `control.enumerate_database_aliases()` (migration 0016), not the plain
+    Reads through `ControlRepository.enumerate_referenced_aliases` (spec A5 / #113), which calls
+    `control.enumerate_database_aliases()` (migration 0016), not the plain
     `control.database_aliases` view (0005): `DATABASE_URL_MIGRATIONS` connects as `app_owner`, a
     real NOBYPASSRLS role, and `control.tenants` carries FORCE ROW LEVEL SECURITY, so a
     security_invoker view over it is only readable cross-tenant by a role that bypasses RLS
@@ -102,21 +103,10 @@ async def _dedicated_aliases_from_control_plane() -> set[str]:
     and the control schema it reads live in migrations this alias must already have applied.
     """
     dsn = get_migration_settings().database_url_migrations.get_secret_value()
-    engine = create_async_engine(dsn)
-    try:
+    async with owner_engine(dsn) as engine:
         async with engine.connect() as conn:
-            rows = (
-                (
-                    await conn.execute(
-                        text("SELECT database_alias FROM control.enumerate_database_aliases()")
-                    )
-                )
-                .scalars()
-                .all()
-            )
-    finally:
-        await engine.dispose()
-    return set(rows) - {POOLED_ALIAS}
+            aliases = await ControlRepository().enumerate_referenced_aliases(conn)
+    return set(aliases) - {POOLED_ALIAS}
 
 
 def _upgrade_head(dsn: str) -> None:

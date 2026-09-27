@@ -1,6 +1,7 @@
-"""The `suspend`/`unsuspend` commands (Spec 9 / #69, ADR-0010): resolve a tenant by id or
+"""The `suspend`/`unsuspend` commands (Spec 9 / #69, ADR-0010, #114): resolve a tenant by id or
 unambiguous name (`app.operator.lookup`), then flip its suspension state through
-`control.set_tenant_suspended()` (migration 0024) -- the one `SECURITY DEFINER` write path the
+`app.repositories.control.ControlRepository.set_suspended` -- which itself calls
+`control.set_tenant_suspended()` (migration 0024), the one `SECURITY DEFINER` write path the
 operator role is granted onto `control.tenants`.
 
 Idempotent by construction: re-running `suspend` against an already-suspended tenant, or
@@ -14,10 +15,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from app.operator.lookup import resolve_tenant
+from app.repositories.control import ControlRepository
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +28,23 @@ class SuspendResult:
     suspended: bool
     changed: bool
     suspended_at: datetime | None
+
+    @property
+    def audit_outcome(self) -> str:
+        """The one line `app.operator.cli` both prints and writes to the operator-action log for
+        this command (spec A5 / #115) -- derivable from `suspended`/`changed` alone: `suspend`
+        always requests `suspended=True` and `unsuspend` always requests `suspended=False`, and
+        this result is idempotent on that request, so `self.suspended` already says which verb
+        applies without the caller passing it back in."""
+        verb = "suspended" if self.suspended else "unsuspended"
+        if not self.changed:
+            return f"no-op: {self.name!r} ({self.tenant_id}) was already {verb}"
+        return f"ok: {self.name!r} ({self.tenant_id}) is now {verb}"
+
+    def render(self) -> str:
+        """Byte-identical to what `app.operator.cli`'s retired `_run_suspend_or_unsuspend`
+        printed: this one line, and only this line."""
+        return self.audit_outcome
 
 
 async def set_tenant_suspended(
@@ -38,18 +56,11 @@ async def set_tenant_suspended(
     uses, never a second, looser resolution just for this one.
     """
     ref = await resolve_tenant(conn, identifier)
-    row = (
-        await conn.execute(
-            text(
-                "SELECT changed, suspended_at FROM control.set_tenant_suspended(:tid, :suspended)"
-            ),
-            {"tid": str(ref.tenant_id), "suspended": suspended},
-        )
-    ).one()
+    outcome = await ControlRepository().set_suspended(conn, ref.tenant_id, suspended)
     return SuspendResult(
         tenant_id=ref.tenant_id,
         name=ref.name,
-        suspended=suspended,
-        changed=row.changed,
-        suspended_at=row.suspended_at,
+        suspended=outcome.suspended,
+        changed=outcome.changed,
+        suspended_at=outcome.suspended_at,
     )

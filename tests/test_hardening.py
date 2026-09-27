@@ -1,25 +1,32 @@
 """Guard tests: SSE framing, the dev-headers environment guard, and residency/embedding
-configuration-property tests (ADR-0008, spec 8 / issue #58)."""
+configuration-property tests (ADR-0008, spec 8 / issue #58, spec A4 / #94, #110)."""
 
 from __future__ import annotations
+
+import subprocess
+import sys
+from pathlib import Path
 
 import httpx
 import pytest
 from pydantic import ValidationError
 
-from app.api.agents import _sse
-from app.config import RESIDENCY_ALLOW_LIST, Settings
+from app.agents.run_errors import sse
+from app.config import Settings
 from app.main import check_auth_mode
+from app.residency import ResidencyAllowList
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 _VALID_KWARGS = {"embedding_provider": "openai", "embedding_model": "text-embedding-3-small"}
 
 
 def test_sse_framing_preserves_newlines():
-    assert _sse("hello") == "data: hello\n\n"
+    assert sse("hello") == "data: hello\n\n"
     # A delta containing newlines must become multiple data: lines (the client
     # reassembles them), never a raw line without the data: prefix.
-    assert _sse("line one\nline two") == "data: line one\ndata: line two\n\n"
-    assert _sse("") == "data: \n\n"
+    assert sse("line one\nline two") == "data: line one\ndata: line two\n\n"
+    assert sse("") == "data: \n\n"
 
 
 def test_dev_headers_refused_outside_dev():
@@ -49,8 +56,10 @@ def test_settings_requires_embedding_model():
 def test_settings_residency_allow_list_has_at_least_two_residencies():
     # Data-driven, not hard-coded per provider: at least two residencies for tests, each with
     # allowed model/gateway host patterns, an allowed embedding endpoint, and a trace sink host.
-    assert len(RESIDENCY_ALLOW_LIST) >= 2
-    for route in RESIDENCY_ALLOW_LIST.values():
+    allow_list = ResidencyAllowList.load()
+    assert len(allow_list.residencies) >= 2
+    for residency in allow_list.residencies:
+        route = allow_list.route_for(residency)
         assert route.model_host_patterns
         assert route.embedding_endpoint
         assert route.trace_sink_host
@@ -72,7 +81,7 @@ def test_settings_valid_configuration_constructs_cleanly():
         residency="eu",
     )
     assert settings.residency == "eu"
-    assert settings.residency_route == RESIDENCY_ALLOW_LIST["eu"]
+    assert settings.residency_route == ResidencyAllowList.load().route_for("eu")
 
     # A second, distinct residency also constructs cleanly and resolves its own route.
     other = Settings(
@@ -81,6 +90,85 @@ def test_settings_valid_configuration_constructs_cleanly():
         residency="us",
     )
     assert other.residency_route != settings.residency_route
+
+
+# --- Every caller resolves through the one object (spec A4 / #94, #111) ------------------------
+
+# The retired module-level globals a pre-#110 caller used to index directly (`RESIDENCY_ALLOW_LIST
+# [<residency>]`/`.get(<residency>)`, `RESIDENCY_MODEL_ALLOW_LIST.get(<residency>)`) -- every
+# caller now asks `Settings.residency_allow_list` (`app.residency.ResidencyAllowList`)'s own
+# `route_for`/`alias_for`/`model_aliases`/`residencies` instead of re-implementing the lookup.
+# Deliberately scoped to these exact retired names, not a blanket ban on any `.get(residency`
+# call in `app/` -- `app.observability`'s own `_residency_tracer_providers`/`_residency_exporters`
+# caches are a different, legitimate per-residency lookup (which residencies have tracing
+# *configured*, not the allow-list itself) that this ticket does not touch.
+_RETIRED_RESIDENCY_LOOKUP_IDIOMS = ("RESIDENCY_ALLOW_LIST", "RESIDENCY_MODEL_ALLOW_LIST")
+
+
+def test_residency_lookup_idiom_lives_only_in_the_residency_module() -> None:
+    residency_module = REPO_ROOT / "app" / "residency.py"
+    offenders = []
+    for path in sorted((REPO_ROOT / "app").rglob("*.py")):
+        if path == residency_module:
+            continue
+        text = path.read_text(encoding="utf-8")
+        for idiom in _RETIRED_RESIDENCY_LOOKUP_IDIOMS:
+            if idiom in text:
+                offenders.append(f"{path.relative_to(REPO_ROOT)}: {idiom!r}")
+    assert offenders == [], offenders
+
+
+def test_gateway_model_aliases_by_residency_literal_mapping_is_gone() -> None:
+    """#85 (closed by spec A4 / #111): the per-residency gateway model alias literal
+    (`GATEWAY_MODEL_ALIASES_BY_RESIDENCY`, a hand-maintained dict in `app/gateway_provisioning.py`
+    that could drift from `config/residency.toml`) must never come back as an actual mapping --
+    prose mentioning its retirement (this test's own docstring, `app/gateway_provisioning.py`'s
+    comment) is fine; a `NAME = {...}`/`NAME: dict` declaration is not.
+    """
+    offenders = []
+    for path in sorted((REPO_ROOT / "app").rglob("*.py")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("GATEWAY_MODEL_ALIASES_BY_RESIDENCY") and (
+                "=" in stripped or ":" in stripped
+            ):
+                offenders.append(f"{path.relative_to(REPO_ROOT)}: {stripped!r}")
+    assert offenders == [], offenders
+
+
+def test_importing_app_config_never_touches_the_filesystem(tmp_path):
+    """Spec A4 (#94, #110), acceptance: importing `app.config` has no side effects -- a missing
+    `RESIDENCY_CONFIG_PATH` must not stop the module from importing at all (the old
+    module-level `load_residency_config()` call did exactly that). Only constructing `Settings()`
+    -- which builds `residency_allow_list` from that path -- fails, and with the one exception
+    type this module now raises for every fail-closed residency lookup or validation
+    (`app.residency.ResidencyUnresolved`). Run in a fresh subprocess: `app.config` is already
+    imported (and cached) in this test process, so only a fresh interpreter actually proves
+    "importing has no side effects."
+    """
+    missing = tmp_path / "does-not-exist.toml"
+    script = (
+        "import app.config\n"
+        "from app.config import Settings\n"
+        "from app.residency import ResidencyUnresolved\n"
+        "try:\n"
+        "    Settings(environment='test', auth_mode='dev-headers', "
+        "litellm_base_url='http://litellm:4000', embedding_provider='openai', "
+        "embedding_model='text-embedding-3-small')\n"
+        "except ResidencyUnresolved:\n"
+        "    print('RAISED_RESIDENCY_UNRESOLVED')\n"
+        "else:\n"
+        "    print('DID_NOT_RAISE')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env={"RESIDENCY_CONFIG_PATH": str(missing), "PATH": "/usr/bin:/bin"},
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "RAISED_RESIDENCY_UNRESOLVED" in result.stdout, result.stdout + result.stderr
 
 
 def test_settings_backup_retention_days_has_a_documented_default(monkeypatch):
@@ -350,3 +438,75 @@ def test_settings_reads_secret_from_secrets_dir(tmp_path):
         embedding_model="text-embedding-3-small",
     )
     assert settings.database_url.get_secret_value() == dsn
+
+
+# --- Retired per-file integration-test scaffolding stays retired (issue #99 / spec #90 "A6-T4") -
+
+# Before #99, seventeen integration files each hand-wrote their own embedded-cluster boot, role
+# bootstrap `psql` runner, settings/engine-reset fixture, and tenant/identity/document seed
+# helpers; #96-#99 replaced every one of them with `tests.support`'s shared `cluster`/
+# `environment` fixtures and `seed_tenant`/`seed_membership`/`seed_conversation`/`seed_document`.
+# Checked by parsing each file's own top-level (and nested) function names, not by grepping for
+# the retired names as literal text -- so this test's own source can name them in prose (as it
+# does two paragraphs down) without tripping the exact check it implements. `tests.support`
+# itself is exempt (it *is* the shared package; its own functions are named
+# `seed_tenant`/`seed_membership`/etc -- no leading underscore, so none of these ever match it
+# anyway).
+_RETIRED_NAME_PREFIXES = ("_seed", "_insert_", "_create_tenant")
+_RETIRED_EXACT_NAMES = frozenset({"_psql", "database_urls", "app_settings"})
+
+# One deliberate exception, named in its own module docstring: test_operator_erase_integration.py
+# proves `erase_tenant` wipes every registered tenant table -- that command's own contract, not
+# generic seeding -- so its table-by-table seeder stays put.
+_RETIRED_TEST_SEED_HELPER_EXCEPTIONS = frozenset({"test_operator_erase_integration.py"})
+
+
+def test_no_retired_integration_test_bootstrap_or_seed_helpers_remain() -> None:
+    """Issue #99 (spec #90 "A6-T4"): every integration test file seeds through `tests.support`
+    now -- no file defines its own cluster/bootstrap, `psql` runner, settings-reset fixture, or
+    ad-hoc tenant/identity/document seed helper. Parses every test file's function definitions so
+    the retired names cannot come back, whatever they are nested inside."""
+    import ast
+
+    tests_dir = REPO_ROOT / "tests"
+    offenders = []
+    for path in sorted(tests_dir.glob("test_*.py")):
+        if path.name in _RETIRED_TEST_SEED_HELPER_EXCEPTIONS:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            name = node.name
+            if name in _RETIRED_EXACT_NAMES or name.startswith(_RETIRED_NAME_PREFIXES):
+                offenders.append(f"{path.relative_to(REPO_ROOT)}:{node.lineno}: {name!r}")
+    assert offenders == [], offenders
+
+
+# --- Code review 2026-09-26: the process-wide test hooks fail closed outside development --------
+
+
+def test_set_default_adapter_for_tests_refuses_outside_development(monkeypatch):
+    """`set_default_adapter_for_tests` overrides every auth read process-wide: under production
+    settings it raises and installs nothing."""
+    import app.token_verifier as token_verifier
+
+    prod_settings = Settings(environment="prod", auth_mode="jwt", **_VALID_KWARGS)
+    monkeypatch.setattr(token_verifier, "get_settings", lambda: prod_settings, raising=False)
+    before = token_verifier.default_adapter()
+
+    with pytest.raises(RuntimeError, match="dev"):
+        token_verifier.set_default_adapter_for_tests(None)
+    assert token_verifier.default_adapter() is before
+
+
+def test_set_run_collaborators_for_tests_refuses_outside_development(monkeypatch):
+    """`set_run_collaborators_for_tests` overrides model resolution process-wide: under
+    production settings it raises and installs nothing."""
+    import app.agents.run as run_module
+
+    prod_settings = Settings(environment="prod", auth_mode="jwt", **_VALID_KWARGS)
+    monkeypatch.setattr(run_module, "get_settings", lambda: prod_settings, raising=False)
+
+    with pytest.raises(RuntimeError, match="dev"):
+        run_module.set_run_collaborators_for_tests(run_module.RunCollaborators())

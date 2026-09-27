@@ -1,9 +1,12 @@
-"""Fail-closed residency and model-allow-list startup checks (ADR-0008, Spec 8 / #59, and the
-mandatory-gateway follow-up, ai-app-starter#7 / ADR-0009).
+"""Fail-closed residency and model-allow-list startup checks (ADR-0008, Spec 8 / #59, the
+mandatory-gateway follow-up ai-app-starter#7 / ADR-0009, and spec A4 / #94, #110).
 
 Configuration-property tests only: no network call, no database. Mirrors
 tests/test_hardening.py's existing residency/embedding configuration tests and the
-construction-time/lifespan pattern used there for issue #15.
+construction-time/lifespan pattern used there for issue #15. `run_startup_checks` is now a thin
+call to `Settings.residency_allow_list.check_deployment` (`app.residency.ResidencyAllowList`) --
+these tests exercise it through `Settings`/`run_startup_checks`, never by patching a module-level
+allow-list.
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.config import Settings
+from app.residency import ResidencyAllowList
 from app.startup_checks import ResidencyConfigurationError, run_startup_checks
 
 _EMBEDDING_KWARGS = {
@@ -185,14 +189,24 @@ def test_model_allowed_in_us_but_not_eu_is_residency_specific():
     run_startup_checks(us_settings)  # no raise
 
 
-def test_unconfigured_residency_raises_naming_the_residency(monkeypatch):
-    """Defensive: even though Settings construction already rejects an unknown residency, this
-    function never trusts that as its only guard -- an allow-list entry removed after
-    construction (or a residency injected another way) still fails closed here."""
-    import app.startup_checks as startup_checks_module
-
+def test_unconfigured_residency_raises_naming_the_residency():
+    """Defensive: even though Settings construction already rejects an unknown residency against
+    the very same allow-list object, `check_deployment` never trusts that as its only guard -- an
+    allow-list swapped out for one missing the deployment's own residency after construction
+    still fails closed here. No global to patch: the allow-list is swapped on the settings object
+    itself, the seam spec A4 (#110) exists for."""
     settings = Settings(residency="eu", **_VALID_KWARGS)
-    monkeypatch.setattr(startup_checks_module, "RESIDENCY_ALLOW_LIST", {})
+    settings.residency_allow_list = ResidencyAllowList.from_data(
+        {
+            "residency": {
+                "us": {
+                    "model_host_patterns": ["gateway-us.internal"],
+                    "embedding_endpoint": "https://gateway-us.internal/v1",
+                    "trace_sink_host": "us.cloud.langfuse.com",
+                }
+            }
+        }
+    )
     with pytest.raises(ResidencyConfigurationError) as exc_info:
         run_startup_checks(settings)
     assert "eu" in str(exc_info.value)

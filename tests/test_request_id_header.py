@@ -15,8 +15,6 @@ import httpx
 import pytest
 from pydantic_ai.models.test import TestModel
 
-from app.agents import assistant as assistant_module
-from app.api import chat as chat_module
 from app.context import RequestContext
 from app.main import app
 
@@ -29,12 +27,12 @@ def captured_ctx() -> list[RequestContext]:
 
 
 @pytest.fixture
-def client(monkeypatch, captured_ctx, test_model):
+def client(captured_ctx, route_run):
     async def _search(ctx: RequestContext, query: str, limit: int):
         captured_ctx.append(ctx)
         return []
 
-    monkeypatch.setattr(assistant_module.document_tools, "search_documents", _search)
+    route_run(TestModel(call_tools=["search_documents"]), search=_search)
     transport = httpx.ASGITransport(app=app)
     return httpx.AsyncClient(transport=transport, base_url="http://test")
 
@@ -73,17 +71,8 @@ async def test_stream_endpoint_carries_request_id_header(client, captured_ctx):
     assert header_value == captured_ctx[0].request_id
 
 
-async def test_chat_endpoint_carries_request_id_header(monkeypatch, fake_history):
-    from tests.conftest import resolve_to_model
-
-    monkeypatch.setattr(
-        chat_module,
-        "resolve_chat_model",
-        resolve_to_model(TestModel(call_tools=["search_documents"])),
-    )
-    monkeypatch.setattr(
-        assistant_module.conversation_tools, "load_conversation_history", fake_history
-    )
+async def test_chat_endpoint_carries_request_id_header(route_run):
+    route_run(TestModel(call_tools=["search_documents"]))
     transport = httpx.ASGITransport(app=app)
     body = {
         "id": "conv-1",

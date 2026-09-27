@@ -33,3 +33,12 @@ and ADR template `adr-0005-mobile.md`.
 
 AI on the device. Models stay behind the API; on-device models are at most a later addition
 for small offline tasks.
+
+## Where the reading/writing split lives
+
+Whichever path above a mobile app takes, the agent side is unchanged: `app/agents/run.py` is the
+one module that decides which agent a run binds (reading-only for the one-shot endpoints, the
+writing-capable one only for `POST /api/chat`, ADR-0007), and a writing tool declares itself with
+the `writing_tool` decorator (`app/agents/writing_tools.py`) rather than its own approval
+bookkeeping. A jobs API for long agent runs (above) would still go through that module, not
+around it.

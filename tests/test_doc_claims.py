@@ -21,7 +21,8 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from app.config import RESIDENCY_ALLOW_LIST, Settings
+from app.config import Settings
+from app.residency import ResidencyAllowList
 from app.tenant_settings import TenantSettings
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -41,6 +42,8 @@ ADR_0009 = (REPO_ROOT / "docs" / "adr" / "0009-cost-and-abuse-protection.md").re
     encoding="utf-8"
 )
 ADR_DIR = REPO_ROOT / "docs" / "adr"
+FRONTEND_MD = (REPO_ROOT / "docs" / "frontend.md").read_text(encoding="utf-8")
+MOBILE_MD = (REPO_ROOT / "docs" / "mobile.md").read_text(encoding="utf-8")
 
 RETIRED_CLAIMS = {
     "superuser-DSN wording": [
@@ -107,6 +110,29 @@ def test_adr_0011_is_accepted_not_proposed() -> None:
     status_line = next(line for line in ADR_0011.splitlines() if line.startswith("- **Status:**"))
     assert "accepted" in status_line
     assert "proposed" not in status_line
+
+
+def test_claude_md_rule_3_and_adr_0011_name_the_control_repository_as_the_one_path() -> None:
+    """Spec A5's closing ticket (#115, acceptance criterion 3): `app/repositories/control.py`'s
+    `ControlRepository` is named, in both `CLAUDE.md` rule 3 and ADR-0011, as the one path for
+    every SQL statement against the `control` schema -- not only stated once and left to drift --
+    and rule 3 also names `run_operator` as the operator tool's own public, test-drivable entry
+    point (`main` is only its synchronous script wrapper)."""
+    rule_3 = next(
+        line
+        for line in CLAUDE_MD.splitlines()
+        if line.strip().startswith("3. **DB access only through repositories**")
+    )
+    section_start = CLAUDE_MD.index(rule_3)
+    section_end = CLAUDE_MD.index("\n4. ", section_start)
+    section = " ".join(CLAUDE_MD[section_start:section_end].split())
+
+    assert "ControlRepository" in section
+    assert "one path" in section
+    assert "app.operator.cli.run_operator" in section
+
+    assert "ControlRepository" in ADR_0011
+    assert "one path" in ADR_0011
 
 
 # Spec 10's closing ticket (#79): ADR-0002 moves from proposed to accepted now that the seam it
@@ -366,30 +392,24 @@ def test_residency_doc_claim_names_what_the_code_actually_enforces() -> None:
     assert "default `False`" in RESIDENCY_MD
 
 
-def test_residency_doc_sub_processor_list_matches_the_allow_list_object() -> None:
-    # Every host RESIDENCY_ALLOW_LIST actually contains is named in the doc -- not a hand-copied
-    # second list that could silently drift from it.
-    for residency, route in RESIDENCY_ALLOW_LIST.items():
-        assert residency in RESIDENCY_MD, f"residency {residency!r} not named in docs/residency.md"
-        assert route.trace_sink_host in RESIDENCY_MD, (
-            f"trace sink host {route.trace_sink_host!r} for {residency!r} not named in the doc"
-        )
-        embedding_host = route.embedding_endpoint.split("//", 1)[-1].split("/", 1)[0]
-        assert embedding_host in RESIDENCY_MD, (
-            f"embedding endpoint host {embedding_host!r} for {residency!r} not named in the doc"
-        )
-        for pattern in route.model_host_patterns:
-            bare_domain = pattern.lstrip("*.")
-            assert bare_domain in RESIDENCY_MD, (
-                f"model host domain {bare_domain!r} for {residency!r} not named in the doc"
-            )
+def test_residency_doc_table_matches_the_rendered_allow_list() -> None:
+    # spec A4 / #94, #112: the sub-processor table in docs/residency.md is generated from
+    # `ResidencyAllowList` by scripts/render_residency_table.py, not hand-maintained -- compare
+    # the doc's marked section against a fresh rendering (data, not a hand-copied list of
+    # per-residency assertions) so the two can never silently drift apart.
+    from scripts.render_residency_table import extract_section, render_section
+
+    allow_list = ResidencyAllowList.load()
+    assert extract_section(RESIDENCY_MD) == render_section(allow_list)
 
 
 def test_residency_doc_has_a_worked_second_residency_recipe() -> None:
     section = RESIDENCY_MD.split("## Worked example: adding a second residency", 1)[1]
     section = section.split("## The MCP boundary", 1)[0]
-    assert "RESIDENCY_ALLOW_LIST" in section
-    assert "RESIDENCY_MODEL_ALLOW_LIST" in section
+    # Spec A4 / #111: the doc names the one object every caller resolves through, not the
+    # retired `RESIDENCY_ALLOW_LIST`/`RESIDENCY_MODEL_ALLOW_LIST` globals.
+    assert "ResidencyAllowList" in section
+    assert "residency_allow_list" in section
     assert "docker/litellm/config.yaml" in section
     assert "trace_sink_host" in section
 
@@ -447,7 +467,7 @@ def test_tenant_settings_catalog_documents_residency_and_content_tracing_opt_in(
     assert "control.tenants.residency" in doc
     assert "content_tracing_opt_in" in doc
     # Shape, validation, and default are all named for both entries, not just one.
-    assert "RESIDENCY_ALLOW_LIST" in doc
+    assert "ResidencyAllowList" in doc
     assert "no default" in doc
     assert "False" in doc
 
@@ -503,6 +523,105 @@ def test_claude_md_per_table_rule_names_conversations_retention_with_no_exceptio
     assert "retention" in section
     assert "no exception" in section
     assert "90" in section
+
+
+# --- Spec A2's closing ticket (#106): suspension has exactly two enforcement points -------------
+
+SESSION_SOURCE = (REPO_ROOT / "app" / "db" / "session.py").read_text(encoding="utf-8")
+ASSISTANT_SOURCE = (REPO_ROOT / "app" / "agents" / "assistant.py").read_text(encoding="utf-8")
+RUN_SOURCE = (REPO_ROOT / "app" / "agents" / "run.py").read_text(encoding="utf-8")
+CHAT_SOURCE = (REPO_ROOT / "app" / "api" / "chat.py").read_text(encoding="utf-8")
+RETENTION_SOURCE = (REPO_ROOT / "app" / "retention.py").read_text(encoding="utf-8")
+
+
+def test_ensure_tenant_not_suspended_is_fully_removed() -> None:
+    """#106's acceptance criterion 1: the standalone suspension module and every explicit call to
+    it are gone -- the six-entry-point pattern ADR-0010 describes as "checked on every request" no
+    longer means six independent reads, it means the two enforcement points below."""
+    for path in (REPO_ROOT / "app").rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        assert "ensure_tenant_not_suspended" not in text, f"still referenced in {path}"
+        assert "tenant_suspension" not in text, f"still referenced in {path}"
+    assert not (REPO_ROOT / "app" / "tenant_suspension.py").exists()
+
+
+def test_claude_md_retention_bullet_states_the_job_skips_suspended_tenants() -> None:
+    rule_2 = next(line for line in CLAUDE_MD.splitlines() if line.strip().startswith("2. **Every"))
+    section_start = CLAUDE_MD.index(rule_2)
+    section_end = CLAUDE_MD.index("\n3. ", section_start)
+    section = " ".join(CLAUDE_MD[section_start:section_end].split())
+
+    assert "skips a suspended tenant" in section
+    # Code review 2026-09-26: the skip is named as rule 2's one deliberate exception, and why.
+    assert "nothing is deleted" in section
+    assert "one deliberate exception" in section
+    assert "refused at three points" in section
+
+
+CONTEXT_RESOLUTION_SOURCE = (REPO_ROOT / "app" / "context_resolution.py").read_text(
+    encoding="utf-8"
+)
+
+
+def test_session_layer_docstring_describes_the_suspension_refusal_points() -> None:
+    """The session layer's own docstring (`app/db/session.py`) states plainly where suspension is
+    refused -- context resolution for a request, `tenant_session()`'s own routing read for a
+    caller that carries no record, `tenant_session()` itself for a suspended record -- and why the
+    retention job skips instead (code review 2026-09-26)."""
+    assert "refused at three points" in SESSION_SOURCE
+    assert "context_resolution" in SESSION_SOURCE
+    assert "TenantSuspendedError" in SESSION_SOURCE
+    assert "nothing is\ndeleted" in SESSION_SOURCE or "nothing is deleted" in SESSION_SOURCE
+
+
+def test_suspension_is_described_the_same_way_in_all_three_places() -> None:
+    """Code review 2026-09-26: `app/db/session.py`, `app/context_resolution.py`, and CLAUDE.md
+    rule 2 give the same three refusal points and the same retention exception."""
+    rule_2 = next(line for line in CLAUDE_MD.splitlines() if line.strip().startswith("2. **Every"))
+    section_start = CLAUDE_MD.index(rule_2)
+    rule_2_text = CLAUDE_MD[section_start : CLAUDE_MD.index("\n3. ", section_start)]
+    for source in (SESSION_SOURCE, CONTEXT_RESOLUTION_SOURCE, rule_2_text):
+        flat = " ".join(source.split())
+        assert "refused at three points" in flat
+        assert "refused at context resolution" in flat
+        assert "routing read" in flat
+        assert "nothing is deleted" in flat
+        assert "one deliberate exception" in flat
+
+
+RETIRED_SUSPENSION_CLAIM_PHRASES = [
+    "independent check at every entry point",
+    "checks suspension itself",
+    "its own, independent check",
+    "independently of whatever context-building",
+    "independently of whatever `tenant_session()` will separately",
+    "own suspension check",
+]
+
+
+def test_no_app_comment_still_claims_an_independent_check_at_every_entry_point() -> None:
+    """#106: the "independent check at every entry point" framing (ADR-0010's six call sites) is
+    retired along with the calls themselves -- no comment anywhere in `app/` may still describe
+    the old, six-independent-reads model."""
+    for path in (REPO_ROOT / "app").rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        for phrase in RETIRED_SUSPENSION_CLAIM_PHRASES:
+            assert phrase not in text, f"retired claim {phrase!r} still present in {path}"
+
+
+def test_assistant_and_chat_modules_no_longer_claim_their_own_suspension_check() -> None:
+    """The agent-run entry points (`run_assistant`/`stream_assistant` in `app/agents/assistant.py`,
+    since #107 the prepared run in `app/agents/run.py`) and the chat route (`app/api/chat.py`) used
+    to each document their own suspension check (Spec 9 / #69) -- #106 removed the check itself,
+    so none of these modules' docstrings/comments may still claim one."""
+    for source in (ASSISTANT_SOURCE, RUN_SOURCE, CHAT_SOURCE):
+        assert "ensure_tenant_not_suspended" not in source
+        assert "tenant_suspension" not in source
+
+
+def test_retention_module_documents_skipping_suspended_tenants() -> None:
+    assert "skipped" in RETENTION_SOURCE.lower() or "skip" in RETENTION_SOURCE.lower()
+    assert "suspended" in RETENTION_SOURCE.lower()
 
 
 def test_claude_md_and_readme_document_the_retention_script_command() -> None:
@@ -588,6 +707,22 @@ def test_settings_load_from_env_example_file_without_error() -> None:
     assert settings.jwt_verification_key is None
     assert settings.agent_token_signing_key is None
     assert settings.agent_token_verification_key is None
+    # Issue #116: blank by default (streamable-http is not the default transport), but the
+    # setting name itself must be present in .env.example, not only in code.
+    assert settings.mcp_allowed_hosts_list == []
+
+
+def test_env_example_documents_mcp_allowed_hosts() -> None:
+    """Issue #116: `check_mcp_mode` refuses `streamable-http` without this setting -- it must be
+    discoverable in `.env.example`, not only in `app/config.py`."""
+    assert "MCP_ALLOWED_HOSTS" in ENV_EXAMPLE
+
+
+def test_connection_guide_documents_mcp_allowed_hosts() -> None:
+    """Issue #116: `docs/mcp-connection.md` names the setting that makes the streamable-http
+    transport's Host-header allow-list configurable, not only its pre-existing token-verifier
+    requirement."""
+    assert "MCP_ALLOWED_HOSTS" in MCP_CONNECTION_MD
 
 
 def test_connection_guide_routes_match_the_agent_identity_and_token_routes() -> None:
@@ -605,6 +740,40 @@ def test_connection_guide_covers_both_the_member_and_the_admin_walkthrough() -> 
     assert "As a tenant admin" in MCP_CONNECTION_MD
     assert "stdio" in MCP_CONNECTION_MD
     assert "streamable-http" in MCP_CONNECTION_MD
+
+
+# --- Spec A1's closing ticket (#103): one context-resolution module, three thin adapters --------
+
+ADR_0012 = (REPO_ROOT / "docs" / "adr" / "0012-tenant-in-the-path.md").read_text(encoding="utf-8")
+
+
+def test_claude_md_and_connection_guide_name_the_context_resolution_module() -> None:
+    """#101/#102: `app/context_resolution.py` is the one chain every adapter (the HTTP dependency,
+    the MCP ASGI middleware, the dev-headers path) resolves a request's context through -- not a
+    second, drifting description of five module-level collaborators each adapter used to reach
+    directly. `CLAUDE.md` rule 1/5 and `docs/mcp-connection.md` both name it by module path."""
+    assert "app/context_resolution.py" in CLAUDE_MD
+    assert "app.context_resolution.resolve_bearer_context" in MCP_CONNECTION_MD
+
+
+def test_no_doc_mentions_the_retired_context_provider_indirection() -> None:
+    """#102 deleted the `context_provider` indirection and the orphaned connection reader from
+    `app/mcp/server.py` -- no doc describing the current MCP auth chain should still name it as
+    the mechanism. (The retired name survives only in test docstrings recording that it is gone,
+    and in the dated 2026-09-12 security-review finding that first called it out -- neither of
+    those is a doc this test reads.)"""
+    docs_text = "\n".join(
+        [README, CLAUDE_MD, DEPLOYMENT_MD, CONTEXT_MD, MCP_CONNECTION_MD, ADR_0005, ADR_0012]
+    )
+    assert "context_provider" not in docs_text
+
+
+def test_adr_0012_describes_the_three_way_check_the_module_implements() -> None:
+    """ADR-0012 needs no decision change for #103 (its own three-way check -- path, audience,
+    membership -- is what `app.context_resolution.resolve_bearer_context` now implements for
+    every adapter) -- this only pins the wording that makes that still true."""
+    assert "resolves the identity from the token" in ADR_0012
+    assert "checks the audience against the path" in ADR_0012
 
 
 def test_claude_md_directory_table_marks_networked_transport_as_production() -> None:
@@ -694,3 +863,36 @@ def test_readme_four_rules_summary_names_the_approval_mechanism() -> None:
     assert "writing tool requires approval" in rules_section
     assert "standing grant" in rules_section
     assert "always allow" in rules_section.lower()
+
+
+# --- The run module and the writing_tool decorator are findable from the docs (#109) -----------
+
+
+def test_claude_md_writing_tool_rule_points_at_the_decorator_not_a_copy_by_hand() -> None:
+    """Rule 4's old "copy this shape verbatim" instruction is gone -- a second writing tool
+    applies the decorator instead of copying `rename_document`'s former hand-written wrapper."""
+    rule_4 = CLAUDE_MD.split("4. **Agents access data only through tools**", 1)[1].split(
+        "\n5. ", 1
+    )[0]
+    assert "copy this shape verbatim" not in rule_4
+    assert "writing_tool` decorator" in rule_4
+    assert "app/agents/writing_tools.py" in rule_4
+    assert "app/agents/run.py" in rule_4
+
+
+def test_frontend_and_mobile_docs_point_at_the_run_module_and_the_decorator() -> None:
+    """#109's own doc-claims check: a developer reading either client-attachment guide can find
+    where the reading/writing split lives (`app/agents/run.py`) and how a writing tool declares
+    itself (the `writing_tool` decorator, `app/agents/writing_tools.py`) without opening the ADR."""
+    for doc in (FRONTEND_MD, MOBILE_MD):
+        assert "app/agents/run.py" in doc
+        assert "writing_tool" in doc
+        assert "app/agents/writing_tools.py" in doc
+
+
+def test_adr_0007_points_at_the_run_module_and_the_decorator() -> None:
+    """ADR-0007 gets a one-line implementation note for #109, not a decision change: the
+    approval policy stays option 1 (module docstring above), only the note is new."""
+    assert "app/agents/run.py" in ADR_0007
+    assert "writing_tool" in ADR_0007
+    assert "app/agents/writing_tools.py" in ADR_0007

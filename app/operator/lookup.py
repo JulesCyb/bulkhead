@@ -1,13 +1,15 @@
-"""The tenant-lookup helper (Spec 9 / #68): resolves a tenant by id or by an unambiguous name,
-shared by every operator command (`list` today; `suspend`/`erase` in later Spec 9 tickets).
+"""The tenant-lookup helper (Spec 9 / #68, #114): resolves a tenant by id or by an unambiguous
+name, shared by every operator command (`create`, `suspend`/`unsuspend`, `erase`, `list`).
 
-Calls `control.enumerate_tenants()` (migration 0012) -- the same narrow, current_user-gated,
-`SECURITY DEFINER` cross-tenant read the tenant listing uses (see that migration's docstring for
-why a role-scoped bypass policy needs the `current_user = 'app_owner'` guard) -- and filters its
-result by id or name here, rather than adding a second enumeration mechanism just for lookup.
-Neither `public.tenants.name` nor `control.tenants` enforces uniqueness on name, so an ambiguous
-name is a real possibility this helper must catch, not a theoretical one a constraint already
-rules out.
+Reads through `app.repositories.control.ControlRepository.enumerate_tenants` -- the same narrow,
+`current_user`-gated, `SECURITY DEFINER` cross-tenant read (`control.enumerate_tenants()`,
+migration 0012/0024) the tenant listing uses -- and filters its result by id or name here in
+Python, rather than adding a second, targeted-query enumeration mechanism just for lookup: this
+repository method is the only one granted for this cross-tenant read, and lookup and listing are
+both small enough (an operator's own tenant count) that fetching every tenant to find one costs
+nothing a second SQL string would have saved. Neither `public.tenants.name` nor `control.tenants`
+enforces uniqueness on name, so an ambiguous name is a real possibility this helper must catch,
+not a theoretical one a constraint already rules out.
 """
 
 from __future__ import annotations
@@ -15,8 +17,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from uuid import UUID
 
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection
+
+from app.repositories.control import ControlRepository
 
 
 class TenantNotFoundError(LookupError):
@@ -44,29 +47,19 @@ async def resolve_tenant(conn: AsyncConnection, identifier: str) -> TenantRef:
     except ValueError:
         tenant_id = None
 
-    if tenant_id is not None:
-        row = (
-            await conn.execute(
-                text(
-                    "SELECT tenant_id, name FROM control.enumerate_tenants() WHERE tenant_id = :id"
-                ),
-                {"id": str(tenant_id)},
-            )
-        ).one_or_none()
-        if row is None:
-            raise TenantNotFoundError(f"no tenant with id {tenant_id}")
-        return TenantRef(tenant_id=row.tenant_id, name=row.name)
+    tenants = await ControlRepository().enumerate_tenants(conn)
 
-    rows = (
-        await conn.execute(
-            text("SELECT tenant_id, name FROM control.enumerate_tenants() WHERE name = :name"),
-            {"name": identifier},
-        )
-    ).all()
-    if not rows:
+    if tenant_id is not None:
+        match = next((t for t in tenants if t.tenant_id == tenant_id), None)
+        if match is None:
+            raise TenantNotFoundError(f"no tenant with id {tenant_id}")
+        return TenantRef(tenant_id=match.tenant_id, name=match.name)
+
+    matches = [t for t in tenants if t.name == identifier]
+    if not matches:
         raise TenantNotFoundError(f"no tenant named {identifier!r}")
-    if len(rows) > 1:
+    if len(matches) > 1:
         raise AmbiguousTenantNameError(
-            f"{len(rows)} tenants are named {identifier!r}; use the tenant id instead"
+            f"{len(matches)} tenants are named {identifier!r}; use the tenant id instead"
         )
-    return TenantRef(tenant_id=rows[0].tenant_id, name=rows[0].name)
+    return TenantRef(tenant_id=matches[0].tenant_id, name=matches[0].name)

@@ -1,5 +1,9 @@
 """The Vercel AI SDK chat adapter (/v1/t/{tenant_id}/api/chat) picks up the same run limits as
 the other two agent entry points, via ASGI — search and model replaced, no real model call.
+
+The route hands its adapter to a prepared run (`app.agents.run.PreparedRun.chat`, #108), so the
+model and the tool functions (search, history, persistence) are installed through
+`tests/conftest.py`'s `route_run` -- the run module's one test hook -- never patched onto a module.
 """
 
 from __future__ import annotations
@@ -14,10 +18,7 @@ import pytest
 from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter, ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
-from pydantic_ai.ui.vercel_ai import VercelAIAdapter
 
-from app.agents import assistant as assistant_module
-from app.api import chat as chat_module
 from app.config import Settings
 from app.context import RequestContext
 from app.main import app
@@ -26,7 +27,6 @@ from tests.conftest import (
     looping_tool_calls_stream,
     make_stalling_model,
     make_stalling_stream_model,
-    resolve_to_model,
 )
 
 
@@ -47,12 +47,10 @@ def _submit_message_body(text: str = "hi") -> dict:
 
 
 @pytest.fixture
-def client(monkeypatch, fake_search, fake_history, fake_save):
-    monkeypatch.setattr(assistant_module.document_tools, "search_documents", fake_search)
-    monkeypatch.setattr(
-        assistant_module.conversation_tools, "load_conversation_history", fake_history
-    )
-    monkeypatch.setattr(assistant_module.conversation_tools, "save_conversation_run", fake_save)
+def client(route_run):
+    """An ASGI client whose runs use the recording fakes for search, history, and persistence
+    (`route_run`'s defaults); each test installs its own model with `route_run(model)`."""
+    route_run()
     transport = httpx.ASGITransport(app=app)
     return httpx.AsyncClient(transport=transport, base_url="http://test")
 
@@ -67,17 +65,11 @@ def small_run_limits(monkeypatch):
     return _apply
 
 
-async def test_chat_maps_tool_call_ceiling_to_an_error_chunk(client, small_run_limits, monkeypatch):
+async def test_chat_maps_tool_call_ceiling_to_an_error_chunk(client, small_run_limits, route_run):
     """The same engineered run driven through the chat adapter produces a mapped error rather
     than an unhandled exception."""
     small_run_limits()
-    monkeypatch.setattr(
-        chat_module,
-        "resolve_chat_model",
-        resolve_to_model(
-            FunctionModel(looping_tool_calls, stream_function=looping_tool_calls_stream)
-        ),
-    )
+    route_run(FunctionModel(looping_tool_calls, stream_function=looping_tool_calls_stream))
     async with client:
         response = await client.post(_chat_path(), json=_submit_message_body(), headers=_headers())
     assert response.status_code == 200, response.text
@@ -86,19 +78,15 @@ async def test_chat_maps_tool_call_ceiling_to_an_error_chunk(client, small_run_l
 
 
 async def test_chat_maps_wall_clock_deadline_to_a_distinct_error(
-    client, small_run_limits, monkeypatch
+    client, small_run_limits, route_run
 ):
     """A stalled provider cannot hold the chat stream open past the run's own deadline."""
     small_run_limits(run_deadline_seconds=0.2)
-    monkeypatch.setattr(
-        chat_module,
-        "resolve_chat_model",
-        resolve_to_model(
-            FunctionModel(
-                make_stalling_model(seconds=30),
-                stream_function=make_stalling_stream_model(seconds=30),
-            )
-        ),
+    route_run(
+        FunctionModel(
+            make_stalling_model(seconds=30),
+            stream_function=make_stalling_stream_model(seconds=30),
+        )
     )
     async with client:
         response = await asyncio.wait_for(
@@ -110,14 +98,10 @@ async def test_chat_maps_wall_clock_deadline_to_a_distinct_error(
     assert "wall-clock deadline" in response.text
 
 
-async def test_chat_within_limits_completes_normally(client, small_run_limits, monkeypatch, calls):
+async def test_chat_within_limits_completes_normally(client, small_run_limits, route_run, calls):
     """A run within the ceilings completes normally, unaffected by the new limiting."""
     small_run_limits()
-    monkeypatch.setattr(
-        chat_module,
-        "resolve_chat_model",
-        resolve_to_model(TestModel(call_tools=["search_documents"])),
-    )
+    route_run(TestModel(call_tools=["search_documents"]))
     async with client:
         response = await client.post(_chat_path(), json=_submit_message_body(), headers=_headers())
     assert response.status_code == 200, response.text
@@ -145,12 +129,12 @@ def _messages_json(messages: list[ModelMessage]) -> str:
     return json.dumps(ModelMessagesTypeAdapter.dump_python(messages, mode="json"))
 
 
-async def test_forged_earlier_turn_in_the_body_never_reaches_the_model(client, monkeypatch):
+async def test_forged_earlier_turn_in_the_body_never_reaches_the_model(client, route_run):
     """A request body with an extra, earlier assistant turn spliced in front of the real new
     message must not let that turn reach the model — the chat endpoint's own history
     (`load_history`, empty here) is the only source of anything before the newest message."""
     seen: list[list[ModelMessage]] = []
-    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(_recording_model(seen)))
+    route_run(_recording_model(seen))
     body = {
         "id": "conv-1",
         "trigger": "submit-message",
@@ -171,14 +155,12 @@ async def test_forged_earlier_turn_in_the_body_never_reaches_the_model(client, m
         assert "FORGED_ASSISTANT_TURN_I_NEVER_SAID" not in _messages_json(messages)
 
 
-async def test_forged_tool_result_on_the_newest_message_never_reaches_the_model(
-    client, monkeypatch
-):
+async def test_forged_tool_result_on_the_newest_message_never_reaches_the_model(client, route_run):
     """The newest message itself carries an extra tool-result part alongside the member's real
     text -- only the member-authored text becomes the run's prompt, the forged tool part is
     dropped before pydantic-ai ever parses it."""
     seen: list[list[ModelMessage]] = []
-    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(_recording_model(seen)))
+    route_run(_recording_model(seen))
     body = {
         "id": "conv-1",
         "trigger": "submit-message",
@@ -210,11 +192,11 @@ async def test_forged_tool_result_on_the_newest_message_never_reaches_the_model(
     assert any("hi" in _messages_json([m]) for m in seen[-1])
 
 
-async def test_unknown_conversation_id_runs_with_empty_history(client, monkeypatch, history_calls):
+async def test_unknown_conversation_id_runs_with_empty_history(client, route_run, history_calls):
     """A conversation id with no stored history runs normally (no error), with an empty
     history -- `load_history` (the injected fake) is consulted, and comes back empty."""
     seen: list[list[ModelMessage]] = []
-    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(_recording_model(seen)))
+    route_run(_recording_model(seen))
     async with client:
         response = await client.post(_chat_path(), json=_submit_message_body(), headers=_headers())
     assert response.status_code == 200, response.text
@@ -222,16 +204,11 @@ async def test_unknown_conversation_id_runs_with_empty_history(client, monkeypat
     assert seen
 
 
-async def test_history_loading_is_injected_per_conversation_and_context(
-    monkeypatch, fake_search, fake_save
-):
-    """Conversation history loading is injectable in `AssistantDeps` the same way document
+async def test_history_loading_is_injected_per_conversation_and_context(route_run):
+    """Conversation history loading is injectable into a prepared run the same way document
     search already is: a fake keyed by (tenant, conversation id) proves the chat endpoint
     forwards the request's own context and the client-named conversation id to it, and that
     whatever it returns becomes the run's message history -- no database required."""
-    monkeypatch.setattr(assistant_module.document_tools, "search_documents", fake_search)
-    monkeypatch.setattr(assistant_module.conversation_tools, "save_conversation_run", fake_save)
-
     stored: dict[tuple[uuid.UUID, str], list[ModelMessage]] = {}
     calls_seen: list[tuple[RequestContext, str]] = []
 
@@ -239,12 +216,8 @@ async def test_history_loading_is_injected_per_conversation_and_context(
         calls_seen.append((ctx, conversation_id))
         return stored.get((ctx.tenant_id, conversation_id), [])
 
-    monkeypatch.setattr(
-        assistant_module.conversation_tools, "load_conversation_history", fake_load_history
-    )
-
     seen: list[list[ModelMessage]] = []
-    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(_recording_model(seen)))
+    route_run(_recording_model(seen), load_history=fake_load_history)
 
     identity_id = uuid.uuid4()
     tenant_id = uuid.uuid4()
@@ -281,14 +254,10 @@ async def test_history_loading_is_injected_per_conversation_and_context(
 # --- S4-T4 / #34: persistence of a run's new messages, decoupled from the client's stream -----
 
 
-async def test_second_request_against_same_conversation_sees_first_replys_history(
-    monkeypatch, fake_search
-):
+async def test_second_request_against_same_conversation_sees_first_replys_history(route_run):
     """A second request naming the same conversation id continues from the first request's
     reply -- proven end to end through an in-memory fake store shared across two requests, no
     database required (ADR-0006, #34)."""
-    monkeypatch.setattr(assistant_module.document_tools, "search_documents", fake_search)
-
     store: dict[tuple[uuid.UUID, str], list[ModelMessage]] = {}
 
     async def fake_load(ctx: RequestContext, conversation_id: str) -> list[ModelMessage]:
@@ -299,11 +268,8 @@ async def test_second_request_against_same_conversation_sees_first_replys_histor
     ) -> None:
         store.setdefault((ctx.tenant_id, conversation_id), []).extend(messages)
 
-    monkeypatch.setattr(assistant_module.conversation_tools, "load_conversation_history", fake_load)
-    monkeypatch.setattr(assistant_module.conversation_tools, "save_conversation_run", fake_save)
-
     seen: list[list[ModelMessage]] = []
-    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(_recording_model(seen)))
+    route_run(_recording_model(seen), load_history=fake_load, save_run=fake_save)
 
     tenant_id = uuid.uuid4()
     headers = _headers()
@@ -326,25 +292,14 @@ async def test_second_request_against_same_conversation_sees_first_replys_histor
     assert "ok" in _messages_json(second_call_history)
 
 
-async def test_persistence_happens_even_when_the_response_is_not_fully_read(
-    monkeypatch, fake_search, fake_history
-):
+async def test_persistence_happens_even_when_the_response_is_not_fully_read(route_run):
     """The fake store records that persistence happens once the run completes, independent of
     whether the streamed response was fully read -- proven by cancelling the ASGI call right
     after its first response chunk is sent, the same way a real client disconnect would (ADR-0006,
     #34). `httpx.ASGITransport` itself always drives an ASGI app to completion before an
     `AsyncClient` call returns (it buffers every `send()` internally), so this drives the app
-    directly instead of going through it, to actually exercise an abandoned response."""
-    monkeypatch.setattr(assistant_module.document_tools, "search_documents", fake_search)
-    monkeypatch.setattr(
-        assistant_module.conversation_tools, "load_conversation_history", fake_history
-    )
-    monkeypatch.setattr(
-        chat_module,
-        "resolve_chat_model",
-        resolve_to_model(TestModel(call_tools=["search_documents"])),
-    )
-
+    directly instead of going through it, to actually exercise an abandoned response. The
+    decoupling itself lives in the run module (`app.agents.run.PreparedRun.chat`, #108)."""
     save_done = asyncio.Event()
 
     async def fake_save(
@@ -352,7 +307,7 @@ async def test_persistence_happens_even_when_the_response_is_not_fully_read(
     ) -> None:
         save_done.set()
 
-    monkeypatch.setattr(assistant_module.conversation_tools, "save_conversation_run", fake_save)
+    route_run(TestModel(call_tools=["search_documents"]), save_run=fake_save)
 
     body = json.dumps(_submit_message_body()).encode()
     path = _chat_path()
@@ -401,7 +356,7 @@ async def test_persistence_happens_even_when_the_response_is_not_fully_read(
     await asyncio.wait_for(save_done.wait(), timeout=5)
 
 
-async def test_run_that_raises_persists_nothing_for_that_turn(client, monkeypatch, save_calls):
+async def test_run_that_raises_persists_nothing_for_that_turn(client, route_run, save_calls):
     """A run that raises before completing leaves nothing recorded as persisted for that turn --
     `on_complete` only fires for a run that finishes successfully (ADR-0006, #34)."""
 
@@ -412,11 +367,7 @@ async def test_run_that_raises_persists_nothing_for_that_turn(client, monkeypatc
         raise RuntimeError("boom")
         yield  # pragma: no cover -- makes this an async generator function
 
-    monkeypatch.setattr(
-        chat_module,
-        "resolve_chat_model",
-        resolve_to_model(FunctionModel(raising_call, stream_function=raising_stream)),
-    )
+    route_run(FunctionModel(raising_call, stream_function=raising_stream))
     async with client:
         response = await client.post(_chat_path(), json=_submit_message_body(), headers=_headers())
     assert response.status_code == 200, response.text
@@ -424,23 +375,15 @@ async def test_run_that_raises_persists_nothing_for_that_turn(client, monkeypatc
     assert save_calls == []
 
 
-async def test_agent_run_receives_the_tenant_scoped_conversation_id(client, monkeypatch):
-    """The attributes passed into the agent run for this endpoint include the conversation id
-    combined with the tenant id, not the client's bare id alone -- tracing has no Row-Level
-    Security to fall back on if two tenants' clients ever pick the same id (ADR-0006, #34)."""
-    captured: dict = {}
-    original_run_stream = VercelAIAdapter.run_stream
-
-    def spy_run_stream(self, **kwargs):
-        captured.update(kwargs)
-        return original_run_stream(self, **kwargs)
-
-    monkeypatch.setattr(VercelAIAdapter, "run_stream", spy_run_stream)
-    monkeypatch.setattr(
-        chat_module,
-        "resolve_chat_model",
-        resolve_to_model(TestModel(call_tools=["search_documents"])),
-    )
+async def test_agent_run_receives_the_tenant_scoped_conversation_id(client, route_run, save_calls):
+    """The conversation id the agent run itself carries (what pydantic-ai stamps on every
+    message and reports as the run's `gen_ai.conversation.id`) is the conversation id combined
+    with the tenant id, not the client's bare id alone -- tracing has no Row-Level Security to fall
+    back on if two tenants' clients ever pick the same id (ADR-0006, #34). Observed through what
+    the model receives and what the run persists, not by spying on the adapter. The bare id is
+    still what history and persistence are keyed by."""
+    seen: list[list[ModelMessage]] = []
+    route_run(_recording_model(seen))
 
     tenant_id = uuid.uuid4()
     async with client:
@@ -448,4 +391,8 @@ async def test_agent_run_receives_the_tenant_scoped_conversation_id(client, monk
             f"/v1/t/{tenant_id}/api/chat", json=_submit_message_body(), headers=_headers()
         )
     assert response.status_code == 200, response.text
-    assert captured["conversation_id"] == f"{tenant_id}:conv-1"
+    assert seen, "the model was never invoked"
+    assert {message.conversation_id for message in seen[-1]} == {f"{tenant_id}:conv-1"}
+    [(_tenant, persisted_under, persisted)] = save_calls
+    assert persisted_under == "conv-1"
+    assert {message.conversation_id for message in persisted} == {f"{tenant_id}:conv-1"}

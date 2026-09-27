@@ -31,7 +31,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from app.config import ROLE_CONNECTION_LIMIT, ROLE_STATEMENT_TIMEOUT_MS
+from app.db.guard import ROLE_CONNECTION_LIMIT, ROLE_STATEMENT_TIMEOUT_MS
 
 
 def _as_asyncpg_url(url: str) -> str:

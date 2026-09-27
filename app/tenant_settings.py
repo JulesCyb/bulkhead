@@ -4,8 +4,9 @@ Also the home of the tenant-editable retention period (ADR-0006, Spec 4 / #35): 
 tenant's conversations and messages live, measured from `conversations.last_activity_at`, before
 the retention job (`app/retention.py`, `scripts/retention.py`) deletes them. A tenant's admin sets
 `settings["retention_days"]` like any other tenant-editable setting, read back out through
-`app.repositories.tenant_settings.TenantSettingsRepository` -- the one place any caller resolves
-this JSONB column, exactly like `app.observability` already does for `content_tracing_opt_in`.
+`app.repositories.tenant_settings.TenantSettingsRepository` -- the one place this JSONB column is
+resolved, as part of the tenant record (`app.tenant_record.TenantRecord.settings`, #104) that
+retention, tracing (`content_tracing_opt_in`), and model resolution (`model`) all read (#105).
 `DEFAULT_RETENTION_DAYS` below is the documented, conservative fallback used for every tenant that
 never sets one.
 
@@ -38,15 +39,19 @@ than left to whichever module happens to read it first.
 
 - **`residency`** -- home: `control.tenants.residency` (operator-owned, migration
   `0013_control_plane_residency.py`). Shape: `text`, nullable. Validation: a `CHECK` constraint
-  restricting it to a key of `RESIDENCY_ALLOW_LIST` (`app/config.py`); a tenant's own request can
-  never write it (no `UPDATE` grant on `control.tenants`). Default: **no default** -- a tenant
-  without one fails closed (`app.residency.ResidencyUnresolved`), never inherits another
-  jurisdiction's route.
+  restricting it to one of `Settings.residency_allow_list.residencies`
+  (`app.residency.ResidencyAllowList`); a tenant's own request can never write it (no `UPDATE`
+  grant on `control.tenants`). Default: **no default** -- a tenant without one fails closed
+  (`app.residency.ResidencyUnresolved`), never inherits another jurisdiction's route.
 - **`model`** -- home: `public.tenants.settings["model"]` (tenant-editable, this module). Shape:
-  `str` or `None`. Validation: validated against
-  `RESIDENCY_MODEL_ALLOW_LIST[<tenant's own residency>]` at the point a chat model is resolved
-  (`app.llm.resolve_tenant_chat_model`), not by this model itself. Default: `None` (the
-  deployment default `Settings.llm_model` applies).
+  `str` or `None`. Validation: against `Settings.residency_allow_list.alias_for` for the
+  tenant's own residency, twice, never by this model itself: on write (every writer of
+  `tenants.settings` -- today only the operator tool's `create`,
+  `app.operator.create._validate_model` -- rejects an unlisted name before writing it) and again
+  on every read (`app.llm.resolve_tenant_chat_model`/`validate_model_for_residency`, from the
+  tenant record, #105), failing closed exactly like an unlisted deployment default -- so an
+  allow-list change after the write can never silently degrade to another model.
+  Default: `None` (the deployment default `Settings.llm_model` applies).
 - **`content_tracing_opt_in`** -- home: `public.tenants.settings["content_tracing_opt_in"]`
   (tenant-editable, this module). Shape: `bool`. Validation: plain Pydantic bool coercion, no
   allow-list -- any tenant admin may flip its own tenant's flag. Default: `False` -- content-free
@@ -55,9 +60,10 @@ than left to whichever module happens to read it first.
 `residency` is deliberately never a field on `TenantSettings` below (see the class docstring): it
 lives in `control.tenants`, read through `app.repositories.control.ControlRepository`, not
 through `TenantSettingsRepository`. It is listed in this catalog anyway because it is resolved
-alongside `content_tracing_opt_in` at the exact same call sites
-(`app.observability.resolve_tenant_tracing_selection`, `app.residency.resolve_residency_route`)
-and a reader of one needs to see the other.
+alongside `content_tracing_opt_in` and `model` from the exact same tenant record
+(`app.tenant_record.TenantRecord`; `app.observability.resolve_tenant_tracing`,
+`app.residency.resolve_residency_route`, `app.llm.resolve_tenant_chat_model`) and a reader of one
+needs to see the other.
 """
 
 from __future__ import annotations
@@ -116,7 +122,9 @@ class TenantSettings(BaseModel):
     reopen that hole.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    # `frozen`: a validated settings object rides on the immutable `app.tenant_record.TenantRecord`
+    # for a whole request (#104) -- nothing may change it half-way through.
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     # `tenants.settings["model"]` (app/llm.py): per-tenant model override. Residency is not
     # here on purpose: it is an operator-owned control-plane fact (`control.tenants.residency`,

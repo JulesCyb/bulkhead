@@ -18,13 +18,13 @@ import httpx
 import jwt
 import pytest
 
-import app.tenant_suspension as tenant_suspension_module
-import app.token_verifier as token_verifier_module
 import app.tools.memberships as memberships_tools_module
 from app.config import Settings, get_settings
 from app.context import RequestContext
 from app.main import app
 from app.repositories.memberships import MembershipRecord
+from app.token_verifier import set_default_adapter_for_tests
+from tests.conftest import FakeControlPlaneReads
 
 SECRET = "asgi-jwt-test-shared-secret-at-least-32-bytes"
 ISSUER = "https://idp.example.com"
@@ -45,12 +45,18 @@ async def _fake_session():
 
 
 def _install_fake_memberships(monkeypatch, records_by_tenant: dict[uuid.UUID, list]):
-    class FakeMembershipRepository:
+    """Fakes `app.tools.memberships.MembershipRepository.list_for_tenant` -- unrelated to (and not
+    migrated by) #100's control-plane-reads adapter, which only covers the narrower `get_role`
+    read `app.token_verifier` uses; this is the tenant-scoped listing route's own repository."""
+
+    class _FakeMembershipListingRepository:
         async def list_for_tenant(self, session, ctx: RequestContext):
             return records_by_tenant.get(ctx.tenant_id, [])
 
     monkeypatch.setattr(memberships_tools_module, "tenant_session", lambda ctx: _fake_session())
-    monkeypatch.setattr(memberships_tools_module, "MembershipRepository", FakeMembershipRepository)
+    monkeypatch.setattr(
+        memberships_tools_module, "MembershipRepository", _FakeMembershipListingRepository
+    )
 
 
 def _headers(identity_id: uuid.UUID, roles: str) -> dict[str, str]:
@@ -187,37 +193,15 @@ def _jwt_settings() -> Settings:
     )
 
 
-def _install_fake_control_plane(monkeypatch, *, auth_settings, identities, memberships):
-    from types import SimpleNamespace
-
-    class FakeTenantAuthSettingsRepository:
-        async def get(self, session, *, tenant_id, default_issuer=None):
-            if tenant_id not in auth_settings:
-                return None
-            issuer, suspended = auth_settings[tenant_id]
-            return SimpleNamespace(issuer=issuer or default_issuer, suspended=suspended)
-
-    class FakeIdentityRepository:
-        async def find_by_issuer_and_subject(self, session, *, issuer, subject):
-            identity_id = identities.get((issuer, subject))
-            if identity_id is None:
-                return None
-            return SimpleNamespace(id=identity_id, issuer=issuer, subject=subject)
-
-    class FakeMembershipRepository:
-        async def get_role(self, session, ctx: RequestContext, *, identity_id):
-            return memberships.get((ctx.tenant_id, identity_id))
-
-    # The token check lives in app.token_verifier (#44); the suspension check app.deps calls lives
-    # in app.tenant_suspension (#69) -- app.deps keeps neither copy itself.
-    for module in (tenant_suspension_module, token_verifier_module):
-        monkeypatch.setattr(module, "control_session", _fake_session)
-        monkeypatch.setattr(
-            module, "TenantAuthSettingsRepository", FakeTenantAuthSettingsRepository
+def _install_fake_control_plane(*, auth_settings, identities, memberships):
+    """Installs one `FakeControlPlaneReads` (#100) as the default adapter both
+    `app.token_verifier.verify_tenant_token` (#44) and `app.context_resolution`'s own tenant-record
+    read fall back to -- `app.deps` keeps neither check itself."""
+    set_default_adapter_for_tests(
+        FakeControlPlaneReads(
+            auth_settings=auth_settings, identities=identities, memberships=memberships
         )
-    monkeypatch.setattr(token_verifier_module, "tenant_session", lambda ctx: _fake_session())
-    monkeypatch.setattr(token_verifier_module, "IdentityRepository", FakeIdentityRepository)
-    monkeypatch.setattr(token_verifier_module, "MembershipRepository", FakeMembershipRepository)
+    )
 
 
 @pytest.fixture
@@ -237,7 +221,6 @@ async def test_jwt_mode_spoofed_role_header_is_ignored_member_still_refused(
     tenant_id = uuid.uuid4()
     identity_id = uuid.uuid4()
     _install_fake_control_plane(
-        monkeypatch,
         auth_settings={tenant_id: (ISSUER, False)},
         identities={(ISSUER, "sub-1"): identity_id},
         memberships={(tenant_id, identity_id): "member"},
@@ -265,7 +248,6 @@ async def test_jwt_mode_role_promotion_takes_effect_next_request_no_token_refres
     identity_id = uuid.uuid4()
     memberships = {(tenant_id, identity_id): "member"}
     _install_fake_control_plane(
-        monkeypatch,
         auth_settings={tenant_id: (ISSUER, False)},
         identities={(ISSUER, "sub-1"): identity_id},
         memberships=memberships,

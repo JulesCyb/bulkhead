@@ -14,12 +14,7 @@ single `POST /api/chat`, not a propose/resume pair.
 from __future__ import annotations
 
 import json
-import os
-import subprocess
-import sys
-import tempfile
 import uuid
-from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
@@ -28,143 +23,28 @@ from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from app.api import chat as chat_module
-from app.config import ROLE_STATEMENT_TIMEOUT_MS
+from app.context import RequestContext
+from app.db.session import tenant_session
 from app.main import app
-from tests.conftest import resolve_to_model
+from app.repositories.standing_grants import StandingGrantRepository
 
 pgserver = pytest.importorskip("pgserver")
+
+from tests.support import (  # noqa: E402
+    cluster,
+    environment,
+    seed_conversation,
+    seed_document,
+    seed_tenant,
+)
+
+_ = (cluster, environment)
 
 CONVERSATION_ID = "conv-agent-1"
 TOOL_CALL_ID = "call-rename-agent-1"
 ORIGINAL_TITLE = "Original Title"
 NEW_TITLE = "Renamed Title"
 TOOL_NAME = "rename_document"
-
-
-def _psql(server, command: str) -> None:
-    """`server.psql` without a shell: pgserver's own version breaks on paths with spaces."""
-    from pgserver.postgres_server import POSTGRES_BIN_PATH
-
-    subprocess.run(
-        [str(POSTGRES_BIN_PATH / "psql"), server.get_uri()],
-        input=command.encode(),
-        check=True,
-        capture_output=True,
-    )
-
-
-@pytest.fixture(scope="module")
-def database_urls():
-    """Mirrors `tests/test_writing_tool_approval_integration.py`'s own fixture: app_owner/app
-    roles, migrated to head with the real Alembic chain."""
-    pgdata = tempfile.mkdtemp(prefix="pgdata-")
-    server = pgserver.get_server(pgdata, cleanup_mode="delete")
-    sockdir = parse_qs(urlparse(server.get_uri()).query)["host"][0]
-    _psql(
-        server,
-        "CREATE EXTENSION IF NOT EXISTS vector; "
-        "CREATE ROLE app_owner LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE; "
-        "ALTER SCHEMA public OWNER TO app_owner; "
-        "GRANT CREATE ON DATABASE postgres TO app_owner; "
-        "CREATE ROLE app LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE; "
-        "GRANT USAGE ON SCHEMA public TO app; "
-        f"ALTER ROLE app SET statement_timeout = '{ROLE_STATEMENT_TIMEOUT_MS}ms';",
-    )
-    urls = {
-        "migrations": f"postgresql+asyncpg://app_owner@/postgres?host={sockdir}",
-        "app": f"postgresql+asyncpg://app@/postgres?host={sockdir}",
-        "superuser": f"postgresql+asyncpg://postgres@/postgres?host={sockdir}",
-    }
-    env = {**os.environ, "DATABASE_URL_MIGRATIONS": urls["migrations"], "DATABASE_URL": urls["app"]}
-    subprocess.run(
-        [sys.executable, "-m", "alembic", "upgrade", "head"], check=True, env=env, timeout=120
-    )
-    yield urls
-    server.cleanup()
-
-
-@pytest.fixture
-def app_settings(database_urls, monkeypatch):
-    from app import config
-    from app.db import session as db_session
-
-    monkeypatch.setenv("DATABASE_URL", database_urls["app"])
-    monkeypatch.setenv("DATABASE_URL_MIGRATIONS", database_urls["migrations"])
-    monkeypatch.setenv("PENDING_ACTION_EXPIRY_SECONDS", "300")
-    config.get_settings.cache_clear()
-    db_session._engine = None
-    db_session._session_factory = None
-    yield
-    config.get_settings.cache_clear()
-    db_session._engine = None
-    db_session._session_factory = None
-
-
-async def _seed_tenant(url: str) -> uuid.UUID:
-    engine = create_async_engine(url)
-    tenant_id = uuid.uuid4()
-    async with engine.begin() as conn:
-        await conn.execute(
-            text("INSERT INTO tenants (id, name) VALUES (:id, 'Acme')"), {"id": tenant_id}
-        )
-    await engine.dispose()
-    return tenant_id
-
-
-async def _seed_membership(
-    url: str, *, tenant_id: uuid.UUID, role: str
-) -> tuple[uuid.UUID, uuid.UUID]:
-    """A global identity plus its membership of `role` in `tenant_id`. Returns
-    (identity_id, membership_id)."""
-    engine = create_async_engine(url)
-    identity_id = uuid.uuid4()
-    async with engine.begin() as conn:
-        await conn.execute(
-            text("INSERT INTO control.identities (id, issuer, subject) VALUES (:id, 'seed', :sub)"),
-            {"id": identity_id, "sub": str(identity_id)},
-        )
-        membership_id = (
-            await conn.execute(
-                text(
-                    "INSERT INTO memberships (tenant_id, identity_id, role) "
-                    "VALUES (:tid, :iid, :role) RETURNING id"
-                ),
-                {"tid": tenant_id, "iid": identity_id, "role": role},
-            )
-        ).scalar_one()
-    await engine.dispose()
-    return identity_id, membership_id
-
-
-async def _seed_conversation(url: str, *, tenant_id: uuid.UUID, identity_id: uuid.UUID) -> None:
-    engine = create_async_engine(url)
-    async with engine.begin() as conn:
-        await conn.execute(
-            text(
-                "INSERT INTO conversations (tenant_id, conversation_id, created_by) "
-                "VALUES (:tid, :cid, :creator)"
-            ),
-            {"tid": tenant_id, "cid": CONVERSATION_ID, "creator": identity_id},
-        )
-    await engine.dispose()
-
-
-async def _seed_document(
-    url: str, *, tenant_id: uuid.UUID, identity_id: uuid.UUID, title: str = ORIGINAL_TITLE
-) -> uuid.UUID:
-    engine = create_async_engine(url)
-    document_id = uuid.uuid4()
-    async with engine.begin() as conn:
-        await conn.execute(
-            text(
-                "INSERT INTO documents (id, tenant_id, title, content, created_by, updated_by) "
-                "VALUES (:id, :tid, :title, 'content', :who, :who)"
-            ),
-            {"id": document_id, "tid": tenant_id, "title": title, "who": identity_id},
-        )
-    await engine.dispose()
-    return document_id
 
 
 async def _document_title(url: str, *, document_id: uuid.UUID) -> str:
@@ -179,33 +59,26 @@ async def _document_title(url: str, *, document_id: uuid.UUID) -> str:
     return title
 
 
-async def _seed_standing_grant(
-    url: str,
+async def _create_standing_grant_via_repository(
+    environment,
     *,
     tenant_id: uuid.UUID,
     agent_membership_id: uuid.UUID,
     granted_by: uuid.UUID,
     tool_name: str = TOOL_NAME,
 ) -> uuid.UUID:
-    engine = create_async_engine(url)
-    async with engine.begin() as conn:
-        grant_id = (
-            await conn.execute(
-                text(
-                    "INSERT INTO standing_grants "
-                    "(tenant_id, agent_membership_id, tool_name, granted_by) "
-                    "VALUES (:tid, :mid, :tool, :granted_by) RETURNING id"
-                ),
-                {
-                    "tid": tenant_id,
-                    "mid": agent_membership_id,
-                    "tool": tool_name,
-                    "granted_by": granted_by,
-                },
-            )
-        ).scalar_one()
-    await engine.dispose()
-    return grant_id
+    """Through the real repository (`app/repositories/standing_grants.py`), exactly like
+    `tests/test_standing_grants_integration.py` -- no raw INSERT of its own."""
+    ctx = RequestContext(tenant_id=tenant_id, identity_id=granted_by, roles=frozenset({"admin"}))
+    async with tenant_session(ctx) as session:
+        grant = await StandingGrantRepository().create(
+            session,
+            ctx,
+            agent_membership_id=agent_membership_id,
+            tool_name=tool_name,
+            granted_by=granted_by,
+        )
+        return grant.id
 
 
 async def _pending_action_rows(url: str, *, tenant_id: uuid.UUID) -> list[dict]:
@@ -313,136 +186,137 @@ def client() -> httpx.AsyncClient:
 
 
 async def test_agent_identity_without_a_standing_grant_is_refused_outright(
-    app_settings, database_urls, client, monkeypatch
+    environment, client, use_model
 ):
     """AC1: an agent identity's context calling the writing tool with no active standing grant is
     refused outright -- no pending action is ever created, and no fallback to asking anyone -- and
     an audit record names the denial (`denied_for_lack_of_grant`)."""
-    tenant_id = await _seed_tenant(database_urls["superuser"])
-    identity_id, _membership_id = await _seed_membership(
-        database_urls["superuser"], tenant_id=tenant_id, role="agent"
+    tenant = await seed_tenant(environment, roles=["agent"], via_operator=False)
+    identity_id = tenant.identities["agent"]
+    await seed_conversation(
+        environment,
+        tenant_id=tenant.tenant_id,
+        identity_id=identity_id,
+        conversation_id=CONVERSATION_ID,
     )
-    await _seed_conversation(
-        database_urls["superuser"], tenant_id=tenant_id, identity_id=identity_id
-    )
-    document_id = await _seed_document(
-        database_urls["superuser"], tenant_id=tenant_id, identity_id=identity_id
+    document_id = await seed_document(
+        environment, tenant_id=tenant.tenant_id, identity_id=identity_id, title=ORIGINAL_TITLE
     )
 
     model = _rename_model(document_id=document_id, title=NEW_TITLE)
-    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(model))
+    use_model(model)
 
     async with client:
         response = await client.post(
-            _chat_path(tenant_id), json=_propose_body(), headers=_headers(identity_id)
+            _chat_path(tenant.tenant_id), json=_propose_body(), headers=_headers(identity_id)
         )
     assert response.status_code == 200, response.text
     # No deferred approval was ever raised for an agent identity -- the denial resolves within
     # this single request.
     assert '"type":"tool-approval-request"' not in response.text
 
-    title = await _document_title(database_urls["superuser"], document_id=document_id)
+    title = await _document_title(environment.superuser_url, document_id=document_id)
     assert title == ORIGINAL_TITLE  # never executed
 
-    pending_rows = await _pending_action_rows(database_urls["superuser"], tenant_id=tenant_id)
+    pending_rows = await _pending_action_rows(environment.superuser_url, tenant_id=tenant.tenant_id)
     assert pending_rows == []  # no fallback to asking anyone -- no pending action at all
 
-    events = await _audit_events_for_tenant(database_urls["superuser"], tenant_id=tenant_id)
+    events = await _audit_events_for_tenant(environment.superuser_url, tenant_id=tenant.tenant_id)
     assert [e["kind"] for e in events] == ["denied_for_lack_of_grant"]
     assert events[0]["standing_grant_id"] is None
     assert events[0]["pending_action_id"] is None
 
 
 async def test_agent_identity_with_a_standing_grant_executes_with_no_pending_action(
-    app_settings, database_urls, client, monkeypatch
+    environment, client, use_model
 ):
     """AC2: the same agent-identity context succeeds once an active standing grant for that
     identity and tool exists, executes with no pending action ever created, and the audit record
     for the execution references that grant."""
-    tenant_id = await _seed_tenant(database_urls["superuser"])
-    identity_id, agent_membership_id = await _seed_membership(
-        database_urls["superuser"], tenant_id=tenant_id, role="agent"
+    tenant = await seed_tenant(environment, roles=["agent", "admin"], via_operator=False)
+    identity_id = tenant.identities["agent"]
+    agent_membership_id = tenant.memberships["agent"]
+    admin_membership_id = tenant.memberships["admin"]
+    await seed_conversation(
+        environment,
+        tenant_id=tenant.tenant_id,
+        identity_id=identity_id,
+        conversation_id=CONVERSATION_ID,
     )
-    admin_identity_id, admin_membership_id = await _seed_membership(
-        database_urls["superuser"], tenant_id=tenant_id, role="admin"
+    document_id = await seed_document(
+        environment, tenant_id=tenant.tenant_id, identity_id=identity_id, title=ORIGINAL_TITLE
     )
-    await _seed_conversation(
-        database_urls["superuser"], tenant_id=tenant_id, identity_id=identity_id
-    )
-    document_id = await _seed_document(
-        database_urls["superuser"], tenant_id=tenant_id, identity_id=identity_id
-    )
-    grant_id = await _seed_standing_grant(
-        database_urls["superuser"],
-        tenant_id=tenant_id,
+    grant_id = await _create_standing_grant_via_repository(
+        environment,
+        tenant_id=tenant.tenant_id,
         agent_membership_id=agent_membership_id,
         granted_by=admin_membership_id,
         tool_name=TOOL_NAME,
     )
 
     model = _rename_model(document_id=document_id, title=NEW_TITLE)
-    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(model))
+    use_model(model)
 
     async with client:
         response = await client.post(
-            _chat_path(tenant_id), json=_propose_body(), headers=_headers(identity_id)
+            _chat_path(tenant.tenant_id), json=_propose_body(), headers=_headers(identity_id)
         )
     assert response.status_code == 200, response.text
     assert '"type":"tool-approval-request"' not in response.text
 
-    title = await _document_title(database_urls["superuser"], document_id=document_id)
+    title = await _document_title(environment.superuser_url, document_id=document_id)
     assert title == NEW_TITLE
 
-    pending_rows = await _pending_action_rows(database_urls["superuser"], tenant_id=tenant_id)
+    pending_rows = await _pending_action_rows(environment.superuser_url, tenant_id=tenant.tenant_id)
     assert pending_rows == []  # a grant-authorized write never creates a pending action
 
-    events = await _audit_events_for_tenant(database_urls["superuser"], tenant_id=tenant_id)
+    events = await _audit_events_for_tenant(environment.superuser_url, tenant_id=tenant.tenant_id)
     assert [e["kind"] for e in events] == ["executed"]
     assert events[0]["standing_grant_id"] == grant_id
     assert events[0]["pending_action_id"] is None
 
 
 async def test_agent_identity_is_refused_when_the_only_grant_names_a_different_tool(
-    app_settings, database_urls, client, monkeypatch
+    environment, client, use_model
 ):
     """AC3: an agent-identity context is refused when the only active grant it holds names a
     different tool than the one being called."""
-    tenant_id = await _seed_tenant(database_urls["superuser"])
-    identity_id, agent_membership_id = await _seed_membership(
-        database_urls["superuser"], tenant_id=tenant_id, role="agent"
+    tenant = await seed_tenant(environment, roles=["agent", "admin"], via_operator=False)
+    identity_id = tenant.identities["agent"]
+    agent_membership_id = tenant.memberships["agent"]
+    admin_membership_id = tenant.memberships["admin"]
+    await seed_conversation(
+        environment,
+        tenant_id=tenant.tenant_id,
+        identity_id=identity_id,
+        conversation_id=CONVERSATION_ID,
     )
-    _admin_identity_id, admin_membership_id = await _seed_membership(
-        database_urls["superuser"], tenant_id=tenant_id, role="admin"
+    document_id = await seed_document(
+        environment, tenant_id=tenant.tenant_id, identity_id=identity_id, title=ORIGINAL_TITLE
     )
-    await _seed_conversation(
-        database_urls["superuser"], tenant_id=tenant_id, identity_id=identity_id
-    )
-    document_id = await _seed_document(
-        database_urls["superuser"], tenant_id=tenant_id, identity_id=identity_id
-    )
-    await _seed_standing_grant(
-        database_urls["superuser"],
-        tenant_id=tenant_id,
+    await _create_standing_grant_via_repository(
+        environment,
+        tenant_id=tenant.tenant_id,
         agent_membership_id=agent_membership_id,
         granted_by=admin_membership_id,
         tool_name="some_other_tool",
     )
 
     model = _rename_model(document_id=document_id, title=NEW_TITLE)
-    monkeypatch.setattr(chat_module, "resolve_chat_model", resolve_to_model(model))
+    use_model(model)
 
     async with client:
         response = await client.post(
-            _chat_path(tenant_id), json=_propose_body(), headers=_headers(identity_id)
+            _chat_path(tenant.tenant_id), json=_propose_body(), headers=_headers(identity_id)
         )
     assert response.status_code == 200, response.text
 
-    title = await _document_title(database_urls["superuser"], document_id=document_id)
+    title = await _document_title(environment.superuser_url, document_id=document_id)
     assert title == ORIGINAL_TITLE  # never executed
 
-    pending_rows = await _pending_action_rows(database_urls["superuser"], tenant_id=tenant_id)
+    pending_rows = await _pending_action_rows(environment.superuser_url, tenant_id=tenant.tenant_id)
     assert pending_rows == []
 
-    events = await _audit_events_for_tenant(database_urls["superuser"], tenant_id=tenant_id)
+    events = await _audit_events_for_tenant(environment.superuser_url, tenant_id=tenant.tenant_id)
     assert [e["kind"] for e in events] == ["denied_for_lack_of_grant"]
     assert events[0]["standing_grant_id"] is None

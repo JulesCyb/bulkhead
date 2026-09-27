@@ -24,6 +24,15 @@ path that carries content out of the process (model, embeddings, tracing) honour
 data never crosses it.
 _Avoid_: region (as a synonym), data location, hosting, EU flag
 
+**Residency allow-list**:
+Which residencies exist and the endpoints (model/gateway host, embedding endpoint, trace sink)
+and gateway model aliases each one may reach — one `ResidencyAllowList` object
+(`app/residency.py`), built from `config/residency.toml`, that answers every "is this residency
+known, and what is its route" question the deployment or a tenant's own request can ask. Adding a
+residency is a new table in that file, never a code change; a lookup outside the list fails
+closed.
+_Avoid_: region list, allowed models (as a synonym for the whole object), provider allow-list
+
 **Budget**:
 How much model usage a tenant may consume in a period, enforced outside the application at the
 gateway with credentials issued per tenant. An exhausted budget stops that tenant, never the
@@ -57,6 +66,15 @@ The operator's own records about tenants and identities: which exist, their isol
 residency, where their data lives. Owned by the operator, never by a tenant; a tenant's request
 can read what it needs of it and change nothing.
 _Avoid_: admin data, master data, tenant catalog
+
+**Tenant record**:
+What the control plane says about one tenant at the moment a request starts — isolation tier,
+database alias, residency, suspension, gateway credential alias — together with the tenant's own
+settings, read once when the request's context is resolved and carried with it, unchanged, to
+every session and resolver the request uses. A suspended record ends the request there; the next
+request reads the record again, never a cached one.
+_Avoid_: tenant config, tenant info, tenant row, tenant metadata, tenant settings (as the whole —
+the settings are one part of it)
 
 **Tenant secret**:
 A secret the operator holds and uses on one tenant's behalf: the gateway credential, access to a

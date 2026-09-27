@@ -4,17 +4,29 @@ Payoff: Claude Code / Claude Desktop during development, managed platforms later
 rewriting the tools.
 
 Context: in production, the tenant/identity context comes from the MCP connection's
-authentication (OAuth/token, `app.token_verifier`), per connection. For local development
-(`MCP_TRANSPORT=stdio`, the default), from the process-wide MCP_TENANT_ID / MCP_IDENTITY_ID.
+authentication -- `MCPTenantAuthMiddleware` below is an adapter of the same one chain the HTTP API
+uses (`app.context_resolution.resolve_bearer_context`, #101/#102), never its own bearer parsing or
+verification-error mapping -- per connection, held in the `_connection_context` contextvar for the
+lifetime of that connection's request. For local development (`MCP_TRANSPORT=stdio`, the
+default), from the process-wide MCP_TENANT_ID / MCP_IDENTITY_ID
+(`app.context_resolution.resolve_stdio_env_context`, #102) -- reachable only when no
+per-connection context is set, and only under `stdio` (issue #89: never a fallback under
+`streamable-http`, where an unset contextvar is a hard error).
+
 Which transport is active is a single setting (`Settings.mcp_transport`, issue #48 / ADR-0005),
 guarded at startup by `check_mcp_mode` below the same way `AUTH_MODE=dev-headers` is guarded by
 `app.main.check_auth_mode`.
 
-Every tool resolves its context through `resolve_context()`, not `context_provider()` directly
-(Spec 9 / #69, ADR-0010): it builds the context, then checks suspension
-(`app.tenant_suspension.ensure_tenant_not_suspended`) before any tool body runs -- the MCP
-connection handler's own, independent check, alongside the HTTP API's (`app/deps.py`) and the
-agent-run entry points' (`app/agents/assistant.py`).
+Every tool resolves its context through `resolve_context()`, never `_connection_context` or
+`_context_from_env` directly (ADR-0010, issue #89): it builds the context (per connection first,
+env fallback only under `stdio`) and returns it -- no suspension check of its own (#106).
+Suspension is refused at three points project-wide (`app/db/session.py`'s module docstring):
+a per-connection context already carries the record `MCPTenantAuthMiddleware`'s call
+to `app.context_resolution.resolve_bearer_context` read and refused a suspended tenant on, before
+`_connection_context` was ever set; the `stdio` fallback's env-based context carries no record at
+all, so the first tool call that opens a `tenant_session()` -- `document_tools.search_documents`,
+`membership_tools.list_memberships` -- hits that function's own routing read and raises there
+instead.
 
 Start (stdio, e.g. in Claude Code's .mcp.json):
     uv run python -m app.mcp.server
@@ -23,18 +35,29 @@ Networked (`MCP_TRANSPORT=streamable-http`, issue #49 / ADR-0005): this module b
 server itself; the connection-authenticated ASGI app is `build_streamable_http_app()`, mounted by
 `app.main.create_app()` under the tenant's own path prefix (`/v1/t/{tenant_id}/mcp`, ADR-0012) --
 MCP now mounts inside the existing API service rather than adding a new one. Every connection's
-tenant/identity is derived from its own bearer token via `MCPTenantAuthMiddleware` below, which
-reuses the exact same shared check (`app.token_verifier.verify_tenant_token`) the HTTP API's
-`app.deps.get_context` does -- never a second, drifting copy of it.
+tenant/identity is derived from its own bearer token via `MCPTenantAuthMiddleware` below, which is
+only an adapter of `app.context_resolution.resolve_bearer_context` (#101/#102) -- the exact same
+chain the HTTP API's `app.deps.get_context` calls -- never a second, drifting copy of bearer
+parsing, verification-error mapping, or context construction.
+
+Two more conditions of the mount, closed by issue #116: the mounted sub-app's own lifespan never
+runs (Starlette forwards only `http`/`websocket` scopes to a `Mount`, never `lifespan`) --
+`app.main.lifespan` enters the mount's own session manager itself instead
+(`app.state.mcp_app.session_manager`, the one `build_streamable_http_app` bound it to -- never
+`server.session_manager`, which only names the latest build), for as long as the outer
+application runs; and `build_streamable_http_app` no longer leaves `transport_security`
+unconfigured -- `MCP_ALLOWED_HOSTS` (`Settings.mcp_allowed_hosts_list`) names this deployment's
+own public Host header(s), checked by `check_mcp_mode` below before `streamable-http` ever starts.
 
 Freshness note: MCP Python SDK 2.x -> `from mcp.server.mcpserver import MCPServer`
 (previously `from mcp.server.fastmcp import FastMCP`). Check on SDK updates.
 
-The residency boundary (ADR-0008, docs/residency.md): a connecting MCP client brings its own
+Residency (ADR-0008, docs/residency.md): a connecting MCP client brings its own
 model. That model sits entirely outside this application's processor chain and outside
-residency enforcement -- `RESIDENCY_ALLOW_LIST`, the gateway, and the per-residency trace sink
-(`app/config.py`, `app/residency.py`, `app/observability.py`) govern the model *this deployment*
-calls on a tenant's behalf, never the model a connecting client happens to be configured with. A
+residency enforcement -- `Settings.residency_allow_list`, the gateway, and the per-residency
+trace sink (`app/config.py`, `app/residency.py`, `app/observability.py`) govern the model *this
+deployment* calls on a tenant's behalf, never the model a connecting client happens to be
+configured with. A
 document snippet `search_documents` returns may leave the tenant's residency the moment that
 client's own model processes it; that is the connecting client's (the customer's) responsibility,
 never something this server can observe or enforce. The one bound that still applies regardless
@@ -52,20 +75,16 @@ from typing import Any
 from uuid import UUID
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 
+from app import context_resolution
 from app.config import Settings, get_settings
 from app.context import RequestContext
-from app.deps import get_algorithm_source, get_key_source
+from app.db.session import TenantSuspendedError
 from app.startup_checks import run_startup_checks
-from app.tenant_suspension import TenantSuspendedError, ensure_tenant_not_suspended
-from app.token_verifier import (
-    AGENT_IDENTITY_ISSUER,
-    TenantTokenVerificationError,
-    VerificationFailureReason,
-    verify_tenant_token,
-)
 from app.tools import documents as document_tools
 from app.tools import memberships as membership_tools
 
@@ -87,45 +106,51 @@ server = MCPServer(
 
 
 def _context_from_env() -> RequestContext:
-    s = get_settings()
-    if not (s.mcp_tenant_id and s.mcp_identity_id):
-        raise RuntimeError("Set MCP_TENANT_ID and MCP_IDENTITY_ID (development only).")
-    return RequestContext(tenant_id=UUID(s.mcp_tenant_id), identity_id=UUID(s.mcp_identity_id))
+    """Thin wrapper of `app.context_resolution.resolve_stdio_env_context` (#102) -- kept under
+    this name for #89's own semantics below (per-connection contextvar first, this fallback only
+    under `stdio`); the construction of `RequestContext` itself lives in that module, not here."""
+    return context_resolution.resolve_stdio_env_context(get_settings())
 
 
 # Per-connection context for the networked transport (issue #49): a `contextvars.ContextVar`
 # rather than a mutable module-level value, so concurrent connections (each its own asyncio task
 # under Streamable HTTP) never see each other's tenant/identity -- the same isolation a per-request
 # FastAPI dependency gets for free, reproduced here since MCP tool functions take no request
-# object of their own to thread a context through.
+# object of their own to thread a context through. Read only from inside `resolve_context()`
+# below (issue #89) -- never a second name standing between it and a tool.
 _connection_context: contextvars.ContextVar[RequestContext | None] = contextvars.ContextVar(
     "mcp_connection_context", default=None
 )
 
 
-def _context_from_connection() -> RequestContext:
-    ctx = _connection_context.get()
-    if ctx is None:  # pragma: no cover - defensive; every request path sets it first
-        raise RuntimeError(
-            "No per-connection MCP context is set -- MCPTenantAuthMiddleware must authenticate "
-            "a connection before any tool call runs on it."
-        )
-    return ctx
-
-
-# The seam for production: replaced with `_context_from_connection` (per-connection, streamable
-# HTTP) or left as `_context_from_env` (stdio, development). Anything but the env fallback MUST be
-# per-connection — a process-wide identity on a shared transport would leak tenants.
-context_provider: Callable[[], RequestContext] = _context_from_env
-
-
 async def resolve_context() -> RequestContext:
-    """The MCP connection handler's own context resolution: builds the context, then rejects a
-    suspended tenant before any tool body runs (Spec 9 / #69, ADR-0010) -- see module docstring.
-    Every tool calls this, never `context_provider()` directly.
+    """The MCP connection handler's own context resolution (issue #89): every tool calls this,
+    never `_connection_context` directly.
+
+    Reads the per-connection contextvar first -- set by `MCPTenantAuthMiddleware` for the
+    lifetime of one `streamable-http` connection's request, module docstring above. Only when it
+    is unset *and* the active transport is `stdio` does this fall back to the process-wide
+    `MCP_TENANT_ID`/`MCP_IDENTITY_ID` development identity (`_context_from_env`); under
+    `streamable-http` an unset contextvar is a hard error -- never that fallback, which would let
+    every connection quietly act as one fixed identity in one fixed tenant (the exact leak the
+    contextvar exists to prevent, and `check_mcp_mode` below separately refuses to even start
+    with those two settings present under this transport).
+
+    No suspension check of its own (#106): the per-connection branch already carries the record
+    `resolve_bearer_context` read and refused a suspended tenant on; the `stdio` fallback carries
+    no record at all, so the first tool call that opens a `tenant_session()` is what refuses it
+    (module docstring above).
     """
-    ctx = context_provider()
-    await ensure_tenant_not_suspended(ctx.tenant_id)
+    ctx = _connection_context.get()
+    if ctx is None:
+        settings = get_settings()
+        if settings.mcp_transport != "stdio":
+            raise RuntimeError(
+                "No per-connection MCP context is set -- MCPTenantAuthMiddleware must "
+                "authenticate a connection before any tool call runs on it. Under "
+                "MCP_TRANSPORT=streamable-http there is no environment fallback."
+            )
+        ctx = _context_from_env()
     return ctx
 
 
@@ -142,11 +167,12 @@ def _masked(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
     `MCPServer._handle_call_tool`'s own catch-all (which otherwise answers with the exception's
     own `str(e)` -- see that method's source). `PermissionError` is deliberately let through
     unmasked: issue #27 already relies on its exact message (the missing role) reaching the
-    caller, the same way the HTTP API's 403 body names it. `TenantSuspendedError` (issue #69) is
-    the same kind of controlled, expected rejection -- `resolve_context()` above already raises it
-    before this wrapper's own function body ever runs, and every other place a context is resolved
-    (`app/deps.py`, `app/api/chat.py`, `app/api/agents.py`) lets it propagate as itself rather than
-    folding it into a generic 500/masked error."""
+    caller, the same way the HTTP API's 403 body names it. `TenantSuspendedError` is the same kind
+    of controlled, expected rejection (#106): a `stdio`-fallback tool call raises it from inside
+    `tenant_session()` the moment its own body opens one (no record to have refused it earlier),
+    and every other place a context is resolved (`app/deps.py`, `app/api/chat.py`,
+    `app/api/agents.py`) lets it propagate as itself rather than folding it into a generic
+    500/masked error."""
 
     @functools.wraps(fn)
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -190,40 +216,58 @@ async def list_memberships() -> list[dict]:
 
 # --- Networked transport: per-connection context from a verified bearer token (issue #49) ---
 
-# Every rejected connection gets exactly this body, mirroring `app.deps.FORBIDDEN_DETAIL` -- the
-# specific reason is discoverable only from the server-side log, never the response (ADR-0012).
-_MCP_FORBIDDEN_DETAIL = "Not authorized for this tenant."
 
-
-def _actor_context(tenant_id: UUID, resolved) -> RequestContext:  # noqa: ANN001
-    """Builds the per-connection `RequestContext` from a verified token, naming the means
-    (ADR-0005, issue #43): a person's token resolves to delegation (means = the assistant's
-    tools); an agent identity's token resolves to autonomous use (means = the credential that
-    authenticated it, from the token's own `cred` claim -- see `app/token_verifier.py`)."""
-    base_ctx = RequestContext(
-        tenant_id=tenant_id, identity_id=resolved.identity_id, roles=frozenset({resolved.role})
-    )
-    if resolved.issuer == AGENT_IDENTITY_ISSUER:
-        return base_ctx.acting_through("credential", resolved.credential_public_id or "unknown")
-    return base_ctx.acting_through("agent", "assistant")
+def _render(rejection: context_resolution.ContextRejection, tenant_id: UUID) -> JSONResponse:
+    """The MCP transport's shape of a `ContextRejection` -- mirrors `app.deps._render` exactly
+    (the same status, the same client-visible `detail`, the same structured security-event
+    fields): the two adapters answer identically for the same rejection
+    (`tests/test_mcp_streamable_http.py::test_mcp_rejection_matches_the_http_adapters_for_the_same_reason`).
+    Only the response *type* differs (`JSONResponse` here, `HTTPException` there -- FastAPI's own
+    default handler turns that into the same `{"detail": ...}` body) and the log event's name
+    (`mcp_auth_forbidden`, this transport's own)."""
+    if rejection.is_security_event:
+        log.warning(
+            "MCP connection rejected",
+            extra={
+                "event": "mcp_auth_forbidden",
+                "reason": rejection.reason.value,
+                "tenant_id": str(tenant_id),
+                "issuer": rejection.issuer or "",
+                "request_id": rejection.request_id,
+            },
+        )
+    return JSONResponse({"detail": rejection.detail}, status_code=int(rejection.status))
 
 
 class MCPTenantAuthMiddleware:
-    """Wraps the MCP Streamable-HTTP ASGI app with the same three-way tenant check ADR-0012
-    requires of the HTTP API: the connection's bearer token is verified via the exact module the
-    HTTP path uses (`app.token_verifier.verify_tenant_token`, issue #44), and its resolved
-    identity/role become a per-connection `RequestContext` (via `_connection_context` above) for
-    the lifetime of that one ASGI request -- never the process-wide `_context_from_env` fallback.
+    """Adapter of `app.context_resolution.resolve_bearer_context` (#101/#102) for the MCP
+    Streamable-HTTP transport: reads this transport's own inputs (the path's `tenant_id`, the
+    `Authorization` header) and either sets the per-connection `RequestContext` (via
+    `_connection_context` above) for the lifetime of that one ASGI request, or renders the
+    module's `ContextRejection` (`_render` above) -- never the process-wide `_context_from_env`
+    fallback. No bearer parsing, no verification-error mapping, and no context construction of
+    its own live here -- all of that belongs to `app.context_resolution`
+    (`tests/test_context_resolution.py` greps for both).
 
     Mounted under `/v1/t/{tenant_id}/mcp` (`app.main.create_app`), so `tenant_id` arrives as an
     ordinary Starlette path parameter, exactly like every other tenant-scoped route -- the tenant
-    the connection is trying to reach, checked against the token's own audience by
-    `verify_tenant_token` itself (ADR-0012's three-way check, reused rather than reinvented).
+    the connection is trying to reach, checked against the token's own audience inside
+    `resolve_bearer_context` itself (ADR-0012's three-way check, reused rather than reinvented).
     """
 
-    def __init__(self, app: ASGIApp, *, settings: Settings) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        settings: Settings,
+        session_manager: StreamableHTTPSessionManager | None = None,
+    ) -> None:
         self.app = app
         self.settings = settings
+        # The session manager the wrapped Streamable HTTP app's own route is bound to (#116
+        # follow-up, code review 2026-09-26) -- what `app.main.lifespan` enters for this mount.
+        # `None` only for a middleware wrapping something other than that app (a test).
+        self.session_manager = session_manager
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -238,69 +282,49 @@ class MCPTenantAuthMiddleware:
             return
 
         headers = Headers(scope=scope)
-        authorization = headers.get("authorization")
-        if not authorization or not authorization.lower().startswith("bearer "):
-            response = JSONResponse(
-                {"detail": "Missing or malformed bearer token"}, status_code=401
-            )
-            await response(scope, receive, send)
-            return
-        token = authorization.split(" ", 1)[1].strip()
-        if not token:
-            response = JSONResponse(
-                {"detail": "Missing or malformed bearer token"}, status_code=401
-            )
-            await response(scope, receive, send)
+        outcome = await context_resolution.resolve_bearer_context(
+            tenant_id=tenant_id,
+            authorization=headers.get("authorization"),
+            settings=self.settings,
+        )
+        if isinstance(outcome, context_resolution.ContextRejection):
+            await _render(outcome, tenant_id)(scope, receive, send)
             return
 
-        key_source = get_key_source(self.settings)
-        algorithm_source = get_algorithm_source(self.settings)
-        try:
-            resolved = await verify_tenant_token(
-                token,
-                tenant_id=tenant_id,
-                key_source=key_source,
-                default_issuer=self.settings.default_identity_issuer,
-                algorithm_source=algorithm_source,
-            )
-        except TenantTokenVerificationError as exc:
-            if exc.reason is VerificationFailureReason.INVALID_OR_EXPIRED:
-                detail = (
-                    "No token issuer configured"
-                    if exc.issuer is None
-                    else "Invalid or expired token"
-                )
-                response = JSONResponse({"detail": detail}, status_code=401)
-            else:
-                log.warning(
-                    "MCP connection rejected",
-                    extra={
-                        "event": "mcp_auth_forbidden",
-                        "reason": exc.reason.value,
-                        "tenant_id": str(tenant_id),
-                        "issuer": exc.issuer or "",
-                    },
-                )
-                response = JSONResponse({"detail": _MCP_FORBIDDEN_DETAIL}, status_code=403)
-            await response(scope, receive, send)
-            return
-
-        ctx = _actor_context(tenant_id, resolved)
-        reset_token = _connection_context.set(ctx)
+        reset_token = _connection_context.set(outcome)
         try:
             await self.app(scope, receive, send)
         finally:
             _connection_context.reset(reset_token)
 
 
-def build_streamable_http_app(settings: Settings) -> ASGIApp:
+def build_streamable_http_app(settings: Settings) -> MCPTenantAuthMiddleware:
     """The networked transport's ASGI app (issue #49): the MCP SDK's own Streamable HTTP app,
     wrapped with `MCPTenantAuthMiddleware` above. `app.main.create_app` mounts this under
     `/v1/t/{tenant_id}/mcp` only when `settings.mcp_transport == "streamable-http"` -- the stdio
     entrypoint (`main()` below) never touches this function, so local development is unaffected.
+
+    Passes `transport_security` explicitly (issue #116), built from
+    `settings.mcp_allowed_hosts_list` (`MCP_ALLOWED_HOSTS`) -- without it,
+    `MCPServer.streamable_http_app` falls back to its own default (`host="127.0.0.1"`), which
+    auto-enables DNS-rebinding protection that only accepts a `127.0.0.1`/`localhost`/`::1` Host
+    header, rejecting a real deployment's own. `check_mcp_mode` below has already refused to let
+    this function be reached with an empty `mcp_allowed_hosts_list`.
+
+    The returned app carries, as `.session_manager`, the session manager this call's inner app is
+    bound to (#116 follow-up, code review 2026-09-26). Every call builds a fresh one and
+    `server.session_manager` then names only the latest, so a caller that mounts the result
+    enters *this* attribute's manager (`app.main.lifespan` does, via `app.state.mcp_app`) -- never
+    `server.session_manager`, which a second build in the same process would have rebound.
     """
-    inner = server.streamable_http_app(streamable_http_path="/")
-    return MCPTenantAuthMiddleware(inner, settings=settings)
+    inner = server.streamable_http_app(
+        streamable_http_path="/",
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=settings.mcp_allowed_hosts_list,
+        ),
+    )
+    return MCPTenantAuthMiddleware(inner, settings=settings, session_manager=server.session_manager)
 
 
 def check_mcp_mode(settings: Settings) -> None:
@@ -308,7 +332,7 @@ def check_mcp_mode(settings: Settings) -> None:
     `app.main.check_auth_mode` (issue #48 / ADR-0005): the guardrail lives in code, not only in
     the docs.
 
-    Two independent failure modes:
+    Four independent failure modes:
 
     - The stdio transport's process-wide identity fallback (`_context_from_env`, above) is only
       reachable when `mcp_transport` is `stdio`. Exactly like `AUTH_MODE=dev-headers`, that
@@ -319,6 +343,19 @@ def check_mcp_mode(settings: Settings) -> None:
       (`jwt_verification_key`, the same signing configuration `app.token_verifier` checks
       connections against) -- regardless of environment, so a half-finished deployment can never
       silently serve every tenant's documents to whoever can open a connection.
+    - `streamable-http` is also refused outright if `MCP_TENANT_ID`/`MCP_IDENTITY_ID` are set at
+      all (issue #89): those two settings have no meaning under this transport --
+      `resolve_context()` above never reads them once a connection is authenticated -- but an
+      operator "fixing" an unrelated startup failure by setting them (as happened before this
+      guard existed) must never be allowed to start, since that configuration used to make every
+      authenticated connection act as one fixed identity in one fixed tenant regardless of who
+      actually connected: a cross-tenant leak, not a fallback.
+    - `streamable-http` is also refused without `MCP_ALLOWED_HOSTS` set (issue #116): with none
+      configured, `build_streamable_http_app` would otherwise pass no explicit
+      `transport_security` to the MCP SDK's own app, which auto-enables its own DNS-rebinding
+      protection only for its own default `host="127.0.0.1"` -- an allow-list of only
+      `127.0.0.1`/`localhost`/`::1` that a real deployment's own Host header never matches. A
+      half-finished deployment must never start and then reject every real connection.
     """
     if settings.mcp_transport == "stdio":
         if settings.environment not in ("dev", "test"):
@@ -330,12 +367,30 @@ def check_mcp_mode(settings: Settings) -> None:
                 "ENVIRONMENT=dev."
             )
         return
+    if settings.mcp_tenant_id or settings.mcp_identity_id:
+        raise RuntimeError(
+            "MCP_TRANSPORT=streamable-http must not have MCP_TENANT_ID/MCP_IDENTITY_ID set -- "
+            "under the networked transport every connection's identity comes from its own "
+            "verified bearer token (resolve_context() never reads these two settings here); "
+            "leaving them set is a leftover from local development that would previously have "
+            "made every authenticated connection act as this one fixed identity in this one "
+            "fixed tenant. Unset them."
+        )
     if settings.jwt_verification_key is None:
         raise RuntimeError(
             "MCP_TRANSPORT=streamable-http requires a configured token verifier "
             "(JWT_VERIFICATION_KEY) so app.token_verifier has something to check connections "
             "against -- without it, a networked transport would accept a tool call from whoever "
             "can open a connection."
+        )
+    if not settings.mcp_allowed_hosts_list:
+        raise RuntimeError(
+            "MCP_TRANSPORT=streamable-http requires MCP_ALLOWED_HOSTS (comma-separated, same "
+            "shape as CORS_ORIGINS) -- the deployment's own public Host header(s) -- so "
+            "build_streamable_http_app's TransportSecuritySettings has something to allow-list; "
+            'without it the MCP SDK falls back to its own default (host="127.0.0.1"), which '
+            "auto-enables DNS-rebinding protection that only accepts a localhost Host header and "
+            "would reject every real connection."
         )
 
 

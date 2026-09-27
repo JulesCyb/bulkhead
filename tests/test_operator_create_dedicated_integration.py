@@ -1,73 +1,41 @@
 """Embedded-Postgres integration tests for the dedicated-tenant path of the `create` command
 (#71, ADR-0002, ADR-0010, ADR-0011): actually provisioning a second physical database, applying
 the current schema to it, and recording its alias in the control plane -- all in the same
-invocation, idempotently. Two ephemeral `pgserver` instances stand in for the pooled
-control-plane database and the target server a dedicated tenant's own database is provisioned on
-(mirroring `tests/test_tenant_session_routing_integration.py`'s own two-instance pattern).
+invocation, idempotently.
+
+The pooled control-plane database comes from `tests.support` (issue #96 / spec #90, "A6"); this
+file's own private bootstrap of it was deleted in favor of that shared fixture. `dedicated_target`
+below -- a second, bare `pgserver` instance standing in for the separate managed-Postgres server a
+dedicated tenant's own database is provisioned onto -- stays private to this file (and to
+`tests/test_operator_erase_integration.py`, which mirrors it under the same name): it is not
+seeding, it is the one thing these tests exist to prove (`create`/`erase` really reach a *second*
+server via `--dedicated-db-admin-url`), so `tests.support.seeding.seed_tenant`'s own dedicated
+path deliberately does not need it (it passes the *same* cluster's own superuser URL instead --
+see that module's docstring) and neither should this file's `pooled_urls` cluster.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import subprocess
-import sys
 import tempfile
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-import httpx
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from app.config import ROLE_STATEMENT_TIMEOUT_MS
-from app.gateway_provisioning import GatewayAdminClient
-
 pgserver = pytest.importorskip("pgserver")
 
 import scripts.migrate as migrate_module  # noqa: E402
+from tests.support import cluster, environment  # noqa: E402
+from tests.support.gateway import fake_gateway_admin_client  # noqa: E402
 
-
-def _psql(server, command: str) -> None:
-    """`server.psql` without a shell: pgserver's own version breaks on paths with spaces."""
-    from pgserver.postgres_server import POSTGRES_BIN_PATH
-
-    subprocess.run(
-        [str(POSTGRES_BIN_PATH / "psql"), server.get_uri()],
-        input=command.encode(),
-        check=True,
-        capture_output=True,
-    )
-
-
-@pytest.fixture(scope="module")
-def pooled_urls():
-    """The pooled control-plane database, fully migrated, `app_owner` running the migrations --
-    same bootstrap as `tests/test_operator_tool_integration.py`."""
-    pgdata = tempfile.mkdtemp(prefix="pgdata-operator-dedicated-pooled-")
-    server = pgserver.get_server(pgdata, cleanup_mode="delete")
-    sockdir = parse_qs(urlparse(server.get_uri()).query)["host"][0]
-    _psql(
-        server,
-        "CREATE EXTENSION IF NOT EXISTS vector; "
-        "CREATE ROLE app_owner LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE; "
-        "ALTER SCHEMA public OWNER TO app_owner; "
-        "GRANT CREATE ON DATABASE postgres TO app_owner; "
-        "CREATE ROLE app LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE; "
-        "GRANT USAGE ON SCHEMA public TO app; "
-        f"ALTER ROLE app SET statement_timeout = '{ROLE_STATEMENT_TIMEOUT_MS}ms';",
-    )
-    urls = {
-        "migrations": f"postgresql+asyncpg://app_owner@/postgres?host={sockdir}",
-        "app": f"postgresql+asyncpg://app@/postgres?host={sockdir}",
-        "superuser": f"postgresql+asyncpg://postgres@/postgres?host={sockdir}",
-    }
-    env = {**os.environ, "DATABASE_URL_MIGRATIONS": urls["migrations"], "DATABASE_URL": urls["app"]}
-    subprocess.run(
-        [sys.executable, "-m", "alembic", "upgrade", "head"], check=True, env=env, timeout=120
-    )
-    yield urls
-    server.cleanup()
+# `cluster`/`environment` are imported only so pytest can discover them as fixtures from this
+# module's namespace -- referenced only by parameter name in the tests below, never called
+# directly.
+_ = (cluster, environment)
 
 
 @pytest.fixture
@@ -82,48 +50,6 @@ def dedicated_target():
     admin_url = f"postgresql+asyncpg://postgres@/postgres?host={sockdir}"
     yield {"sockdir": sockdir, "admin_url": admin_url}
     server.cleanup()
-
-
-@pytest.fixture
-def operator_env(pooled_urls, monkeypatch):
-    from app import migration_settings
-
-    monkeypatch.setenv("DATABASE_URL_MIGRATIONS", pooled_urls["migrations"])
-    migration_settings.get_migration_settings.cache_clear()
-    yield
-    migration_settings.get_migration_settings.cache_clear()
-
-
-@pytest.fixture
-def dedicated_secrets_dirs(tmp_path, monkeypatch):
-    """Points scripts/migrate.py and app/db/engine_registry.py's secret-file directories at
-    fresh, empty tmp directories, exactly as a real deployment would provide separately."""
-    migrations_dir = tmp_path / "tenant-db-migrations"
-    migrations_dir.mkdir()
-    app_dir = tmp_path / "tenant-db"
-    app_dir.mkdir()
-    monkeypatch.setenv("TENANT_DB_MIGRATIONS_SECRETS_DIR", str(migrations_dir))
-    monkeypatch.setenv("TENANT_DB_SECRETS_DIR", str(app_dir))
-    return {"migrations": migrations_dir, "app": app_dir}
-
-
-def _fake_admin_client(*, key: str = "sk-minted") -> GatewayAdminClient:
-    """Mirrors `tests/test_operator_tool_integration.py`'s own fake -- the gateway is never
-    reached over a real network here either."""
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/key/generate":
-            return httpx.Response(200, json={"key": key})
-        return httpx.Response(404)
-
-    http_client = httpx.AsyncClient(
-        base_url="http://litellm.internal:4000", transport=httpx.MockTransport(handler)
-    )
-    return GatewayAdminClient(
-        base_url="http://litellm.internal:4000",
-        master_key="sk-master-test",
-        http_client=http_client,
-    )
 
 
 def _owner_dsn(alias: str, sockdir: str) -> str:
@@ -156,7 +82,7 @@ def _head_revision() -> str:
 
 
 async def test_create_provisions_a_second_physical_database_at_head(
-    pooled_urls, operator_env, dedicated_target, dedicated_secrets_dirs, tmp_path
+    environment, dedicated_target, tmp_path
 ):
     """Acceptance (#71): creating a dedicated tenant results in a second physical database that
     exists, carries the current migration head, and is named by the alias the control-plane
@@ -165,7 +91,7 @@ async def test_create_provisions_a_second_physical_database_at_head(
     from app.operator.create import create_tenant
 
     settings = Settings(gateway_credentials_dir=str(tmp_path))
-    engine = create_async_engine(pooled_urls["migrations"])
+    engine = create_async_engine(environment.owner_url)
     try:
         async with engine.begin() as conn:
             result = await create_tenant(
@@ -176,7 +102,7 @@ async def test_create_provisions_a_second_physical_database_at_head(
                 isolation_tier="dedicated",
                 dedicated_db_admin_url=dedicated_target["admin_url"],
                 settings=settings,
-                admin_client=_fake_admin_client(key="sk-dedicated-co"),
+                admin_client=fake_gateway_admin_client(key="sk-dedicated-co"),
             )
     finally:
         await engine.dispose()
@@ -192,7 +118,7 @@ async def test_create_provisions_a_second_physical_database_at_head(
     assert version == _head_revision()
 
     # The control-plane record (in the pooled database) carries the alias.
-    verify_engine = create_async_engine(pooled_urls["superuser"])
+    verify_engine = create_async_engine(environment.superuser_url)
     try:
         async with verify_engine.connect() as conn:
             row = (
@@ -234,7 +160,7 @@ async def test_create_provisions_a_second_physical_database_at_head(
     assert membership.role == "admin"
 
     # ...never in the pooled one.
-    pooled_membership_engine = create_async_engine(pooled_urls["superuser"])
+    pooled_membership_engine = create_async_engine(environment.superuser_url)
     try:
         async with pooled_membership_engine.connect() as conn:
             count = (
@@ -248,12 +174,12 @@ async def test_create_provisions_a_second_physical_database_at_head(
     assert count == 0
 
     # Both tenant-secret files were written.
-    assert (dedicated_secrets_dirs["migrations"] / result.database_alias).exists()
-    assert (dedicated_secrets_dirs["app"] / result.database_alias).exists()
+    assert (Path(os.environ["TENANT_DB_MIGRATIONS_SECRETS_DIR"]) / result.database_alias).exists()
+    assert (Path(os.environ["TENANT_DB_SECRETS_DIR"]) / result.database_alias).exists()
 
 
 async def test_rerun_does_not_recreate_the_database_or_reapply_migrations(
-    pooled_urls, operator_env, dedicated_target, dedicated_secrets_dirs, tmp_path
+    environment, dedicated_target, tmp_path
 ):
     """Acceptance (#71): re-running create against the same dedicated tenant does not attempt to
     recreate the database or reapply migrations it already applied -- proven by omitting
@@ -264,7 +190,7 @@ async def test_rerun_does_not_recreate_the_database_or_reapply_migrations(
     from app.operator.create import create_tenant
 
     settings = Settings(gateway_credentials_dir=str(tmp_path))
-    engine = create_async_engine(pooled_urls["migrations"])
+    engine = create_async_engine(environment.owner_url)
     try:
         async with engine.begin() as conn:
             first = await create_tenant(
@@ -275,12 +201,12 @@ async def test_rerun_does_not_recreate_the_database_or_reapply_migrations(
                 isolation_tier="dedicated",
                 dedicated_db_admin_url=dedicated_target["admin_url"],
                 settings=settings,
-                admin_client=_fake_admin_client(key="sk-rerun-dedicated"),
+                admin_client=fake_gateway_admin_client(key="sk-rerun-dedicated"),
             )
     finally:
         await engine.dispose()
 
-    second_engine = create_async_engine(pooled_urls["migrations"])
+    second_engine = create_async_engine(environment.owner_url)
     try:
         async with second_engine.begin() as conn:
             second = await create_tenant(
@@ -291,7 +217,7 @@ async def test_rerun_does_not_recreate_the_database_or_reapply_migrations(
                 isolation_tier="dedicated",
                 dedicated_db_admin_url=None,  # never needed again -- see docstring
                 settings=settings,
-                admin_client=_fake_admin_client(key="sk-should-not-be-minted"),
+                admin_client=fake_gateway_admin_client(key="sk-should-not-be-minted"),
             )
     finally:
         await second_engine.dispose()
@@ -305,14 +231,14 @@ async def test_rerun_does_not_recreate_the_database_or_reapply_migrations(
     assert second.gateway_credential_alias == first.gateway_credential_alias
 
 
-async def test_pooled_tenant_never_gets_a_database_alias(pooled_urls, operator_env, tmp_path):
+async def test_pooled_tenant_never_gets_a_database_alias(environment, tmp_path):
     """Acceptance (#71): the control-plane record's database-alias field is populated only for
     the dedicated tier, and left absent for a pooled tenant."""
     from app.config import Settings
     from app.operator.create import create_tenant
 
     settings = Settings(gateway_credentials_dir=str(tmp_path))
-    engine = create_async_engine(pooled_urls["migrations"])
+    engine = create_async_engine(environment.owner_url)
     try:
         async with engine.begin() as conn:
             result = await create_tenant(
@@ -321,7 +247,7 @@ async def test_pooled_tenant_never_gets_a_database_alias(pooled_urls, operator_e
                 residency="eu",
                 admin_email="admin@still-pooled.test",
                 settings=settings,
-                admin_client=_fake_admin_client(key="sk-still-pooled"),
+                admin_client=fake_gateway_admin_client(key="sk-still-pooled"),
             )
     finally:
         await engine.dispose()
@@ -332,23 +258,20 @@ async def test_pooled_tenant_never_gets_a_database_alias(pooled_urls, operator_e
 
 
 async def test_create_dedicated_is_recorded_in_the_operator_action_log(
-    pooled_urls, operator_env, dedicated_target, dedicated_secrets_dirs, tmp_path, monkeypatch
+    environment, dedicated_target, tmp_path, monkeypatch, capsys
 ):
     """Acceptance (#71): the create invocation for a dedicated tenant is recorded in the
-    operator-action log the same way a pooled create is, with the admin URL redacted."""
-    import app.operator.create as create_module
+    operator-action log the same way a pooled create is, with the admin URL redacted. The gateway
+    admin client is injected straight into `run_operator()` (spec A5 / #115), not monkeypatched
+    onto `app.operator.create.build_admin_client`."""
     from app import config
-    from app.operator.cli import _run, build_parser
+    from app.operator.cli import run_operator
 
     monkeypatch.setenv("GATEWAY_CREDENTIALS_DIR", str(tmp_path))
     config.get_settings.cache_clear()
-    monkeypatch.setattr(
-        create_module,
-        "build_admin_client",
-        lambda settings: _fake_admin_client(key="sk-cli-dedicated"),
-    )
 
-    args = build_parser().parse_args(
+    engine = create_async_engine(environment.owner_url)
+    exit_code = await run_operator(
         [
             "create",
             "CLI Dedicated Co",
@@ -360,13 +283,15 @@ async def test_create_dedicated_is_recorded_in_the_operator_action_log(
             "dedicated",
             "--dedicated-db-admin-url",
             dedicated_target["admin_url"],
-        ]
+        ],
+        engine=engine,
+        admin_client=fake_gateway_admin_client(key="sk-cli-dedicated"),
     )
-    exit_code = await _run(args.command, args)
+    await engine.dispose()
     config.get_settings.cache_clear()
     assert exit_code == 0
 
-    rows_engine = create_async_engine(pooled_urls["superuser"])
+    rows_engine = create_async_engine(environment.superuser_url)
     try:
         async with rows_engine.connect() as conn:
             rows = (
@@ -381,10 +306,61 @@ async def test_create_dedicated_is_recorded_in_the_operator_action_log(
         await rows_engine.dispose()
 
     assert len(rows) >= 1
-    _, action, details = rows[-1]
+    tenant_id, action, details = rows[-1]
     if isinstance(details, str):
         details = json.loads(details)
     assert action == "create"
     assert details["outcome"].startswith("ok: tenant ")
     assert details["args"]["isolation_tier"] == "dedicated"
     assert details["args"]["dedicated_db_admin_url"] == "<redacted>"
+
+    # A dedicated tenant's control-plane record lives in the pooled database, but its own
+    # membership lives only in its own database (never the pooled one) -- see
+    # `app.operator.create`'s module docstring -- so this needs two connections, not one.
+    verify_engine = create_async_engine(environment.superuser_url)
+    try:
+        async with verify_engine.connect() as conn:
+            control_row = (
+                await conn.execute(
+                    text(
+                        "SELECT database_alias, gateway_credential_alias FROM control.tenants "
+                        "WHERE tenant_id = :tid"
+                    ),
+                    {"tid": tenant_id},
+                )
+            ).one()
+    finally:
+        await verify_engine.dispose()
+
+    dedicated_url = _owner_dsn(control_row.database_alias, dedicated_target["sockdir"])
+    dedicated_engine = create_async_engine(dedicated_url)
+    try:
+        async with dedicated_engine.begin() as conn:
+            await conn.execute(
+                text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": str(tenant_id)}
+            )
+            identity_id = (
+                await conn.execute(
+                    text("SELECT identity_id FROM memberships WHERE tenant_id = :tid"),
+                    {"tid": tenant_id},
+                )
+            ).scalar_one()
+    finally:
+        await dedicated_engine.dispose()
+
+    # Golden output (spec A5 / #115, acceptance criterion 2): byte-identical to what the retired
+    # `_run_create` printed for a dedicated tenant, reconstructed from independently-queried
+    # database state (not from the result object under test). Provisioning a fresh dedicated
+    # database prints its own role-bootstrap/migration lines first (unrelated to this command's
+    # own formatter) -- this checks the create command's own block, at the end of stdout.
+    assert capsys.readouterr().out.endswith(
+        f"MCP_TENANT_ID={tenant_id}\n"
+        f"MCP_IDENTITY_ID={identity_id}\n"
+        f"Gateway credential alias: {control_row.gateway_credential_alias}\n"
+        f"Database alias: {control_row.database_alias}\n"
+        "control-plane record: created; gateway credential: provisioned; "
+        "admin membership: created; dedicated database: provisioned\n"
+        "\n"
+        f"curl -H 'X-Identity-Id: {identity_id}' "
+        f"http://localhost:8000/v1/t/{tenant_id}/agents/assistant/run ...\n"
+    )

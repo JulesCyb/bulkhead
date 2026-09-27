@@ -29,8 +29,9 @@
 # APP_STATEMENT_TIMEOUT_MS / APP_CONNECTION_LIMIT (Spec 7 / #55): role-level settings, independent
 # of the per-transaction statement_timeout the app sets in app/db/session.py's tenant_session().
 # They are a deployment-wide ceiling/default that applies even to a connection tenant_session()
-# never touched. Defaults here must match app.config.ROLE_STATEMENT_TIMEOUT_MS /
-# ROLE_CONNECTION_LIMIT, which the embedded-Postgres integration test asserts against.
+# never touched. Defaults here must match app.db.guard.ROLE_STATEMENT_TIMEOUT_MS /
+# ROLE_CONNECTION_LIMIT (spec A4 / #94, #112), which the embedded-Postgres integration test
+# asserts against.
 #
 # GATEWAY_DB_PASSWORD (Spec 7 / #51): the model gateway (LiteLLM) is a required service with its
 # own role and its own database — never the application database. It gets no grant of any kind

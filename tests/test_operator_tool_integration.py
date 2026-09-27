@@ -5,144 +5,53 @@ command dispatch, the tenant-lookup helper, and the read-only tenant listing. Pa
 Also covers the `create` command (Spec 9 / #70): provisioning a pooled tenant end to end, its
 idempotency, up-front residency/model validation, and the audit log. The gateway is never
 reached over a real network here either -- `GatewayAdminClient` is always built on
-`httpx.MockTransport`, the same pattern `tests/test_gateway_provisioning_integration.py` uses.
+`httpx.MockTransport`, via the shared fake `tests.support.gateway.fake_gateway_admin_client`
+(issue #98 / "A6-T3").
+
+Cluster boot, role bootstrap, and tenant seeding come from `tests.support` (issue #96 / spec #90,
+"A6"); this file's own private copies of all three were deleted in favor of it.
 """
 
 from __future__ import annotations
 
 import json
-import os
-import subprocess
-import sys
-import tempfile
+import re
 import uuid
-from urllib.parse import parse_qs, urlparse
+from pathlib import Path
 
-import httpx
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from app.config import ROLE_STATEMENT_TIMEOUT_MS
-from app.gateway_provisioning import GatewayAdminClient
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 pgserver = pytest.importorskip("pgserver")
 
+from tests.support import cluster, environment, seed_tenant  # noqa: E402
+from tests.support.gateway import fake_gateway_admin_client  # noqa: E402
 
-def _psql(server, command: str) -> None:
-    """`server.psql` without a shell: pgserver's own version breaks on paths with spaces."""
-    from pgserver.postgres_server import POSTGRES_BIN_PATH
-
-    subprocess.run(
-        [str(POSTGRES_BIN_PATH / "psql"), server.get_uri()],
-        input=command.encode(),
-        check=True,
-        capture_output=True,
-    )
+# `cluster`/`environment` are imported only so pytest can discover them as fixtures from this
+# module's namespace (the same pattern `tests/test_support_seeding_integration.py` uses) --
+# referenced only by parameter name in the tests below, never called directly.
+_ = (cluster, environment)
 
 
-@pytest.fixture(scope="module")
-def database_urls():
-    """Same bootstrap as `tests/test_rls_integration.py`: `app_owner` runs the migrations, the
-    real superuser is used only to seed fixtures without a tenant context."""
-    pgdata = tempfile.mkdtemp(prefix="pgdata-operator-")
-    server = pgserver.get_server(pgdata, cleanup_mode="delete")
-    sockdir = parse_qs(urlparse(server.get_uri()).query)["host"][0]
-    _psql(
-        server,
-        "CREATE EXTENSION IF NOT EXISTS vector; "
-        "CREATE ROLE app_owner LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE; "
-        "ALTER SCHEMA public OWNER TO app_owner; "
-        "GRANT CREATE ON DATABASE postgres TO app_owner; "
-        "CREATE ROLE app LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE; "
-        "GRANT USAGE ON SCHEMA public TO app; "
-        f"ALTER ROLE app SET statement_timeout = '{ROLE_STATEMENT_TIMEOUT_MS}ms';",
-    )
-    urls = {
-        "migrations": f"postgresql+asyncpg://app_owner@/postgres?host={sockdir}",
-        "app": f"postgresql+asyncpg://app@/postgres?host={sockdir}",
-        "superuser": f"postgresql+asyncpg://postgres@/postgres?host={sockdir}",
-    }
-    env = {**os.environ, "DATABASE_URL_MIGRATIONS": urls["migrations"], "DATABASE_URL": urls["app"]}
-    subprocess.run(
-        [sys.executable, "-m", "alembic", "upgrade", "head"], check=True, env=env, timeout=120
-    )
-    yield urls
-    server.cleanup()
-
-
-async def _seed_tenant(
-    superuser_url: str,
-    *,
-    name: str,
-    residency: str = "eu",
-    isolation_tier: str = "pooled",
-    database_alias: str | None = None,
-    suspended: bool = False,
-) -> uuid.UUID:
-    """One tenant across `public.tenants` and `control.tenants` -- as the superuser, which
-    bypasses RLS entirely, exactly like `_seed` in `tests/test_rls_integration.py`. Standing in
-    for what a future `create` command will do."""
-    tenant_id = uuid.uuid4()
-    engine = create_async_engine(superuser_url)
-    async with engine.begin() as conn:
-        await conn.execute(
-            text("INSERT INTO tenants (id, name) VALUES (:id, :name)"),
-            {"id": tenant_id, "name": name},
-        )
-        await conn.execute(
-            text(
-                "INSERT INTO control.tenants "
-                "(tenant_id, isolation_tier, database_alias, residency) "
-                "VALUES (:id, :tier, :alias, :residency)"
-            ),
-            {
-                "id": tenant_id,
-                "tier": isolation_tier,
-                "alias": database_alias,
-                "residency": residency,
-            },
-        )
-        if suspended:
-            await conn.execute(
-                text("UPDATE control.tenants SET suspended_at = now() WHERE tenant_id = :id"),
-                {"id": tenant_id},
-            )
-    await engine.dispose()
-    return tenant_id
-
-
-@pytest.fixture
-def operator_env(database_urls, monkeypatch):
-    """Points the operator tool's settings object at the embedded database, mirroring
-    `app_settings` in `tests/test_rls_integration.py`."""
-    from app import migration_settings
-
-    monkeypatch.setenv("DATABASE_URL_MIGRATIONS", database_urls["migrations"])
-    migration_settings.get_migration_settings.cache_clear()
-    yield
-    migration_settings.get_migration_settings.cache_clear()
-
-
-async def test_listing_reports_every_seeded_tenant(database_urls):
+async def test_listing_reports_every_seeded_tenant(environment):
     from app.operator.listing import list_tenants
 
-    tenant_a = await _seed_tenant(
-        database_urls["superuser"],
-        name="Acme",
-        residency="eu",
-        isolation_tier="pooled",
+    tenant_a = await seed_tenant(
+        environment, name="Acme", residency="eu", isolation_tier="pooled", via_operator=False
     )
-    tenant_b = await _seed_tenant(
-        database_urls["superuser"],
+    tenant_b = await seed_tenant(
+        environment,
         name="Globex",
         residency="us",
         isolation_tier="dedicated",
-        database_alias="globex_db",
-        suspended=True,
+        via_operator=False,
     )
+    await tenant_b.suspend()
 
-    engine = create_async_engine(database_urls["migrations"])
+    engine = create_async_engine(tenant_a.cluster.owner_url)
     try:
         async with engine.begin() as conn:
             summaries = await list_tenants(conn)
@@ -150,46 +59,46 @@ async def test_listing_reports_every_seeded_tenant(database_urls):
         await engine.dispose()
 
     by_id = {s.tenant_id: s for s in summaries}
-    assert tenant_a in by_id and tenant_b in by_id
+    assert tenant_a.tenant_id in by_id and tenant_b.tenant_id in by_id
 
-    acme = by_id[tenant_a]
+    acme = by_id[tenant_a.tenant_id]
     assert acme.isolation_tier == "pooled"
     assert acme.residency == "eu"
     assert acme.database_alias is None
     assert acme.suspended is False
 
-    globex = by_id[tenant_b]
+    globex = by_id[tenant_b.tenant_id]
     assert globex.isolation_tier == "dedicated"
     assert globex.residency == "us"
-    assert globex.database_alias == "globex_db"
+    assert globex.database_alias == tenant_b.database_alias
     assert globex.suspended is True
     assert globex.suspended_at is not None
 
 
-async def test_lookup_resolves_by_id_and_by_unambiguous_name(database_urls):
+async def test_lookup_resolves_by_id_and_by_unambiguous_name(environment):
     from app.operator.lookup import resolve_tenant
 
-    tenant_id = await _seed_tenant(database_urls["superuser"], name="Initech")
+    tenant = await seed_tenant(environment, name="Initech", via_operator=False)
 
-    engine = create_async_engine(database_urls["migrations"])
+    engine = create_async_engine(tenant.cluster.owner_url)
     try:
         async with engine.begin() as conn:
-            by_id = await resolve_tenant(conn, str(tenant_id))
+            by_id = await resolve_tenant(conn, str(tenant.tenant_id))
             by_name = await resolve_tenant(conn, "Initech")
     finally:
         await engine.dispose()
 
-    assert by_id.tenant_id == tenant_id
-    assert by_name.tenant_id == tenant_id
+    assert by_id.tenant_id == tenant.tenant_id
+    assert by_name.tenant_id == tenant.tenant_id
 
 
-async def test_lookup_rejects_ambiguous_name(database_urls):
+async def test_lookup_rejects_ambiguous_name(environment):
     from app.operator.lookup import AmbiguousTenantNameError, resolve_tenant
 
-    await _seed_tenant(database_urls["superuser"], name="Dup Co")
-    await _seed_tenant(database_urls["superuser"], name="Dup Co")
+    tenant = await seed_tenant(environment, name="Dup Co", via_operator=False)
+    await seed_tenant(environment, name="Dup Co", via_operator=False)
 
-    engine = create_async_engine(database_urls["migrations"])
+    engine = create_async_engine(tenant.cluster.owner_url)
     try:
         async with engine.begin() as conn:
             with pytest.raises(AmbiguousTenantNameError):
@@ -198,10 +107,10 @@ async def test_lookup_rejects_ambiguous_name(database_urls):
         await engine.dispose()
 
 
-async def test_lookup_raises_not_found_for_unknown_id_and_name(database_urls):
+async def test_lookup_raises_not_found_for_unknown_id_and_name(environment):
     from app.operator.lookup import TenantNotFoundError, resolve_tenant
 
-    engine = create_async_engine(database_urls["migrations"])
+    engine = create_async_engine(environment.owner_url)
     try:
         async with engine.begin() as conn:
             with pytest.raises(TenantNotFoundError):
@@ -212,7 +121,7 @@ async def test_lookup_raises_not_found_for_unknown_id_and_name(database_urls):
         await engine.dispose()
 
 
-async def test_app_cannot_widen_its_view_with_the_operator_read_flag(database_urls):
+async def test_app_cannot_widen_its_view_with_the_operator_read_flag(environment):
     """Regression (mirrors `test_app_cannot_widen_its_control_plane_view_with_the_migration_read_
     flag` in `tests/test_rls_integration.py` for 0016's identically-shaped flag): `app` can set
     any custom setting in its own session, and a real `app` session querying
@@ -221,15 +130,16 @@ async def test_app_cannot_widen_its_view_with_the_operator_read_flag(database_ur
     function). So `control_tenants_operator_read`/`tenants_operator_read` requiring `current_user
     = 'app_owner'`, not just the flag, must still leave `app` seeing only its own tenant even
     after setting `app.control_operator_read` itself."""
-    tenant_a = await _seed_tenant(database_urls["superuser"], name="Flag A")
-    await _seed_tenant(database_urls["superuser"], name="Flag B")
+    tenant_a = await seed_tenant(environment, name="Flag A", via_operator=False)
+    await seed_tenant(environment, name="Flag B", via_operator=False)
 
-    engine = create_async_engine(database_urls["app"])
+    engine = create_async_engine(environment.app_url)
     try:
         async with engine.begin() as conn:
             await conn.execute(text("SELECT set_config('app.control_operator_read', 'true', true)"))
             await conn.execute(
-                text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": str(tenant_a)}
+                text("SELECT set_config('app.tenant_id', :tid, true)"),
+                {"tid": str(tenant_a.tenant_id)},
             )
             visible = (
                 (await conn.execute(text("SELECT tenant_id FROM control.tenants_view")))
@@ -239,8 +149,8 @@ async def test_app_cannot_widen_its_view_with_the_operator_read_flag(database_ur
             visible_public = (await conn.execute(text("SELECT id FROM tenants"))).scalars().all()
     finally:
         await engine.dispose()
-    assert visible == [tenant_a]
-    assert visible_public == [tenant_a]
+    assert visible == [tenant_a.tenant_id]
+    assert visible_public == [tenant_a.tenant_id]
 
 
 async def _operator_actions(superuser_url: str, action: str) -> list:
@@ -274,20 +184,26 @@ async def _operator_actions(superuser_url: str, action: str) -> list:
     ]
 
 
-async def test_cli_list_records_the_invocation_in_the_operator_action_log(
-    database_urls, operator_env
-):
-    from app.operator.cli import _run, build_parser
+async def test_cli_list_records_the_invocation_in_the_operator_action_log(environment, capsys):
+    from app.operator.cli import run_operator
 
-    await _seed_tenant(database_urls["superuser"], name="Umbrella")
+    tenant = await seed_tenant(environment, name="Umbrella", residency="eu", via_operator=False)
 
-    # `_run` directly, not `main()`: `main()` wraps this in `asyncio.run`, which cannot be
-    # called from the event loop pytest-asyncio is already running this test in.
-    args = build_parser().parse_args(["list"])
-    exit_code = await _run(args.command, args)
+    engine = create_async_engine(environment.owner_url)
+    exit_code = await run_operator(["list"], engine=engine)
+    await engine.dispose()
     assert exit_code == 0
 
-    rows = await _operator_actions(database_urls["superuser"], "list")
+    # Golden output (spec A5 / #115, acceptance criterion 2): byte-identical to what the retired
+    # `_run_list` printed directly, for this test's own tenant -- `environment`'s underlying
+    # cluster is shared across this file, so `list`'s real output also names every tenant an
+    # earlier test seeded; this test's own line is checked verbatim, not the whole listing.
+    assert (
+        f"{tenant.tenant_id}  'Umbrella'                      tier=pooled     "
+        "residency=eu      alias=-             suspended=False"
+    ) in capsys.readouterr().out.splitlines()
+
+    rows = await _operator_actions(environment.superuser_url, "list")
     assert len(rows) >= 1
     tenant_id, action, details, performed_at = rows[-1]
     # `list` targets every tenant, not one -- the documented nil-UUID sentinel, never NULL
@@ -301,40 +217,31 @@ async def test_cli_list_records_the_invocation_in_the_operator_action_log(
     assert performed_at is not None
 
 
-async def test_cli_records_a_failed_invocation_too(database_urls, operator_env, monkeypatch):
-    """Even a failed command is recorded, with its error, not silently dropped."""
-    import app.operator.cli as cli_module
+async def test_cli_records_a_failed_invocation_too(environment):
+    """Even a failed command is recorded, with its error, not silently dropped -- driven through
+    a real failure (an unknown tenant), not a monkeypatched private dispatch entry (spec A5 /
+    #115: no test reaches `_COMMANDS`)."""
+    from app.operator.cli import run_operator
 
-    async def _boom(conn, args):
-        raise RuntimeError("simulated failure")
-
-    monkeypatch.setitem(cli_module._COMMANDS, "list", _boom)
-
-    args = cli_module.build_parser().parse_args(["list"])
-    exit_code = await cli_module._run(args.command, args)
+    unknown_id = str(uuid.uuid4())
+    engine = create_async_engine(environment.owner_url)
+    exit_code = await run_operator(["suspend", unknown_id], engine=engine)
+    await engine.dispose()
     assert exit_code == 1
 
-    rows = await _operator_actions(database_urls["superuser"], "list")
+    rows = await _operator_actions(environment.superuser_url, "suspend")
     _, _, details, _ = rows[-1]
     assert details["outcome"] == "error"
-    assert "simulated failure" in details["error"]
+    assert "TenantNotFoundError" in details["error"]
 
 
-async def test_suspend_sets_the_flag_and_timestamp_and_reruns_as_a_no_op(database_urls):
+async def test_suspend_sets_the_flag_and_timestamp_and_reruns_as_a_no_op(environment):
     """Spec 9 / #69, ADR-0010, seam 1: `suspend` sets `suspended`/`suspended_at`, and running it
     again against an already-suspended tenant reports a no-op, not an error."""
-    from app.operator.suspend import set_tenant_suspended
+    tenant = await seed_tenant(environment, name="Suspend Co", via_operator=False)
 
-    tenant_id = await _seed_tenant(database_urls["superuser"], name="Suspend Co")
-
-    engine = create_async_engine(database_urls["migrations"])
-    try:
-        async with engine.begin() as conn:
-            first = await set_tenant_suspended(conn, str(tenant_id), suspended=True)
-        async with engine.begin() as conn:
-            second = await set_tenant_suspended(conn, str(tenant_id), suspended=True)
-    finally:
-        await engine.dispose()
+    first = await tenant.suspend()
+    second = await tenant.suspend()
 
     assert first.changed is True
     assert first.suspended is True
@@ -345,27 +252,25 @@ async def test_suspend_sets_the_flag_and_timestamp_and_reruns_as_a_no_op(databas
     assert second.suspended_at == first.suspended_at
 
 
-async def test_unsuspend_restores_the_tenant_with_nothing_reprovisioned(database_urls):
+async def test_unsuspend_restores_the_tenant_with_nothing_reprovisioned(environment):
     """`unsuspend` clears `suspended_at` and is itself a no-op when the tenant is already
     active -- and never touches isolation tier, database alias, or residency."""
     from app.operator.listing import list_tenants
-    from app.operator.suspend import set_tenant_suspended
 
-    tenant_id = await _seed_tenant(
-        database_urls["superuser"],
+    tenant = await seed_tenant(
+        environment,
         name="Restore Co",
         residency="us",
         isolation_tier="dedicated",
-        database_alias="restore_db",
-        suspended=True,
+        via_operator=False,
     )
+    await tenant.suspend()
 
-    engine = create_async_engine(database_urls["migrations"])
+    result = await tenant.unsuspend()
+    no_op = await tenant.unsuspend()
+
+    engine = create_async_engine(tenant.cluster.owner_url)
     try:
-        async with engine.begin() as conn:
-            result = await set_tenant_suspended(conn, str(tenant_id), suspended=False)
-        async with engine.begin() as conn:
-            no_op = await set_tenant_suspended(conn, str(tenant_id), suspended=False)
         async with engine.begin() as conn:
             summaries = {t.tenant_id: t for t in await list_tenants(conn)}
     finally:
@@ -377,23 +282,25 @@ async def test_unsuspend_restores_the_tenant_with_nothing_reprovisioned(database
 
     assert no_op.changed is False
 
-    restored = summaries[tenant_id]
+    restored = summaries[tenant.tenant_id]
     assert restored.suspended is False
     assert restored.isolation_tier == "dedicated"
-    assert restored.database_alias == "restore_db"
+    assert restored.database_alias == tenant.database_alias
     assert restored.residency == "us"
 
 
 async def test_suspend_creates_a_control_plane_row_for_a_pooled_tenant_with_none_yet(
-    database_urls,
+    environment,
 ):
     """A tenant provisioned only through the pooled default (ADR-0002, `scripts/seed.py`'s
     original path) has no `control.tenants` row at all -- suspending it must not error, it
-    creates one."""
+    creates one. `seed_tenant` always writes a `control.tenants` row, so this one edge case is
+    still seeded by hand -- there is no seam of the shared package for "a tenant with no
+    control-plane row at all"."""
     from app.operator.suspend import set_tenant_suspended
 
     tenant_id = uuid.uuid4()
-    engine = create_async_engine(database_urls["superuser"])
+    engine = create_async_engine(environment.superuser_url)
     async with engine.begin() as conn:
         await conn.execute(
             text("INSERT INTO tenants (id, name) VALUES (:id, :name)"),
@@ -401,7 +308,7 @@ async def test_suspend_creates_a_control_plane_row_for_a_pooled_tenant_with_none
         )
     await engine.dispose()
 
-    engine = create_async_engine(database_urls["migrations"])
+    engine = create_async_engine(environment.owner_url)
     try:
         async with engine.begin() as conn:
             result = await set_tenant_suspended(conn, str(tenant_id), suspended=True)
@@ -414,14 +321,14 @@ async def test_suspend_creates_a_control_plane_row_for_a_pooled_tenant_with_none
 
 
 async def test_app_cannot_widen_its_control_plane_write_with_the_operator_write_flag(
-    database_urls,
+    environment,
 ):
     """Mirrors `test_app_cannot_widen_its_view_with_the_operator_read_flag`: `app` setting
     `app.control_operator_write` itself must not grant it write access to `control.tenants` --
     `current_user = 'app_owner'` is what actually restricts the escape hatch, not the flag alone."""
-    tenant_id = await _seed_tenant(database_urls["superuser"], name="Write Flag Co")
+    tenant = await seed_tenant(environment, name="Write Flag Co", via_operator=False)
 
-    engine = create_async_engine(database_urls["app"])
+    engine = create_async_engine(environment.app_url)
     try:
         async with engine.begin() as conn:
             await conn.execute(
@@ -430,47 +337,64 @@ async def test_app_cannot_widen_its_control_plane_write_with_the_operator_write_
             with pytest.raises(Exception):  # noqa: B017 - asyncpg's InsufficientPrivilegeError
                 await conn.execute(
                     text("UPDATE control.tenants SET suspended_at = now() WHERE tenant_id = :tid"),
-                    {"tid": str(tenant_id)},
+                    {"tid": str(tenant.tenant_id)},
                 )
     finally:
         await engine.dispose()
 
 
 async def test_cli_suspend_is_idempotent_and_records_both_invocations_in_the_audit_log(
-    database_urls, operator_env
+    environment, capsys
 ):
-    from app.operator.cli import _run, build_parser
+    from app.operator.cli import run_operator
 
-    tenant_id = await _seed_tenant(database_urls["superuser"], name="Audited Suspend Co")
+    tenant = await seed_tenant(environment, name="Audited Suspend Co", via_operator=False)
 
-    args = build_parser().parse_args(["suspend", str(tenant_id)])
-    assert await _run(args.command, args) == 0
-    assert await _run(args.command, args) == 0
+    argv = ["suspend", str(tenant.tenant_id)]
+    first_engine = create_async_engine(environment.owner_url)
+    assert await run_operator(argv, engine=first_engine) == 0
+    await first_engine.dispose()
+    first_printed = capsys.readouterr().out
 
-    rows = await _operator_actions(database_urls["superuser"], "suspend")
+    second_engine = create_async_engine(environment.owner_url)
+    assert await run_operator(argv, engine=second_engine) == 0
+    await second_engine.dispose()
+    second_printed = capsys.readouterr().out
+
+    # Golden output (spec A5 / #115): byte-identical to what the retired
+    # `_run_suspend_or_unsuspend` printed directly.
+    assert first_printed == f"ok: {tenant.name!r} ({tenant.tenant_id}) is now suspended\n"
+    assert second_printed == (
+        f"no-op: {tenant.name!r} ({tenant.tenant_id}) was already suspended\n"
+    )
+
+    rows = await _operator_actions(environment.superuser_url, "suspend")
     assert len(rows) >= 2
     first_tenant_id, _, first_details, _ = rows[-2]
     second_tenant_id, _, second_details, _ = rows[-1]
-    assert str(first_tenant_id) == str(tenant_id)
-    assert str(second_tenant_id) == str(tenant_id)
+    assert str(first_tenant_id) == str(tenant.tenant_id)
+    assert str(second_tenant_id) == str(tenant.tenant_id)
     assert first_details["outcome"].startswith("ok: ")
     assert second_details["outcome"].startswith("no-op: ")
 
 
-async def test_cli_unsuspend_records_the_invocation_by_tenant_name(database_urls, operator_env):
-    from app.operator.cli import _run, build_parser
+async def test_cli_unsuspend_records_the_invocation_by_tenant_name(environment, capsys):
+    from app.operator.cli import run_operator
 
-    tenant_id = await _seed_tenant(
-        database_urls["superuser"], name="Named Unsuspend Co", suspended=True
+    tenant = await seed_tenant(environment, name="Named Unsuspend Co", via_operator=False)
+    await tenant.suspend()
+
+    engine = create_async_engine(environment.owner_url)
+    exit_code = await run_operator(["unsuspend", "Named Unsuspend Co"], engine=engine)
+    await engine.dispose()
+    assert exit_code == 0
+    assert (
+        capsys.readouterr().out == f"ok: {tenant.name!r} ({tenant.tenant_id}) is now unsuspended\n"
     )
 
-    args = build_parser().parse_args(["unsuspend", "Named Unsuspend Co"])
-    exit_code = await _run(args.command, args)
-    assert exit_code == 0
-
-    rows = await _operator_actions(database_urls["superuser"], "unsuspend")
+    rows = await _operator_actions(environment.superuser_url, "unsuspend")
     tenant_id_logged, _, details, _ = rows[-1]
-    assert str(tenant_id_logged) == str(tenant_id)
+    assert str(tenant_id_logged) == str(tenant.tenant_id)
     assert details["outcome"].startswith("ok: ")
 
 
@@ -484,6 +408,30 @@ def test_cli_has_no_flag_or_env_var_for_an_alternate_connection_string():
         opt for action in parser._actions for opt in getattr(action, "option_strings", [])
     }
     assert not any("dsn" in opt.lower() or "database" in opt.lower() for opt in option_strings)
+
+
+_RETIRED_PRIVATE_DISPATCH_PATTERN = re.compile(
+    r"from app\.operator\.cli import _run|cli_module\._run|_COMMANDS"
+)
+
+
+def test_no_test_imports_the_operator_clis_private_dispatch_function():
+    """Acceptance (spec A5 / #115): `run_operator(argv, *, engine=None, admin_client=None)` is
+    the one entry point every operator test drives -- dispatch (`_run`, `_COMMANDS`) stays
+    private, so no test file may import or monkeypatch either. `main(argv=None)` is the
+    synchronous script wrapper `scripts/operator.py` calls (`asyncio.run(run_operator(argv))`,
+    nothing else) -- not itself a seam a test needs. Mirrors
+    `grep -rn 'from app.operator.cli import _run\\|cli_module\\._run\\|_COMMANDS' tests/` finding
+    nothing, in pure Python rather than depending on the `grep` binary. This file itself (naming
+    the retired pattern above, in prose, for exactly this test) is the one file the scan skips --
+    every other file in `tests/` is checked, this one included would only ever flag itself."""
+    this_file = Path(__file__).resolve()
+    for path in (REPO_ROOT / "tests").rglob("*.py"):
+        if path.resolve() == this_file:
+            continue
+        text = path.read_text(encoding="utf-8")
+        match = _RETIRED_PRIVATE_DISPATCH_PATTERN.search(text)
+        assert match is None, f"{path} still reaches the operator CLI's private dispatch: {match}"
 
 
 def test_cli_module_never_imports_the_application_settings_object():
@@ -507,27 +455,8 @@ def test_cli_module_never_imports_the_application_settings_object():
     assert imported_modules & {"app.migration_settings"}
 
 
-def _fake_admin_client(*, key: str = "sk-minted") -> GatewayAdminClient:
-    """Mirrors `tests/test_gateway_provisioning_integration.py`'s own fake -- `create`'s gateway
-    call is never reached over a real network here either."""
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/key/generate":
-            return httpx.Response(200, json={"key": key})
-        return httpx.Response(404)
-
-    http_client = httpx.AsyncClient(
-        base_url="http://litellm.internal:4000", transport=httpx.MockTransport(handler)
-    )
-    return GatewayAdminClient(
-        base_url="http://litellm.internal:4000",
-        master_key="sk-master-test",
-        http_client=http_client,
-    )
-
-
 async def test_create_provisions_control_plane_credential_and_admin_membership(
-    database_urls, operator_env, tmp_path
+    environment, tmp_path
 ):
     """Acceptance (#70): `create` writes the control-plane record (isolation tier, residency,
     database alias), mints and writes a gateway-credential secret file, and creates the first
@@ -536,7 +465,7 @@ async def test_create_provisions_control_plane_credential_and_admin_membership(
     from app.operator.create import create_tenant
 
     settings = Settings(gateway_credentials_dir=str(tmp_path))
-    engine = create_async_engine(database_urls["migrations"])
+    engine = create_async_engine(environment.owner_url)
     try:
         async with engine.begin() as conn:
             result = await create_tenant(
@@ -545,7 +474,7 @@ async def test_create_provisions_control_plane_credential_and_admin_membership(
                 residency="eu",
                 admin_email="admin@create.test",
                 settings=settings,
-                admin_client=_fake_admin_client(key="sk-create-co"),
+                admin_client=fake_gateway_admin_client(key="sk-create-co"),
             )
     finally:
         await engine.dispose()
@@ -555,7 +484,7 @@ async def test_create_provisions_control_plane_credential_and_admin_membership(
     assert result.gateway_credential == "provisioned"
     assert (tmp_path / result.gateway_credential_alias).read_text() == "sk-create-co"
 
-    verify_engine = create_async_engine(database_urls["superuser"])
+    verify_engine = create_async_engine(environment.superuser_url)
     try:
         async with verify_engine.connect() as conn:
             tenant_row = (
@@ -589,7 +518,7 @@ async def test_create_provisions_control_plane_credential_and_admin_membership(
     assert membership_row.role == "admin"
 
 
-async def test_create_is_idempotent_on_rerun(database_urls, operator_env, tmp_path):
+async def test_create_is_idempotent_on_rerun(environment, tmp_path):
     """Acceptance (#70): re-running `create` against the same tenant name performs none of the
     three steps again and reports each as already in place. A second, differently-keyed fake
     admin client proves the gateway is never called a second time -- if it were, the freshly
@@ -599,7 +528,7 @@ async def test_create_is_idempotent_on_rerun(database_urls, operator_env, tmp_pa
 
     settings = Settings(gateway_credentials_dir=str(tmp_path))
 
-    engine = create_async_engine(database_urls["migrations"])
+    engine = create_async_engine(environment.owner_url)
     try:
         async with engine.begin() as conn:
             first = await create_tenant(
@@ -608,7 +537,7 @@ async def test_create_is_idempotent_on_rerun(database_urls, operator_env, tmp_pa
                 residency="us",
                 admin_email="admin@idempotent.test",
                 settings=settings,
-                admin_client=_fake_admin_client(key="sk-idempotent"),
+                admin_client=fake_gateway_admin_client(key="sk-idempotent"),
             )
     finally:
         await engine.dispose()
@@ -619,7 +548,7 @@ async def test_create_is_idempotent_on_rerun(database_urls, operator_env, tmp_pa
         "provisioned",
     )
 
-    second_engine = create_async_engine(database_urls["migrations"])
+    second_engine = create_async_engine(environment.owner_url)
     try:
         async with second_engine.begin() as conn:
             second = await create_tenant(
@@ -628,7 +557,7 @@ async def test_create_is_idempotent_on_rerun(database_urls, operator_env, tmp_pa
                 residency="us",
                 admin_email="admin@idempotent.test",
                 settings=settings,
-                admin_client=_fake_admin_client(key="sk-should-not-be-minted"),
+                admin_client=fake_gateway_admin_client(key="sk-should-not-be-minted"),
             )
     finally:
         await second_engine.dispose()
@@ -644,14 +573,12 @@ async def test_create_is_idempotent_on_rerun(database_urls, operator_env, tmp_pa
     assert (tmp_path / first.gateway_credential_alias).read_text() == "sk-idempotent"
 
 
-async def test_create_rejects_unrecognized_residency_before_any_write(
-    database_urls, operator_env, tmp_path
-):
+async def test_create_rejects_unrecognized_residency_before_any_write(environment, tmp_path):
     from app.config import Settings
     from app.operator.create import UnrecognizedResidencyError, create_tenant
 
     settings = Settings(gateway_credentials_dir=str(tmp_path))
-    engine = create_async_engine(database_urls["migrations"])
+    engine = create_async_engine(environment.owner_url)
     try:
         async with engine.begin() as conn:
             with pytest.raises(UnrecognizedResidencyError):
@@ -661,12 +588,12 @@ async def test_create_rejects_unrecognized_residency_before_any_write(
                     residency="mars",
                     admin_email="nobody@example.test",
                     settings=settings,
-                    admin_client=_fake_admin_client(),
+                    admin_client=fake_gateway_admin_client(),
                 )
     finally:
         await engine.dispose()
 
-    verify_engine = create_async_engine(database_urls["superuser"])
+    verify_engine = create_async_engine(environment.superuser_url)
     try:
         async with verify_engine.connect() as conn:
             count = (
@@ -679,14 +606,12 @@ async def test_create_rejects_unrecognized_residency_before_any_write(
     assert count == 0
 
 
-async def test_create_rejects_unrecognized_model_before_any_write(
-    database_urls, operator_env, tmp_path
-):
+async def test_create_rejects_unrecognized_model_before_any_write(environment, tmp_path):
     from app.config import Settings
     from app.operator.create import UnrecognizedModelError, create_tenant
 
     settings = Settings(gateway_credentials_dir=str(tmp_path))
-    engine = create_async_engine(database_urls["migrations"])
+    engine = create_async_engine(environment.owner_url)
     try:
         async with engine.begin() as conn:
             with pytest.raises(UnrecognizedModelError):
@@ -697,12 +622,12 @@ async def test_create_rejects_unrecognized_model_before_any_write(
                     admin_email="nobody2@example.test",
                     model="gpt-nonexistent",
                     settings=settings,
-                    admin_client=_fake_admin_client(),
+                    admin_client=fake_gateway_admin_client(),
                 )
     finally:
         await engine.dispose()
 
-    verify_engine = create_async_engine(database_urls["superuser"])
+    verify_engine = create_async_engine(environment.superuser_url)
     try:
         async with verify_engine.connect() as conn:
             count = (
@@ -716,33 +641,70 @@ async def test_create_rejects_unrecognized_model_before_any_write(
 
 
 async def test_cli_create_records_the_invocation_in_the_operator_action_log(
-    database_urls, operator_env, tmp_path, monkeypatch
+    environment, tmp_path, monkeypatch, capsys
 ):
     """Acceptance (#70): a `create` invocation through the real CLI dispatch is recorded in the
     operator-action log, with secrets redacted from the logged arguments (none of `create`'s own
-    arguments are secret-shaped, so this also proves ordinary arguments still show up plainly)."""
-    import app.operator.create as create_module
+    arguments are secret-shaped, so this also proves ordinary arguments still show up plainly).
+    The gateway admin client is injected straight into `run_operator()` (spec A5 / #115), not
+    monkeypatched onto `app.operator.create.build_admin_client`."""
     from app import config
-    from app.operator.cli import _run, build_parser
+    from app.operator.cli import run_operator
 
     monkeypatch.setenv("GATEWAY_CREDENTIALS_DIR", str(tmp_path))
     config.get_settings.cache_clear()
-    monkeypatch.setattr(
-        create_module, "build_admin_client", lambda settings: _fake_admin_client(key="sk-cli")
-    )
 
-    args = build_parser().parse_args(
-        ["create", "CLI Co", "--residency", "eu", "--admin-email", "admin@cli.test"]
+    engine = create_async_engine(environment.owner_url)
+    exit_code = await run_operator(
+        ["create", "CLI Co", "--residency", "eu", "--admin-email", "admin@cli.test"],
+        engine=engine,
+        admin_client=fake_gateway_admin_client(key="sk-cli"),
     )
-    exit_code = await _run(args.command, args)
+    await engine.dispose()
     config.get_settings.cache_clear()
     assert exit_code == 0
 
-    rows = await _operator_actions(database_urls["superuser"], "create")
+    rows = await _operator_actions(environment.superuser_url, "create")
     assert len(rows) >= 1
-    _, action, details, performed_at = rows[-1]
+    tenant_id, action, details, performed_at = rows[-1]
     assert action == "create"
     assert details["outcome"].startswith("ok: tenant ")
     assert details["args"]["tenant_name"] == "CLI Co"
     assert details["args"]["admin_email"] == "admin@cli.test"
     assert performed_at is not None
+
+    verify_engine = create_async_engine(environment.superuser_url)
+    try:
+        async with verify_engine.connect() as conn:
+            membership_row = (
+                await conn.execute(
+                    text("SELECT identity_id FROM memberships WHERE tenant_id = :tid"),
+                    {"tid": tenant_id},
+                )
+            ).one()
+            alias = (
+                await conn.execute(
+                    text(
+                        "SELECT gateway_credential_alias FROM control.tenants "
+                        "WHERE tenant_id = :tid"
+                    ),
+                    {"tid": tenant_id},
+                )
+            ).scalar_one()
+    finally:
+        await verify_engine.dispose()
+
+    # Golden output (spec A5 / #115, acceptance criterion 2): byte-identical to what the retired
+    # `_run_create` printed directly, reconstructed from independently-queried database state
+    # (not from the result object under test).
+    identity_id = membership_row.identity_id
+    assert capsys.readouterr().out == (
+        f"MCP_TENANT_ID={tenant_id}\n"
+        f"MCP_IDENTITY_ID={identity_id}\n"
+        f"Gateway credential alias: {alias}\n"
+        "control-plane record: created; gateway credential: provisioned; "
+        "admin membership: created\n"
+        "\n"
+        f"curl -H 'X-Identity-Id: {identity_id}' "
+        f"http://localhost:8000/v1/t/{tenant_id}/agents/assistant/run ...\n"
+    )

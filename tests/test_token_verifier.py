@@ -1,28 +1,25 @@
-"""Unit tests for the shared tenant-token verifier (#44): exercises `verify_tenant_token`
-directly, with the control-plane and membership repositories faked (no real Postgres) -- the same
-faking pattern `tests/test_jwt_auth.py` uses at the ASGI seam, but here calling the module
-directly so each categorized failure is proven in isolation from FastAPI/HTTP entirely.
+"""Unit tests for the shared tenant-token verifier (#44): exercises `verify_tenant_token` as a
+black box, with the shared `FakeControlPlaneReads` (#100) passed explicitly as its `adapter=`
+keyword -- no monkeypatching of any name inside `app.token_verifier` itself.
 """
 
 from __future__ import annotations
 
 import time
 import uuid
-from contextlib import asynccontextmanager
-from types import SimpleNamespace
 
 import jwt
 import pytest
 
-import app.token_verifier as token_verifier_module
-from app.context import RequestContext
 from app.jwt_verifier import mint_token
 from app.token_verifier import (
     AGENT_IDENTITY_ISSUER,
+    TenantSuspendedAtVerification,
     TenantTokenVerificationError,
     VerificationFailureReason,
     verify_tenant_token,
 )
+from tests.conftest import FakeControlPlaneReads
 
 SECRET = "token-verifier-unit-test-shared-secret-32-bytes"
 ISSUER = "https://idp.example.com"
@@ -52,50 +49,11 @@ def _make_token(
     return jwt.encode(claims, secret, algorithm=algorithm)
 
 
-@asynccontextmanager
-async def _fake_session():
-    yield None
-
-
-def _install_fake_control_plane(monkeypatch, *, auth_settings, identities, memberships):
-    """`auth_settings`: {tenant_id: (issuer, suspended)} — a missing key means no control-plane
-    row. `identities`: {(issuer, subject): identity_id}. `memberships`: {(tenant_id,
-    identity_id): role}."""
-
-    class FakeTenantAuthSettingsRepository:
-        async def get(self, session, *, tenant_id, default_issuer=None):
-            if tenant_id not in auth_settings:
-                return None
-            issuer, suspended = auth_settings[tenant_id]
-            return SimpleNamespace(issuer=issuer or default_issuer, suspended=suspended)
-
-    class FakeIdentityRepository:
-        async def find_by_issuer_and_subject(self, session, *, issuer, subject):
-            identity_id = identities.get((issuer, subject))
-            if identity_id is None:
-                return None
-            return SimpleNamespace(id=identity_id, issuer=issuer, subject=subject)
-
-    class FakeMembershipRepository:
-        async def get_role(self, session, ctx: RequestContext, *, identity_id):
-            return memberships.get((ctx.tenant_id, identity_id))
-
-    monkeypatch.setattr(token_verifier_module, "control_session", _fake_session)
-    monkeypatch.setattr(token_verifier_module, "tenant_session", lambda ctx: _fake_session())
-    monkeypatch.setattr(
-        token_verifier_module, "TenantAuthSettingsRepository", FakeTenantAuthSettingsRepository
-    )
-    monkeypatch.setattr(token_verifier_module, "IdentityRepository", FakeIdentityRepository)
-    monkeypatch.setattr(token_verifier_module, "MembershipRepository", FakeMembershipRepository)
-
-
-async def test_bad_signature_is_invalid_or_expired(monkeypatch):
+async def test_bad_signature_is_invalid_or_expired():
     tenant_id = uuid.uuid4()
-    _install_fake_control_plane(
-        monkeypatch,
+    adapter = FakeControlPlaneReads(
         auth_settings={tenant_id: (ISSUER, False)},
         identities={(ISSUER, "sub-1"): uuid.uuid4()},
-        memberships={},
     )
     token = _make_token(secret="a-completely-different-secret-32-bytes!", audience=str(tenant_id))
     with pytest.raises(TenantTokenVerificationError) as exc_info:
@@ -105,17 +63,16 @@ async def test_bad_signature_is_invalid_or_expired(monkeypatch):
             key_source=_key_source,
             default_issuer=None,
             algorithm_source=lambda issuer: ("HS256",),
+            adapter=adapter,
         )
     assert exc_info.value.reason is VerificationFailureReason.INVALID_OR_EXPIRED
 
 
-async def test_expired_token_is_invalid_or_expired(monkeypatch):
+async def test_expired_token_is_invalid_or_expired():
     tenant_id = uuid.uuid4()
-    _install_fake_control_plane(
-        monkeypatch,
+    adapter = FakeControlPlaneReads(
         auth_settings={tenant_id: (ISSUER, False)},
         identities={(ISSUER, "sub-1"): uuid.uuid4()},
-        memberships={},
     )
     token = _make_token(audience=str(tenant_id), exp_delta=-60.0)
     with pytest.raises(TenantTokenVerificationError) as exc_info:
@@ -125,13 +82,14 @@ async def test_expired_token_is_invalid_or_expired(monkeypatch):
             key_source=_key_source,
             default_issuer=None,
             algorithm_source=lambda issuer: ("HS256",),
+            adapter=adapter,
         )
     assert exc_info.value.reason is VerificationFailureReason.INVALID_OR_EXPIRED
 
 
-async def test_no_issuer_configured_is_invalid_or_expired(monkeypatch):
+async def test_no_issuer_configured_is_invalid_or_expired():
     tenant_id = uuid.uuid4()
-    _install_fake_control_plane(monkeypatch, auth_settings={}, identities={}, memberships={})
+    adapter = FakeControlPlaneReads()
     token = _make_token(audience=str(tenant_id))
     with pytest.raises(TenantTokenVerificationError) as exc_info:
         await verify_tenant_token(
@@ -140,17 +98,17 @@ async def test_no_issuer_configured_is_invalid_or_expired(monkeypatch):
             key_source=_key_source,
             default_issuer=None,
             algorithm_source=lambda issuer: ("HS256",),
+            adapter=adapter,
         )
     assert exc_info.value.reason is VerificationFailureReason.INVALID_OR_EXPIRED
     assert exc_info.value.issuer is None
 
 
-async def test_wrong_audience_is_audience_mismatch(monkeypatch):
+async def test_wrong_audience_is_audience_mismatch():
     tenant_id = uuid.uuid4()
     other_tenant = uuid.uuid4()
     identity_id = uuid.uuid4()
-    _install_fake_control_plane(
-        monkeypatch,
+    adapter = FakeControlPlaneReads(
         auth_settings={tenant_id: (ISSUER, False)},
         identities={(ISSUER, "sub-1"): identity_id},
         memberships={(tenant_id, identity_id): "member"},
@@ -163,18 +121,14 @@ async def test_wrong_audience_is_audience_mismatch(monkeypatch):
             key_source=_key_source,
             default_issuer=None,
             algorithm_source=lambda issuer: ("HS256",),
+            adapter=adapter,
         )
     assert exc_info.value.reason is VerificationFailureReason.AUDIENCE_MISMATCH
 
 
-async def test_unknown_identity_is_unknown_identity(monkeypatch):
+async def test_unknown_identity_is_unknown_identity():
     tenant_id = uuid.uuid4()
-    _install_fake_control_plane(
-        monkeypatch,
-        auth_settings={tenant_id: (ISSUER, False)},
-        identities={},
-        memberships={},
-    )
+    adapter = FakeControlPlaneReads(auth_settings={tenant_id: (ISSUER, False)})
     token = _make_token(audience=str(tenant_id))
     with pytest.raises(TenantTokenVerificationError) as exc_info:
         await verify_tenant_token(
@@ -183,18 +137,17 @@ async def test_unknown_identity_is_unknown_identity(monkeypatch):
             key_source=_key_source,
             default_issuer=None,
             algorithm_source=lambda issuer: ("HS256",),
+            adapter=adapter,
         )
     assert exc_info.value.reason is VerificationFailureReason.UNKNOWN_IDENTITY
 
 
-async def test_no_membership_is_missing_membership(monkeypatch):
+async def test_no_membership_is_missing_membership():
     tenant_id = uuid.uuid4()
     identity_id = uuid.uuid4()
-    _install_fake_control_plane(
-        monkeypatch,
+    adapter = FakeControlPlaneReads(
         auth_settings={tenant_id: (ISSUER, False)},
         identities={(ISSUER, "sub-1"): identity_id},
-        memberships={},
     )
     token = _make_token(audience=str(tenant_id))
     with pytest.raises(TenantTokenVerificationError) as exc_info:
@@ -204,15 +157,15 @@ async def test_no_membership_is_missing_membership(monkeypatch):
             key_source=_key_source,
             default_issuer=None,
             algorithm_source=lambda issuer: ("HS256",),
+            adapter=adapter,
         )
     assert exc_info.value.reason is VerificationFailureReason.MISSING_MEMBERSHIP
 
 
-async def test_success_resolves_identity_and_role(monkeypatch):
+async def test_success_resolves_identity_and_role():
     tenant_id = uuid.uuid4()
     identity_id = uuid.uuid4()
-    _install_fake_control_plane(
-        monkeypatch,
+    adapter = FakeControlPlaneReads(
         auth_settings={tenant_id: (ISSUER, False)},
         identities={(ISSUER, "sub-1"): identity_id},
         memberships={(tenant_id, identity_id): "admin"},
@@ -224,6 +177,7 @@ async def test_success_resolves_identity_and_role(monkeypatch):
         key_source=_key_source,
         default_issuer=None,
         algorithm_source=lambda issuer: ("HS256",),
+        adapter=adapter,
     )
     assert resolved.identity_id == identity_id
     assert resolved.role == "admin"
@@ -242,36 +196,17 @@ def _agent_key_source(issuer: str, kid: str | None) -> str:
     return SECRET
 
 
-async def test_agent_issued_token_bypasses_tenant_auth_settings(monkeypatch):
+async def test_agent_issued_token_bypasses_tenant_auth_settings():
     """Gap fix (Spec 6 / #49): an agent identity's token (iss == AGENT_IDENTITY_ISSUER) is
-    verified without ever consulting the tenant's own auth settings -- proven here by making that
-    repository raise if it is called at all."""
+    verified without ever consulting the tenant's own auth settings -- proven here by making the
+    fake adapter raise if `get_tenant_auth_settings` is called at all."""
     tenant_id = uuid.uuid4()
     identity_id = uuid.uuid4()
-
-    class ExplodingTenantAuthSettingsRepository:
-        async def get(self, session, *, tenant_id, default_issuer=None):
-            raise AssertionError("must not be consulted for an agent-issuer token")
-
-    class FakeIdentityRepository:
-        async def find_by_issuer_and_subject(self, session, *, issuer, subject):
-            if (issuer, subject) != (AGENT_IDENTITY_ISSUER, "agent-sub-1"):
-                return None
-            return SimpleNamespace(id=identity_id, issuer=issuer, subject=subject)
-
-    class FakeMembershipRepository:
-        async def get_role(self, session, ctx: RequestContext, *, identity_id):
-            return "agent"
-
-    monkeypatch.setattr(token_verifier_module, "control_session", _fake_session)
-    monkeypatch.setattr(token_verifier_module, "tenant_session", lambda ctx: _fake_session())
-    monkeypatch.setattr(
-        token_verifier_module,
-        "TenantAuthSettingsRepository",
-        ExplodingTenantAuthSettingsRepository,
+    adapter = FakeControlPlaneReads(
+        identities={(AGENT_IDENTITY_ISSUER, "agent-sub-1"): identity_id},
+        memberships={(tenant_id, identity_id): "agent"},
+        explode=frozenset({"get_tenant_auth_settings"}),
     )
-    monkeypatch.setattr(token_verifier_module, "IdentityRepository", FakeIdentityRepository)
-    monkeypatch.setattr(token_verifier_module, "MembershipRepository", FakeMembershipRepository)
 
     token = mint_token(
         subject="agent-sub-1",
@@ -289,6 +224,7 @@ async def test_agent_issued_token_bypasses_tenant_auth_settings(monkeypatch):
         key_source=_agent_key_source,
         default_issuer=None,
         algorithm_source=lambda issuer: ("HS256",),
+        adapter=adapter,
     )
 
     assert resolved.identity_id == identity_id
@@ -297,20 +233,11 @@ async def test_agent_issued_token_bypasses_tenant_auth_settings(monkeypatch):
     assert resolved.credential_public_id == "agt_xyz"
 
 
-async def test_agent_issued_token_still_fails_closed_on_a_bad_signature(monkeypatch):
+async def test_agent_issued_token_still_fails_closed_on_a_bad_signature():
     """The unverified issuer peek is never trusted on its own: a token claiming
     AGENT_IDENTITY_ISSUER but signed with the wrong key still fails verification."""
     tenant_id = uuid.uuid4()
-
-    class ExplodingTenantAuthSettingsRepository:
-        async def get(self, session, *, tenant_id, default_issuer=None):
-            raise AssertionError("must not be consulted for an agent-issuer token")
-
-    monkeypatch.setattr(
-        token_verifier_module,
-        "TenantAuthSettingsRepository",
-        ExplodingTenantAuthSettingsRepository,
-    )
+    adapter = FakeControlPlaneReads(explode=frozenset({"get_tenant_auth_settings"}))
 
     token = mint_token(
         subject="agent-sub-1",
@@ -328,18 +255,42 @@ async def test_agent_issued_token_still_fails_closed_on_a_bad_signature(monkeypa
             key_source=_agent_key_source,
             default_issuer=None,
             algorithm_source=lambda issuer: ("HS256",),
+            adapter=adapter,
         )
     assert exc_info.value.reason is VerificationFailureReason.INVALID_OR_EXPIRED
 
 
-async def test_success_is_not_affected_by_tenant_suspension(monkeypatch):
-    """The shared module does not check suspension at all (issue #69 owns that check, in each
-    caller) -- a suspended tenant's otherwise-valid token still resolves here."""
+async def test_a_suspended_tenant_is_refused_before_any_identity_or_membership_lookup():
+    """Code review 2026-09-26 retired the `read_tenant_record` opt-out: the verifier always reads
+    the tenant record after the audience check and refuses a suspended tenant there -- an
+    otherwise-valid token never reaches the identity or membership lookup."""
     tenant_id = uuid.uuid4()
     identity_id = uuid.uuid4()
-    _install_fake_control_plane(
-        monkeypatch,
+    adapter = FakeControlPlaneReads(
         auth_settings={tenant_id: (ISSUER, True)},
+        identities={(ISSUER, "sub-1"): identity_id},
+        memberships={(tenant_id, identity_id): "member"},
+        explode=frozenset({"find_identity_by_issuer_and_subject", "get_membership_role"}),
+    )
+    token = _make_token(audience=str(tenant_id))
+    with pytest.raises(TenantSuspendedAtVerification) as exc_info:
+        await verify_tenant_token(
+            token,
+            tenant_id=tenant_id,
+            key_source=_key_source,
+            default_issuer=None,
+            algorithm_source=lambda issuer: ("HS256",),
+            adapter=adapter,
+        )
+    assert exc_info.value.tenant_id == tenant_id
+    assert exc_info.value.issuer == ISSUER
+
+
+async def test_an_unsuspended_tenant_record_is_returned_on_the_resolved_identity():
+    tenant_id = uuid.uuid4()
+    identity_id = uuid.uuid4()
+    adapter = FakeControlPlaneReads(
+        auth_settings={tenant_id: (ISSUER, False)},
         identities={(ISSUER, "sub-1"): identity_id},
         memberships={(tenant_id, identity_id): "member"},
     )
@@ -350,5 +301,8 @@ async def test_success_is_not_affected_by_tenant_suspension(monkeypatch):
         key_source=_key_source,
         default_issuer=None,
         algorithm_source=lambda issuer: ("HS256",),
+        adapter=adapter,
     )
     assert resolved.identity_id == identity_id
+    assert resolved.tenant_record is not None
+    assert resolved.tenant_record.tenant_id == tenant_id

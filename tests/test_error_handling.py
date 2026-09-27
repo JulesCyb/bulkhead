@@ -15,8 +15,8 @@ from collections.abc import AsyncIterator
 
 import httpx
 import pytest
+from pydantic_ai.models.test import TestModel
 
-from app.api import agents as agents_module
 from app.config import Settings
 from app.main import app
 
@@ -34,11 +34,17 @@ def _tenant_path(suffix: str) -> str:
 # --- A run that fails mid-way returns only a request id ---
 
 
-async def test_failed_run_returns_only_a_request_id(monkeypatch, caplog):
-    async def _boom(prompt: str, deps) -> str:
+def _run_whose_tool_calls(route_run, search) -> None:
+    """Every run the one-shot route prepares calls the search tool once, and the tool is
+    `search` -- how a test makes a run fail mid-way, inside a tool, without patching anything."""
+    route_run(TestModel(call_tools=["search_documents"]), search=search)
+
+
+async def test_failed_run_returns_only_a_request_id(route_run, caplog):
+    async def _boom(ctx, query, limit):
         raise RuntimeError(SENSITIVE_DETAIL)
 
-    monkeypatch.setattr(agents_module, "run_assistant", _boom)
+    _run_whose_tool_calls(route_run, _boom)
     # raise_app_exceptions=False: Starlette's ServerErrorMiddleware builds the response from our
     # handler *and* re-raises the original exception (so an ASGI server can still log it) —
     # httpx.ASGITransport exists precisely to let a test inspect that response instead of
@@ -66,12 +72,12 @@ async def test_failed_run_returns_only_a_request_id(monkeypatch, caplog):
 # --- A caller lacking a required role gets a clean rejection, never a 500 ---
 
 
-async def test_missing_role_ends_in_a_clean_rejection_not_a_crash(monkeypatch):
-    async def _forbidden(prompt: str, deps) -> str:
-        deps.ctx.require_role("admin")
-        return "unreachable"
+async def test_missing_role_ends_in_a_clean_rejection_not_a_crash(route_run):
+    async def _forbidden(ctx, query, limit):
+        ctx.require_role("admin")
+        return []
 
-    monkeypatch.setattr(agents_module, "run_assistant", _forbidden)
+    _run_whose_tool_calls(route_run, _forbidden)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(
@@ -85,16 +91,16 @@ async def test_missing_role_ends_in_a_clean_rejection_not_a_crash(monkeypatch):
     assert body["error"] == "forbidden"
 
 
-async def test_403_names_the_required_role_from_the_typed_attribute_not_the_message(monkeypatch):
+async def test_403_names_the_required_role_from_the_typed_attribute_not_the_message(route_run):
     """The handler reads `exc.required_role` (`RoleRequired`, `app/context.py`) rather than
     parsing the exception's message with a regex -- proven by using a `RoleRequired` whose message
     text has nothing in common with the old `role '...' required` shape the regex expected."""
     from app.context import RoleRequired
 
-    async def _forbidden(prompt: str, deps) -> str:
+    async def _forbidden(ctx, query, limit):
         raise RoleRequired("admin", frozenset({"member"}))
 
-    monkeypatch.setattr(agents_module, "run_assistant", _forbidden)
+    _run_whose_tool_calls(route_run, _forbidden)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(
@@ -157,22 +163,8 @@ async def test_chunked_body_over_the_cap_is_rejected_before_full_read():
     assert len(chunks_yielded) < total_chunks
 
 
-async def test_chunked_body_under_the_cap_still_succeeds(monkeypatch, fake_search, fake_history):
-    from pydantic_ai.models.test import TestModel
-
-    from app.agents import assistant as assistant_module
-    from app.api import chat as chat_module
-    from tests.conftest import resolve_to_model
-
-    monkeypatch.setattr(assistant_module.document_tools, "search_documents", fake_search)
-    monkeypatch.setattr(
-        assistant_module.conversation_tools, "load_conversation_history", fake_history
-    )
-    monkeypatch.setattr(
-        chat_module,
-        "resolve_chat_model",
-        resolve_to_model(TestModel(call_tools=["search_documents"])),
-    )
+async def test_chunked_body_under_the_cap_still_succeeds(route_run):
+    route_run(TestModel(call_tools=["search_documents"]))
     payload = _chat_body_json(text_len=100)
 
     async def chunked_body() -> AsyncIterator[bytes]:
@@ -211,6 +203,8 @@ def _settings(environment: str) -> Settings:
         jwt_verification_key="prod-like-settings-test-verification-key"
         if environment == "prod"
         else None,
+        # streamable-http also requires this (issue #116) -- see check_mcp_mode.
+        mcp_allowed_hosts="mcp.example.com" if environment == "prod" else "",
     )
 
 

@@ -73,7 +73,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # `app.main.run_role_rls_guard` and drive this lifespan directly to prove the guard runs
     # here independent of the readiness endpoint's own dependency.
     await run_role_rls_guard()
-    yield
+    # The MCP mount's own lifespan never runs (issue #116): Starlette's `Mount.matches` only
+    # forwards `http`/`websocket` scopes to a mounted sub-app, never `lifespan`
+    # (`app.mcp.server.build_streamable_http_app` -> `MCPServer.streamable_http_app` -> the SDK's
+    # own Starlette app, whose `lifespan=lambda app: session_manager.run()` therefore never fires
+    # once mounted below in `create_app`). The session manager -- the anyio task group every
+    # Streamable HTTP request needs -- is entered here instead, for as long as this outer
+    # application runs, exactly reproducing what the SDK's own (unmounted) app would have done
+    # for itself. Same guard as the mount itself in `create_app`, so this is only ever attempted
+    # when `check_mcp_mode` above has already let a `streamable-http` configuration through.
+    # It is *this* app's own mount's manager (`app.state.mcp_app`, set by `create_app`), never the
+    # tool server's `session_manager` property: that names whichever mount was built last, so a
+    # second `create_app()` in the same process would otherwise rebind it (code review
+    # 2026-09-26).
+    if settings.mcp_transport == "streamable-http":
+        async with app.state.mcp_app.session_manager.run():
+            yield
+    else:
+        yield
 
 
 async def handle_permission_error(request: Request, exc: Exception) -> JSONResponse:
@@ -299,10 +316,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # reachable at all under the stdio (local-development) transport, which never touches this
     # FastAPI app in the first place. `check_mcp_mode` above has already refused to let this
     # branch be reached with `mcp_transport == "streamable-http"` and no verifier configured.
+    # Its own lifespan never runs once mounted this way (issue #116) -- `lifespan` above enters
+    # the mount's own session manager instead, for the outer application's lifetime, read from
+    # `app.state.mcp_app` so each app enters the manager of the mount it built itself.
     if settings.mcp_transport == "streamable-http":
-        app.mount(
-            "/v1/t/{tenant_id}/mcp", build_streamable_http_app(settings), name="mcp-streamable-http"
-        )
+        mcp_app = build_streamable_http_app(settings)
+        app.state.mcp_app = mcp_app
+        app.mount("/v1/t/{tenant_id}/mcp", mcp_app, name="mcp-streamable-http")
 
     return app
 

@@ -1,69 +1,41 @@
 """Embedded-Postgres integration tests for the engine-registry seam (`app/db/engine_registry.py`,
-ticket #74). Two ephemeral `pgserver` instances stand in for "the pooled database" and "a
-tenant's dedicated database"; the property under test is routing and caching, not RLS (RLS is
-out of scope for this ticket -- see #73/#75).
+ticket #74). A second database on the same embedded cluster (`tests.support.create_database`)
+stands in for "a tenant's dedicated database"; the property under test is routing and caching,
+not RLS (RLS is out of scope for this ticket -- see #73/#75).
 """
 
 from __future__ import annotations
 
 import asyncio
-import tempfile
-from urllib.parse import parse_qs, urlparse
+import uuid
 
 import pytest
 from sqlalchemy import text
 
-from app import config
 from app.db import engine_registry
 from app.db import session as db_session
+from app.db.engine_registry import _secrets_dir
 
 pgserver = pytest.importorskip("pgserver")
 
+from tests.support import cluster, create_database, environment  # noqa: E402
 
-@pytest.fixture(scope="module")
-def two_servers():
-    """Two independent ephemeral Postgres instances: index 0 stands in for the pooled default,
-    index 1 for a tenant's dedicated database."""
-    servers = []
-    urls = []
-    for _ in range(2):
-        pgdata = tempfile.mkdtemp(prefix="pgdata-engine-registry-")
-        server = pgserver.get_server(pgdata, cleanup_mode="delete")
-        sockdir = parse_qs(urlparse(server.get_uri()).query)["host"][0]
-        urls.append(f"postgresql+asyncpg://postgres@/postgres?host={sockdir}")
-        servers.append(server)
-    yield urls
-    for server in servers:
-        server.cleanup()
+# `cluster`/`environment` are imported only so pytest can discover them as fixtures from this
+# module's namespace -- referenced only by parameter name in the tests below, never called
+# directly.
+_ = (cluster, environment)
 
 
 @pytest.fixture
-def registry_env(two_servers, tmp_path, monkeypatch):
-    pooled_url, dedicated_url = two_servers
-
-    settings = config.Settings(
-        database_url=pooled_url,
-        environment="test",
-        auth_mode="dev-headers",
-        embedding_provider="openai",
-        embedding_model="text-embedding-3-small",
-    )
-    monkeypatch.setattr(config, "get_settings", lambda: settings)
-    monkeypatch.setattr(db_session, "get_settings", lambda: settings)
-    monkeypatch.setattr(engine_registry, "get_settings", lambda: settings)
-    db_session._engine = None
-    db_session._session_factory = None
-    engine_registry.reset_registry_for_tests()
-
-    secrets_dir = tmp_path / "tenant-db"
-    secrets_dir.mkdir()
-    monkeypatch.setenv("TENANT_DB_SECRETS_DIR", str(secrets_dir))
-
-    yield {"pooled_url": pooled_url, "dedicated_url": dedicated_url, "secrets_dir": secrets_dir}
-
-    db_session._engine = None
-    db_session._session_factory = None
-    engine_registry.reset_registry_for_tests()
+async def registry_env(environment):
+    """`environment` already points `Settings`/the session layer/the engine registry at the
+    pooled cluster and resets every cache before and after -- the cache-clear/engine-reset dance
+    this fixture used to repeat by hand. A second database on the same cluster
+    (`tests.support.create_database`) stands in for a tenant's dedicated database -- named
+    uniquely per test, since `cluster` (and so its underlying server) is session-scoped and
+    `CREATE DATABASE` does not tolerate a repeat name."""
+    dedicated = await create_database(environment, f"registry-dedicated-{uuid.uuid4().hex[:8]}")
+    yield {"pooled_url": environment.app_url, "dedicated_url": dedicated.app_url}
 
 
 async def _select_1(engine) -> int:
@@ -87,8 +59,7 @@ async def test_pooled_alias_is_stable_and_never_reads_a_secret_file(registry_env
 
 
 async def test_dedicated_alias_reads_secret_file_and_serves_a_second_instance(registry_env):
-    secrets_dir = registry_env["secrets_dir"]
-    (secrets_dir / "tenant-blue").write_text(registry_env["dedicated_url"])
+    (_secrets_dir() / "tenant-blue").write_text(registry_env["dedicated_url"])
 
     dedicated = await engine_registry.get_engine_for_alias("tenant-blue")
     pooled = await engine_registry.get_engine_for_alias(engine_registry.POOLED_ALIAS)
@@ -106,8 +77,7 @@ async def test_dedicated_alias_reads_secret_file_and_serves_a_second_instance(re
 async def test_concurrent_requests_for_a_new_alias_build_exactly_one_engine(
     registry_env, monkeypatch
 ):
-    secrets_dir = registry_env["secrets_dir"]
-    (secrets_dir / "tenant-green").write_text(registry_env["dedicated_url"])
+    (_secrets_dir() / "tenant-green").write_text(registry_env["dedicated_url"])
 
     build_calls: list[str] = []
     original_build = engine_registry._build_engine

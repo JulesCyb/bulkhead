@@ -34,13 +34,28 @@ served from its own engine, built and cached by the registry from its alias's te
 file. Every caller keeps the exact same signature and transaction behaviour either way -- no
 repository, tool, or agent run needs to know or change anything.
 
-That same read is also where suspension is enforced (Spec 9 / #69, ADR-0010): `control.tenants_
-view` (migration 0024) now exposes `suspended_at` alongside isolation tier and database alias, and
-`_resolve_tenant_alias` raises `TenantSuspendedError` the moment it sees one set, before ever
-opening the tenant's session -- the same query every live request already makes to route the
-session, so this is the one seam every caller of `tenant_session()` shares (the HTTP API, the MCP
-server's tools, and an agent run alike), with no separate check for any of them to forget. A
-tenant with no control-plane row at all is not suspended (ADR-0002's pooled default).
+A request does not pay for that read (#104, spec #92): `app.context_resolution` reads the
+tenant's whole control-plane record once and attaches it to the `RequestContext`
+(`ctx.tenant_record`, `app.tenant_record`). `tenant_session()` routes by that record when it is
+present and skips `_resolve_tenant_alias` entirely, so every session a request opens is routed
+from the same one read. `tenant_record_session()` below is the session mode of that one record
+read. A tenant with no control-plane row at all is not suspended (ADR-0002's pooled default).
+
+**Suspension (ADR-0010) is refused at three points, one per kind of caller:**
+
+1. A request is refused at context resolution, on the tenant record it reads
+   (`app/context_resolution.py`) -- no context is ever built for a suspended tenant.
+2. A caller without a record (the stdio MCP fallback, a test) is refused by `tenant_session()`'s
+   own routing read (`_resolve_tenant_alias`, reading `suspended_at` from `control.tenants_view`,
+   migration 0024), before any session against the tenant's data is opened.
+3. A context that carries a suspended record is refused by `tenant_session()` itself, before it
+   routes by that record.
+
+The retention job (`app/retention.py`) skips a suspended tenant on its record and opens no
+`tenant_session()` for it, because CONTEXT.md defines suspension as a state in which "nothing is
+deleted" (ADR-0010) -- the one deliberate exception to CLAUDE.md rule 2's "with no exception" for
+retention. Every point raises (or, at context resolution, rejects with) the same
+`TenantSuspendedError` meaning; nothing else checks suspension.
 """
 
 from __future__ import annotations
@@ -66,9 +81,12 @@ _session_factory: async_sessionmaker[AsyncSession] | None = None
 
 
 class TenantSuspendedError(RuntimeError):
-    """Raised by `tenant_session()` (and `app.tenant_suspension.ensure_tenant_not_suspended`,
-    which reuses this same exception type) when `tenant_id` is currently suspended. Callers map
-    this to their own transport's documented rejection status -- 403 for the HTTP API, a tool
+    """Raised when `tenant_id` is currently suspended, by whichever of the session layer's two
+    refusal points (points 2 and 3 of the module docstring) sees it: `_resolve_tenant_alias`
+    (below, for a record-less context) or `tenant_session()` itself (for a context whose
+    `tenant_record` says so); `app.token_verifier.TenantSuspendedAtVerification` is the same type
+    raised at context resolution (point 1). Callers
+    map this to their own transport's documented rejection status -- 403 for the HTTP API, a tool
     error for the MCP server -- never to a raw 500."""
 
     def __init__(self, tenant_id: UUID) -> None:
@@ -124,6 +142,7 @@ async def _resolve_tenant_alias(ctx: RequestContext) -> str:
     actual data.
     """
     from app.db.engine_registry import POOLED_ALIAS  # local import: avoids a circular import
+    from app.repositories.control import ControlRepository  # local import: avoids a cycle too
 
     async with get_session_factory()() as session:
         async with session.begin():
@@ -131,36 +150,40 @@ async def _resolve_tenant_alias(ctx: RequestContext) -> str:
                 text("SELECT set_config('app.tenant_id', :tid, true)"),
                 {"tid": str(ctx.tenant_id)},
             )
-            row = (
-                (
-                    await session.execute(
-                        text(
-                            "SELECT isolation_tier, database_alias, suspended_at "
-                            "FROM control.tenants_view WHERE tenant_id = :tid"
-                        ),
-                        {"tid": str(ctx.tenant_id)},
-                    )
-                )
-                .mappings()
-                .one_or_none()
-            )
+            state = await ControlRepository().get_routing_state(session, tenant_id=ctx.tenant_id)
 
-    if row is not None and row["suspended_at"] is not None:
+    if state.suspended_at is not None:
         raise TenantSuspendedError(ctx.tenant_id)
 
-    if row is None or row["isolation_tier"] == "pooled":
+    if state.isolation_tier is None or state.isolation_tier == "pooled":
         return POOLED_ALIAS
-    return row["database_alias"]
+    return state.database_alias
 
 
 @asynccontextmanager
 async def tenant_session(ctx: RequestContext) -> AsyncIterator[AsyncSession]:
     """One transaction in the tenant's context, against whichever database the control plane
-    currently assigns `ctx.tenant_id` to (ADR-0002, Spec 10 / #75; see module docstring).
-    Commit at the end, rollback on error."""
+    currently assigns `ctx.tenant_id` to (ADR-0002, Spec 10 / #75; see module docstring) --
+    taken from `ctx.tenant_record` when the context carries one (#104), read from the control
+    plane otherwise. Commit at the end, rollback on error."""
     from app.db.engine_registry import POOLED_ALIAS, get_engine_for_alias  # avoids a cycle
 
-    alias = await _resolve_tenant_alias(ctx)
+    record = ctx.tenant_record
+    if record is None:
+        alias = await _resolve_tenant_alias(ctx)
+    else:
+        # The record context resolution already read for this request (#104): route by it, no
+        # second control-plane read. A record for another tenant is a bug, never a route.
+        if record.tenant_id != ctx.tenant_id:
+            raise RuntimeError(
+                f"context for tenant {ctx.tenant_id} carries the record of tenant "
+                f"{record.tenant_id}"
+            )
+        if record.suspended:
+            raise TenantSuspendedError(ctx.tenant_id)
+        alias = POOLED_ALIAS if record.isolation_tier == "pooled" else record.database_alias
+        if alias is None:
+            raise RuntimeError(f"dedicated tenant {ctx.tenant_id} has no database alias recorded")
     engine = await get_engine_for_alias(alias)
     factory = (
         get_session_factory()
@@ -180,6 +203,24 @@ async def tenant_session(ctx: RequestContext) -> AsyncIterator[AsyncSession]:
             )
             # SET does not accept bind parameters in Postgres; the value is a validated int from
             # config, never user input, so interpolation here is safe.
+            timeout_ms = int(get_settings().db_statement_timeout_ms)
+            await session.execute(text(f"SET LOCAL statement_timeout = '{timeout_ms}ms'"))
+            yield session
+
+
+@asynccontextmanager
+async def tenant_record_session(tenant_id: UUID) -> AsyncIterator[AsyncSession]:
+    """One transaction against the pooled database with `app.tenant_id` set to `tenant_id` for
+    that transaction only -- the session mode of the once-per-request tenant-record read
+    (`app.repositories.control.ControlRepository.get_tenant_record`, #104). Pooled always, like
+    `_resolve_tenant_alias`: the control plane is never a dedicated tenant's data. No
+    `app.identity_id`: the record read writes nothing and has no actor yet."""
+    async with get_session_factory()() as session:
+        async with session.begin():
+            await session.execute(
+                text("SELECT set_config('app.tenant_id', :tid, true)"),
+                {"tid": str(tenant_id)},
+            )
             timeout_ms = int(get_settings().db_statement_timeout_ms)
             await session.execute(text(f"SET LOCAL statement_timeout = '{timeout_ms}ms'"))
             yield session
