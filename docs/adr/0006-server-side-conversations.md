@@ -41,6 +41,15 @@ We choose **option 2**.
   (`app/retention.py`, run via `scripts/retention.py`) that runs per tenant, through the same
   `tenant_session(ctx)` every other request uses — never a superuser or bypass-RLS statement.
   Deleting a tenant deletes its conversations for free, via the existing cascade.
+- A tenant may shorten or lengthen its own retention period, but never past a deployment-wide
+  maximum of 365 days (`Settings.max_retention_days`, `MAX_RETENTION_DAYS`, #84) — GDPR
+  Art. 5(1)(e)'s storage-limitation principle requires personal data be kept "no longer than is
+  necessary," and an unbounded tenant-chosen period would defeat that regardless of how
+  conservative the 90-day default is. The maximum is enforced twice: on write, wherever
+  `retention_days` is set (`app.operator.create`'s `_validate_retention_days`) rejects a value
+  above it before anything is written; on read, `app.tenant_settings.effective_retention_days`
+  clamps a pre-existing stored value above the current maximum down to it — the fail-safe for a
+  row written under an earlier, higher cap.
 - This is the prerequisite for the approval flow (next decision) and for audit records.
 
 ## Consequences

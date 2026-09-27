@@ -636,6 +636,56 @@ def test_readme_table_states_the_default_retention_period() -> None:
     assert "ADR-0006" in row
 
 
+# --- #84: a deployment-wide cap on a tenant's own retention_days ---------------------------------
+
+
+def test_adr_0006_states_the_retention_maximum_and_why() -> None:
+    """#84: the ADR names the deployment maximum (not only the default), the setting that
+    configures it, and the GDPR storage-limitation reasoning -- not just "a safe default"."""
+    decision_section = " ".join(
+        ADR_0006.split("## Decision", 1)[1].split("## Consequences", 1)[0].split()
+    )
+    assert "365 days" in decision_section
+    assert "MAX_RETENTION_DAYS" in decision_section
+    assert "GDPR" in decision_section
+    assert "Art. 5(1)(e)" in decision_section
+    assert "effective_retention_days" in decision_section
+
+
+def test_readme_table_states_the_retention_maximum() -> None:
+    row = next(line for line in README.splitlines() if line.startswith("| Retention |"))
+    assert "365 days" in row
+    assert "MAX_RETENTION_DAYS" in row
+
+
+def test_claude_md_retention_sentence_mentions_the_cap() -> None:
+    """CLAUDE.md rule 2's retention sentence names the cap in a few words (#84) -- the maximum
+    setting, the default cap value, and that it is enforced on both write and read."""
+    rule_2 = next(line for line in CLAUDE_MD.splitlines() if line.strip().startswith("2. **Every"))
+    section_start = CLAUDE_MD.index(rule_2)
+    section_end = CLAUDE_MD.index("\n3. ", section_start)
+    section = " ".join(CLAUDE_MD[section_start:section_end].split())
+
+    assert "max_retention_days" in section
+    assert "MAX_RETENTION_DAYS" in section
+    assert "365 days" in section
+
+
+def test_env_example_documents_max_retention_days() -> None:
+    assert "MAX_RETENTION_DAYS=365" in ENV_EXAMPLE
+    assert "#84" in ENV_EXAMPLE.split("MAX_RETENTION_DAYS=365", 1)[0][-500:]
+
+
+def test_tenant_settings_catalog_documents_retention_days_write_and_read_split() -> None:
+    """app/tenant_settings.py's own catalog (the one place every tenants.settings field is
+    documented) names the write-side validator and the read-side clamp for retention_days (#84),
+    mirroring how it already documents the split for `model`."""
+    source = (REPO_ROOT / "app" / "tenant_settings.py").read_text(encoding="utf-8")
+    assert "_validate_retention_days" in source
+    assert "effective_retention_days" in source
+    assert "max_retention_days" in source.lower()
+
+
 # --- Spec 6's closing ticket (#50): connecting to and administering the tools server ---
 
 MCP_JSON_EXAMPLE_PATH = REPO_ROOT / ".mcp.json.example"
