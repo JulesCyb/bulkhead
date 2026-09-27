@@ -4,6 +4,8 @@ Art. 5(1)(e) storage limitation): no DB, no real model call.
 - `Settings.max_retention_days` refuses construction below 1 day, and below the documented
   `DEFAULT_RETENTION_DAYS` (90) -- a maximum under the default would put every tenant that has
   never set its own `retention_days` over the cap by definition.
+- `TenantSettings.require_retention_within_cap` -- the write-side half -- rejects a value above
+  the cap it is handed and passes an unset one or one at/below the cap.
 - `app.tenant_settings.effective_retention_days` -- the one function the retention job calls --
   returns the stored value unchanged when at or below the cap, the cap when the stored value is
   above it, and `DEFAULT_RETENTION_DAYS` when the tenant never set one at all.
@@ -15,7 +17,12 @@ import pytest
 from pydantic import ValidationError
 
 from app.config import Settings
-from app.tenant_settings import DEFAULT_RETENTION_DAYS, TenantSettings, effective_retention_days
+from app.tenant_settings import (
+    DEFAULT_RETENTION_DAYS,
+    RetentionDaysExceedsMaximumError,
+    TenantSettings,
+    effective_retention_days,
+)
 
 _VALID_KWARGS = {"embedding_provider": "openai", "embedding_model": "text-embedding-3-small"}
 
@@ -69,3 +76,14 @@ def test_effective_retention_days_uses_the_default_when_unset():
     settings = TenantSettings()
     assert settings.retention_days is None
     assert effective_retention_days(settings, max_days=365) == DEFAULT_RETENTION_DAYS
+
+
+def test_tenant_settings_rejects_a_retention_days_above_the_maximum():
+    with pytest.raises(RetentionDaysExceedsMaximumError, match="exceeds this deployment's maximum"):
+        TenantSettings(retention_days=366).require_retention_within_cap(max_days=365)
+
+
+def test_tenant_settings_accepts_retention_days_at_or_below_the_maximum_or_unset():
+    TenantSettings(retention_days=365).require_retention_within_cap(max_days=365)
+    TenantSettings(retention_days=1).require_retention_within_cap(max_days=365)
+    TenantSettings().require_retention_within_cap(max_days=365)

@@ -26,8 +26,9 @@ rather than merely readable.
 That raw stored value is never used as-is: it is passed through `app.tenant_settings.
 effective_retention_days`, which clamps it to `Settings.max_retention_days` (#84, ADR-0006; GDPR
 Art. 5(1)(e)) -- the read-side fail-safe for a row whose stored value predates a later, lower cap,
-or was written before the cap existed at all (the write side, `app.operator.create`'s
-`_validate_retention_days`, already refuses anything above the *current* cap, but cannot protect
+or was written before the cap existed at all (the write side,
+`TenantSettings.require_retention_within_cap`, already refuses anything above the *current* cap
+as `app.operator.create` writes, but cannot protect
 a row written under a previous, higher one). A clamp is logged once, naming the tenant and the
 stored value, so the sweep stays quiet for every tenant it does not have to correct.
 

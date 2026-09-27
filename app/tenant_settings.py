@@ -57,14 +57,15 @@ than left to whichever module happens to read it first.
   allow-list -- any tenant admin may flip its own tenant's flag. Default: `False` -- content-free
   tracing (`include_content=False`) until explicitly turned on, see `app.observability`.
 - **`retention_days`** -- home: `public.tenants.settings["retention_days"]` (tenant-editable,
-  this module). Shape: `PositiveInt | None`. Validation: this model only ever checks "a positive
-  integer" -- it cannot see `Settings.max_retention_days` (a plain Pydantic model has no access to
-  process configuration), so the deployment cap (#84, ADR-0006; GDPR Art. 5(1)(e)) is enforced
-  outside it, twice, exactly like `model` above: on write (`app.operator.create`'s
-  `_validate_retention_days`, the same shape as that module's `_validate_model`) -- rejected
-  before any write happens at all -- and again on every read, via `effective_retention_days`
-  below, which clamps a stored value above the cap down to it (the fail-safe for a row written
-  under a higher, earlier cap). Default: `None` (`DEFAULT_RETENTION_DAYS` applies).
+  this module). Shape: `PositiveInt | None`. Validation: construction checks "a positive
+  integer"; the deployment cap (#84, ADR-0006; GDPR Art. 5(1)(e)) is enforced twice, exactly like
+  `model` above: on write, by this model's own `require_retention_within_cap(max_days=...)`,
+  which every writing code path calls before the write (today `app.operator.create`, right after
+  `_validate_model`) -- rejected with `RetentionDaysExceedsMaximumError` before anything is
+  written -- and again on every read, via `effective_retention_days` below, which clamps a stored
+  value above the cap down to it (the fail-safe for a row written under a higher, earlier cap).
+  The cap itself (`Settings.max_retention_days`) is passed in: a plain Pydantic model has no
+  access to process configuration. Default: `None` (`DEFAULT_RETENTION_DAYS` applies).
 
 `residency` is deliberately never a field on `TenantSettings` below (see the class docstring): it
 lives in `control.tenants`, read through `app.repositories.control.ControlRepository`, not
@@ -121,6 +122,13 @@ _DSN_LIKE_VALUE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://")
 
 def _normalize_key(key: str) -> str:
     return key.strip().lower().replace("-", "_")
+
+
+class RetentionDaysExceedsMaximumError(ValueError):
+    """`retention_days` is above the deployment's `Settings.max_retention_days` (#84, ADR-0006;
+    GDPR Art. 5(1)(e)). Raised by `TenantSettings.require_retention_within_cap`, the write-side
+    half of the cap, before any write happens; the read-side half is `effective_retention_days`
+    below, which clamps instead of raising."""
 
 
 class TenantEditableSettingRejected(ValueError):
@@ -180,6 +188,20 @@ class TenantSettings(BaseModel):
                     "never hold a DSN, hostname, or credential."
                 )
         return data
+
+    def require_retention_within_cap(self, *, max_days: int) -> None:
+        """The write-side half of the retention cap (#84, ADR-0006): refuses, with
+        `RetentionDaysExceedsMaximumError`, a `retention_days` above `max_days`
+        (`Settings.max_retention_days`, passed in because a plain Pydantic model has no access to
+        process configuration). Every code path that writes a tenant's settings calls this before
+        the write (today: `app.operator.create.create_tenant`); a stored row that nevertheless
+        exceeds a later, lower cap is handled by the read-side clamp, `effective_retention_days`
+        below, never by this method. `None` (never set) always passes."""
+        if self.retention_days is not None and self.retention_days > max_days:
+            raise RetentionDaysExceedsMaximumError(
+                f"retention_days={self.retention_days} exceeds this deployment's maximum of "
+                f"{max_days} days (MAX_RETENTION_DAYS, see app.config.Settings)"
+            )
 
 
 def effective_retention_days(settings: TenantSettings, *, max_days: int) -> int:

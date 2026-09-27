@@ -168,8 +168,8 @@ class Settings(BaseSettings):
     # period freely, but never lengthen it past this. `TenantSettings` itself cannot know this
     # value (it is a plain Pydantic model with no access to `Settings`), so it is enforced twice,
     # in the same write-then-read shape rule 6 of CLAUDE.md uses for the `model` setting: on
-    # write, by whichever code path sets `retention_days` (today: `app.operator.create`'s
-    # `_validate_retention_days`, the same shape as that module's `_validate_model`) -- rejected
+    # write, by `TenantSettings.require_retention_within_cap(max_days=...)`, which whichever code
+    # path sets `retention_days` calls first (today: `app.operator.create`) -- rejected
     # before any write ever happens, naming this maximum; on read, as the fail-safe for a
     # pre-existing row written under a higher, earlier cap (or before this field existed at all),
     # `app.tenant_settings.effective_retention_days` clamps a stored value above this maximum down

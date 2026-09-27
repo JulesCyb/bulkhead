@@ -398,7 +398,7 @@ async def seed_conversation(
 
 async def set_tenant_retention_days(cluster: Cluster, tenant_id: uuid.UUID, days: int) -> None:
     """Sets this tenant's own `tenants.settings['retention_days']` (ADR-0006) directly, as the
-    cluster's own superuser, bypassing whatever `app.operator.create._validate_retention_days`
+    cluster's own superuser, bypassing whatever `TenantSettings.require_retention_within_cap`
     (#84) would otherwise reject -- `tenants`' own self-only RLS policy would otherwise block the
     update with no `app.tenant_id` context in scope, and going straight to the row is also the
     only way to get a value the write-side cap would refuse (e.g. one written under an earlier,

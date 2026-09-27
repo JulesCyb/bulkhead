@@ -129,7 +129,7 @@ class IdentityRepository:
         provisions, or update-in-place (`ON CONFLICT (issuer, subject)`) if that issuer/subject
         pair already names one -- the same idempotency key `create_tenant`'s own re-run relies on.
         Also used, with an already-known `id`, to mirror that same identity row into a dedicated
-        tenant's own database (`app.operator.dedicated_db.ensure_dedicated_admin_membership`):
+        tenant's own database (`app.operator.dedicated_db.ensure_dedicated_membership`):
         its `memberships.identity_id` foreign key needs a local copy even though identity
         resolution at request time always reads the pooled database's copy (this repository's
         app-role side, above). `control.identities` carries no `tenant_id`/RLS (migration 0003),
@@ -213,7 +213,7 @@ async def _set_owner_tenant_context(conn: AsyncConnection, tenant_id: UUID) -> N
     membership write (`app.repositories.memberships.ensure_membership`, called by
     `app.operator.create` after `create_tenant_record`/`get_record`) relies on it too -- that
     table is forced-RLS as well (code review 2026-09-26). The one owner-role `set_config` outside
-    this helper is `app.operator.dedicated_db.ensure_dedicated_admin_membership`'s, against a
+    this helper is `app.operator.dedicated_db.ensure_dedicated_membership`'s, against a
     tenant's *dedicated* database, which this repository never reaches. Never used by
     `set_suspended` below, which goes through `control.set_tenant_suspended()` instead -- a
     `SECURITY DEFINER` function that manages its own escape-hatch flag internally and needs no

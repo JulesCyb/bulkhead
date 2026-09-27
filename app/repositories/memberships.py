@@ -97,7 +97,7 @@ async def ensure_membership(
     and the insert would fail its `WITH CHECK`. On the pooled path the control repository's own
     forced-RLS helper has already set it (`ControlRepository.create_tenant_record`/`get_record`,
     one of which `app.operator.create.create_tenant` always calls first on the same transaction);
-    on the dedicated path `app.operator.dedicated_db.ensure_dedicated_admin_membership` sets it
+    on the dedicated path `app.operator.dedicated_db.ensure_dedicated_membership` sets it
     itself against the dedicated database, where the control repository has no connection. This
     function checks that precondition and raises `RuntimeError` when the connection's tenant
     context names a different tenant or none, rather than answering for a tenant it cannot see."""

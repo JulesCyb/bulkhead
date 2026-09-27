@@ -681,7 +681,7 @@ def test_tenant_settings_catalog_documents_retention_days_write_and_read_split()
     documented) names the write-side validator and the read-side clamp for retention_days (#84),
     mirroring how it already documents the split for `model`."""
     source = (REPO_ROOT / "app" / "tenant_settings.py").read_text(encoding="utf-8")
-    assert "_validate_retention_days" in source
+    assert "require_retention_within_cap" in source
     assert "effective_retention_days" in source
     assert "max_retention_days" in source.lower()
 

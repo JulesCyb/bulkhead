@@ -45,10 +45,9 @@ control schema); the membership is written through
 docstring), refusing (`MembershipRoleConflictError`) rather than silently changing an existing
 membership of a different role.
 
-`ensure_dedicated_admin_membership` is a thin `role="admin"` wrapper over
-`ensure_dedicated_membership` -- `create_tenant`'s own call site and its worked tests predate the
-generalization (#83, `app.operator.add_membership`, the operator command that adds a membership
-of any role to an already-provisioned tenant).
+Both operator commands that write a dedicated tenant's membership call `ensure_dedicated_membership`
+directly: `create_tenant` with `role="admin"` for the first membership, and
+`app.operator.add_membership` (#83) with whichever role the operator asked for.
 """
 
 from __future__ import annotations
@@ -336,30 +335,3 @@ async def ensure_dedicated_membership(
         return await ensure_membership(
             conn, tenant_id=tenant_id, identity_id=identity_id, role=role
         )
-
-
-async def ensure_dedicated_admin_membership(
-    *,
-    owner_dsn: str,
-    tenant_id: UUID,
-    tenant_name: str,
-    tenant_settings_json: str,
-    identity_id: UUID,
-    issuer: str,
-    subject: str,
-    admin_email: str,
-) -> str:
-    """Thin `role="admin"` wrapper over `ensure_dedicated_membership` above -- `create_tenant`'s
-    own call site and its worked tests predate the generalization (#83); see that function's
-    docstring for the full contract."""
-    return await ensure_dedicated_membership(
-        owner_dsn=owner_dsn,
-        tenant_id=tenant_id,
-        tenant_name=tenant_name,
-        tenant_settings_json=tenant_settings_json,
-        identity_id=identity_id,
-        issuer=issuer,
-        subject=subject,
-        email=admin_email,
-        role="admin",
-    )

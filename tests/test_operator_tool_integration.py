@@ -647,7 +647,8 @@ async def test_create_rejects_retention_days_above_the_maximum_before_any_write(
     deployment's `MAX_RETENTION_DAYS` is refused before the control-plane record, the credential,
     or the membership is touched -- same shape as the model-allow-list rejection above."""
     from app.config import Settings
-    from app.operator.create import RetentionDaysExceedsMaximumError, create_tenant
+    from app.operator.create import create_tenant
+    from app.tenant_settings import RetentionDaysExceedsMaximumError
 
     settings = Settings(gateway_credentials_dir=str(tmp_path), max_retention_days=365)
     engine = create_async_engine(environment.owner_url)
