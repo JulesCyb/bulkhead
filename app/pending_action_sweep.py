@@ -13,7 +13,10 @@ nothing and writes nothing. The late-resume path cannot double-record either: it
 an *approved* row (`mark_expired`), never a pending one, and records nothing new for a row the
 sweep already expired (`app.tools.approvals._audit_kind_for_failed_verification`). An overdue
 row a member approved just before its expiry is deliberately not the sweep's to claim -- the
-member's own resume decides it (`expired`, or never executed).
+member's own resume decides it (`expired`, or never executed). An `executing` row (claimed by a
+resume that is running its tool, #122) is never touched either, however overdue: only that
+resume's recorded outcome leaves `executing`, and a row stuck there after a crash stays a visible,
+fail-closed state rather than something the sweep guesses about.
 
 **Per tenant, under RLS, like retention.** The loop -- enumerate on the owner connection, build
 each tenant's record, skip a suspended tenant with one log line, open `tenant_session(ctx)` as

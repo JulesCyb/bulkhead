@@ -8,9 +8,11 @@ ever tries to resume it. Runs against PostgreSQL + pgvector (`pgserver`, via
 Two seams, two halves of this file:
 
 - **Repository** (`PendingActionRepository`): every status transition lives there and nowhere
-  else -- `mark_execution_outcome` moves only an `approved` action, `mark_expired` only an
-  overdue `approved` one, `expire_overdue` only overdue `pending` rows of the calling tenant; and
-  `verify()` refuses an action that has already executed.
+  else -- `claim_for_execution` moves an `approved` action to `executing` exactly once, even for
+  two concurrent claims (#122); `mark_execution_outcome` moves only an `executing` action,
+  `mark_expired` only an overdue `approved` one, `expire_overdue` only overdue `pending` rows of
+  the calling tenant (never an `executing` one); and `verify()` refuses an action that has been
+  claimed or has already executed.
 - **Job** (`app.pending_action_sweep.run_pending_action_sweep`): visits every non-suspended
   tenant through `tenant_session(ctx)` exactly like the retention job, is idempotent, and never
   reaches across tenants. The cluster is shared across the whole test session, so every
@@ -20,6 +22,7 @@ Two seams, two halves of this file:
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -62,8 +65,16 @@ def _ctx(tenant) -> RequestContext:
 
 
 async def _create_action(
-    tenant, *, tool_call_id: str, expires_in: timedelta, approve: bool = False
+    tenant,
+    *,
+    tool_call_id: str,
+    expires_in: timedelta,
+    approve: bool = False,
+    claim: bool = False,
 ) -> uuid.UUID:
+    """`approve` resolves the new action `approved`; `claim` (which implies `approve`) then claims
+    it `executing` (#122) -- the state an action is in while its tool is running."""
+    approve = approve or claim
     ctx = _ctx(tenant)
     repo = PendingActionRepository()
     async with tenant_session(ctx) as session:
@@ -85,7 +96,28 @@ async def _create_action(
                 approved=True,
                 resolved_by=tenant.memberships["member"],
             )
+        if claim:
+            assert await repo.claim_for_execution(session, ctx, pending_action_id=action.id)
         return action.id
+
+
+async def _move_expiry_into_the_past(environment, action_id: uuid.UUID) -> None:
+    """An action claimed while still inside its window, whose window has since passed -- how an
+    `executing` row ends up overdue in real life (a tool body that runs past the expiry, or a
+    process that crashed mid-execution). Written as the superuser: a test fixture, not a
+    transition the application ever makes."""
+    engine = create_async_engine(environment.superuser_url)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "UPDATE pending_actions SET expires_at = now() - interval '1 hour' "
+                    "WHERE id = :id"
+                ),
+                {"id": action_id},
+            )
+    finally:
+        await engine.dispose()
 
 
 async def _status(tenant, action_id: uuid.UUID) -> str | None:
@@ -107,9 +139,10 @@ async def _audit(tenant, action_id: uuid.UUID):
 # --- repository seam -----------------------------------------------------------------------------
 
 
-async def test_execution_outcome_moves_only_an_approved_action_of_this_tenant(environment):
-    """`approved -> executed` / `approved -> execution_failed`, once, scoped by tenant + id: a
-    `pending` action, an already-executed one, and another tenant's approved one all refuse."""
+async def test_execution_outcome_moves_only_an_executing_action_of_this_tenant(environment):
+    """`executing -> executed` / `executing -> execution_failed`, once, scoped by tenant + id: a
+    `pending` action, an `approved` one that was never claimed (#122: no path may skip the claim),
+    an already-executed one, and another tenant's executing one all refuse."""
     tenant_a = await _tenant_with_conversation(environment, "OutcomeA")
     tenant_b = await _tenant_with_conversation(environment, "OutcomeB")
     repo = PendingActionRepository()
@@ -118,23 +151,29 @@ async def test_execution_outcome_moves_only_an_approved_action_of_this_tenant(en
     still_pending = await _create_action(
         tenant_a, tool_call_id="call-pending", expires_in=timedelta(minutes=5)
     )
+    unclaimed = await _create_action(
+        tenant_a, tool_call_id="call-unclaimed", expires_in=timedelta(minutes=5), approve=True
+    )
     succeeded = await _create_action(
-        tenant_a, tool_call_id="call-ok", expires_in=timedelta(minutes=5), approve=True
+        tenant_a, tool_call_id="call-ok", expires_in=timedelta(minutes=5), claim=True
     )
     failed = await _create_action(
-        tenant_a, tool_call_id="call-fail", expires_in=timedelta(minutes=5), approve=True
+        tenant_a, tool_call_id="call-fail", expires_in=timedelta(minutes=5), claim=True
     )
 
     async with tenant_session(ctx_a) as session:
         assert not await repo.mark_execution_outcome(
             session, ctx_a, pending_action_id=still_pending, success=True
         )
-    # Another tenant's session cannot move tenant A's approved action.
+        assert not await repo.mark_execution_outcome(
+            session, ctx_a, pending_action_id=unclaimed, success=True
+        )
+    # Another tenant's session cannot move tenant A's executing action.
     async with tenant_session(ctx_b) as session:
         assert not await repo.mark_execution_outcome(
             session, ctx_b, pending_action_id=succeeded, success=True
         )
-    assert await _status(tenant_a, succeeded) == "approved"
+    assert await _status(tenant_a, succeeded) == "executing"
 
     async with tenant_session(ctx_a) as session:
         assert await repo.mark_execution_outcome(
@@ -150,8 +189,118 @@ async def test_execution_outcome_moves_only_an_approved_action_of_this_tenant(en
         )
 
     assert await _status(tenant_a, still_pending) == "pending"
+    assert await _status(tenant_a, unclaimed) == "approved"
     assert await _status(tenant_a, succeeded) == "executed"
     assert await _status(tenant_a, failed) == "execution_failed"
+
+
+async def test_two_concurrent_claims_of_one_approved_action_move_it_exactly_once(environment):
+    """#122: two sessions that have *both* verified the same `approved` action (a barrier holds
+    each one between `verify()` and the claim until both have verified -- exactly the window the
+    race lived in) both try to claim it; Postgres re-checks the guarded `UPDATE`'s `WHERE` after
+    the winner's row lock is released, so exactly one claim moves the row and the other changes
+    nothing."""
+    tenant = await _tenant_with_conversation(environment, "ClaimRace")
+    ctx = _ctx(tenant)
+    action_id = await _create_action(
+        tenant, tool_call_id="call-race", expires_in=timedelta(minutes=5), approve=True
+    )
+    both_verified = asyncio.Barrier(2)
+
+    async def verify_then_claim() -> bool:
+        repo = PendingActionRepository()
+        async with tenant_session(ctx) as session:
+            verification = await repo.verify(
+                session,
+                ctx,
+                pending_action_id=action_id,
+                tool_name="rename_document",
+                arguments={"document_id": "call-race"},
+            )
+            assert verification.ok
+            await both_verified.wait()
+            return await repo.claim_for_execution(session, ctx, pending_action_id=action_id)
+
+    results = await asyncio.gather(verify_then_claim(), verify_then_claim())
+
+    assert sorted(results) == [False, True]
+    assert await _status(tenant, action_id) == "executing"
+
+
+async def test_claim_changes_nothing_unless_the_action_is_approved_in_this_tenant(environment):
+    """#122: the claim is a guarded `approved -> executing` move and nothing else -- a `pending`,
+    `refused`, `expired`, already-`executing` or `executed` action, and another tenant's
+    `approved` one, all change zero rows and keep their status."""
+    tenant_a = await _tenant_with_conversation(environment, "ClaimA")
+    tenant_b = await _tenant_with_conversation(environment, "ClaimB")
+    repo = PendingActionRepository()
+    ctx_a, ctx_b = _ctx(tenant_a), _ctx(tenant_b)
+
+    pending = await _create_action(
+        tenant_a, tool_call_id="call-pending", expires_in=timedelta(minutes=5)
+    )
+    refused = await _create_action(
+        tenant_a, tool_call_id="call-refused", expires_in=timedelta(minutes=5)
+    )
+    expired = await _create_action(
+        tenant_a, tool_call_id="call-expired", expires_in=timedelta(minutes=-5), approve=True
+    )
+    executing = await _create_action(
+        tenant_a, tool_call_id="call-executing", expires_in=timedelta(minutes=5), claim=True
+    )
+    executed = await _create_action(
+        tenant_a, tool_call_id="call-executed", expires_in=timedelta(minutes=5), claim=True
+    )
+    foreign_approved = await _create_action(
+        tenant_b, tool_call_id="call-foreign", expires_in=timedelta(minutes=5), approve=True
+    )
+    async with tenant_session(ctx_a) as session:
+        assert await repo.resolve(
+            session,
+            ctx_a,
+            pending_action_id=refused,
+            approved=False,
+            resolved_by=tenant_a.memberships["member"],
+        )
+        assert await repo.mark_expired(session, ctx_a, pending_action_id=expired)
+        assert await repo.mark_execution_outcome(
+            session, ctx_a, pending_action_id=executed, success=True
+        )
+
+    async with tenant_session(ctx_a) as session:
+        for action_id in (pending, refused, expired, executing, executed, foreign_approved):
+            assert not await repo.claim_for_execution(session, ctx_a, pending_action_id=action_id)
+
+    assert await _status(tenant_a, pending) == "pending"
+    assert await _status(tenant_a, refused) == "refused"
+    assert await _status(tenant_a, expired) == "expired"
+    assert await _status(tenant_a, executing) == "executing"
+    assert await _status(tenant_a, executed) == "executed"
+    assert await _status(tenant_b, foreign_approved) == "approved"
+    # And the same foreign row, claimed from its own tenant, moves normally.
+    async with tenant_session(ctx_b) as session:
+        assert await repo.claim_for_execution(session, ctx_b, pending_action_id=foreign_approved)
+
+
+async def test_verify_refuses_an_action_that_has_been_claimed(environment):
+    """#122: a claimed (`executing`) action no longer verifies -- `verify()` reports
+    `status_executing`, which is what a late or concurrent resume is refused with."""
+    tenant = await _tenant_with_conversation(environment, "VerifyExecuting")
+    ctx = _ctx(tenant)
+    action_id = await _create_action(
+        tenant, tool_call_id="call-claimed", expires_in=timedelta(minutes=5), claim=True
+    )
+
+    async with tenant_session(ctx) as session:
+        result = await PendingActionRepository().verify(
+            session,
+            ctx,
+            pending_action_id=action_id,
+            tool_name="rename_document",
+            arguments={"document_id": "call-claimed"},
+        )
+    assert result.ok is False
+    assert result.reason == "status_executing"
 
 
 async def test_verify_refuses_an_action_that_already_executed(environment):
@@ -174,6 +323,7 @@ async def test_verify_refuses_an_action_that_already_executed(environment):
             arguments=arguments,
         )
         assert first.ok
+        assert await repo.claim_for_execution(session, ctx, pending_action_id=action_id)
         assert await repo.mark_execution_outcome(
             session, ctx, pending_action_id=action_id, success=True
         )
@@ -192,8 +342,9 @@ async def test_verify_refuses_an_action_that_already_executed(environment):
 async def test_expire_overdue_touches_only_this_tenants_overdue_pending_rows(environment):
     """`expire_overdue` returns exactly the rows it moved (id + asking membership) and moves only
     this tenant's `pending` rows whose `expires_at` has passed -- a fresh pending row, an overdue
-    *approved* row (the late-resume path's business, not the sweep's), and another tenant's
-    overdue pending row are all left alone."""
+    *approved* row (the late-resume path's business, not the sweep's), an overdue *executing* row
+    (#122: only the outcome path ever leaves that state), and another tenant's overdue pending row
+    are all left alone."""
     tenant_a = await _tenant_with_conversation(environment, "ExpireA")
     tenant_b = await _tenant_with_conversation(environment, "ExpireB")
     repo = PendingActionRepository()
@@ -206,6 +357,10 @@ async def test_expire_overdue_touches_only_this_tenants_overdue_pending_rows(env
     overdue_approved = await _create_action(
         tenant_a, tool_call_id="call-approved", expires_in=timedelta(minutes=-5), approve=True
     )
+    overdue_executing = await _create_action(
+        tenant_a, tool_call_id="call-executing", expires_in=timedelta(hours=1), claim=True
+    )
+    await _move_expiry_into_the_past(environment, overdue_executing)
     foreign_overdue = await _create_action(
         tenant_b, tool_call_id="call-foreign", expires_in=timedelta(minutes=-5)
     )
@@ -219,6 +374,7 @@ async def test_expire_overdue_touches_only_this_tenants_overdue_pending_rows(env
     assert await _status(tenant_a, overdue) == "expired"
     assert await _status(tenant_a, fresh) == "pending"
     assert await _status(tenant_a, overdue_approved) == "approved"
+    assert await _status(tenant_a, overdue_executing) == "executing"
     assert await _status(tenant_b, foreign_overdue) == "pending"
 
     # Idempotent: nothing left to expire.
@@ -310,6 +466,12 @@ async def test_sweep_expires_each_tenants_overdue_action_once_and_is_idempotent(
     fresh_b = await _create_action(
         tenant_b, tool_call_id="call-b-fresh", expires_in=timedelta(hours=1)
     )
+    # #122: an `executing` row past its expiry (claimed in time, still running or stuck after a
+    # crash) is never the sweep's -- no transition, no audit event.
+    executing_a = await _create_action(
+        tenant_a, tool_call_id="call-a-executing", expires_in=timedelta(hours=1), claim=True
+    )
+    await _move_expiry_into_the_past(environment, executing_a)
 
     outcomes = await _run_sweep(environment)
 
@@ -326,6 +488,8 @@ async def test_sweep_expires_each_tenants_overdue_action_once_and_is_idempotent(
         assert events[0].pending_action_id == overdue
         assert events[0].means_kind is None and events[0].means_id is None
         assert await _audit(tenant, fresh) == []
+    assert await _status(tenant_a, executing_a) == "executing"
+    assert await _audit(tenant_a, executing_a) == []
 
     # Neither tenant's session can see the other's rows -- the sweep wrote each tenant's event
     # under that tenant's own context, never under the other's.

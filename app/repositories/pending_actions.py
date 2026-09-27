@@ -19,23 +19,38 @@ actually runs, and it fails closed on every axis rather than guessing:
 This mirrors ADR-0007 directly: "the approval is verified against that record, never against the
 message the client sends back," and a mismatching hash or an expired record "fails closed."
 
-Because `verify()` requires exactly `approved`, an action whose execution has already been
-recorded (`executed`/`execution_failed`, below) never verifies again -- a second guarantee against
-running the same approved call twice, independent of the hash and expiry checks. (It holds from
-the moment the outcome is recorded; two resumes of one action racing each other *between*
-`verify()` and that record are not serialized here.)
+Because `verify()` requires exactly `approved`, an action that has been claimed for execution
+(`executing`) or whose execution has already been recorded (`executed`/`execution_failed`, below)
+never verifies again -- a second guarantee against running the same approved call twice,
+independent of the hash and expiry checks.
+
+**Verify, then claim, in one transaction (#122).** `verify()` only reads; the caller that is about
+to run the tool (`app.tools.approvals.require_approval`) follows a successful `verify()` with
+`claim_for_execution()` *in the same session and transaction*, and may run the tool only when the
+claim returns True. The claim is a guarded `UPDATE ... WHERE status = 'approved'` that moves the
+row to `executing`: two resumes of the same action that both pass `verify()` concurrently both
+reach the `UPDATE`, the second blocks on the first's row lock, re-checks the `WHERE` once the
+first commits, and updates zero rows -- so exactly one of them may execute, and the other is
+refused (`status_executing`). The claim is a separate method rather than a side effect of
+`verify()` so that `verify()` stays what its name says -- a read-only check its callers and tests
+can run on a row without changing it -- and the one state change lives where its guard is.
 
 **Status lifecycle (#82, migration 0043).** Every transition lives in this class and nothing
 outside it writes `status`; each is a single guarded `UPDATE ... WHERE status = <from>`, so a
 transition happens at most once even under concurrency (Postgres re-checks the `WHERE` after
 taking the row lock -- the loser updates zero rows):
 
-    pending  --resolve()-------------------> approved | refused
-    pending  --expire_overdue() (sweep)----> expired
-    approved --mark_expired() (late resume)-> expired
-    approved --mark_execution_outcome()----> executed | execution_failed
+    pending   --resolve()--------------------> approved | refused
+    pending   --expire_overdue() (sweep)-----> expired
+    approved  --mark_expired() (late resume)-> expired
+    approved  --claim_for_execution()--------> executing
+    executing --mark_execution_outcome()-----> executed | execution_failed
 
-`expired`, `refused`, `executed`, `execution_failed` are terminal. Every operation except the
+`expired`, `refused`, `executed`, `execution_failed` are terminal. `executing` is not, but only
+`mark_execution_outcome()` ever leaves it: no sweep, timeout, or late resume touches an
+`executing` row. A row left there by a process that crashed mid-execution stays there -- a
+visible, fail-closed state (it can never run again), deliberately not something this class
+guesses about (#122). Every operation except the
 sweep's `expire_overdue()` is scoped by the single pending action's own primary key (plus
 tenant), not by conversation or tool name, so moving one pending action never touches another --
 even one in the same tenant and conversation. `expire_overdue()` is scoped by tenant (RLS plus the
@@ -61,11 +76,12 @@ PENDING = "pending"
 APPROVED = "approved"
 REFUSED = "refused"
 EXPIRED = "expired"
+EXECUTING = "executing"
 EXECUTED = "executed"
 EXECUTION_FAILED = "execution_failed"
 
 STATUSES: frozenset[str] = frozenset(
-    {PENDING, APPROVED, REFUSED, EXPIRED, EXECUTED, EXECUTION_FAILED}
+    {PENDING, APPROVED, REFUSED, EXPIRED, EXECUTING, EXECUTED, EXECUTION_FAILED}
 )
 
 
@@ -213,12 +229,39 @@ class PendingActionRepository:
         pending_action_id: UUID,
         success: bool,
     ) -> bool:
-        """Moves an `approved` action to `executed` (`success=True`) or `execution_failed`, once --
-        called from `app.tools.approvals.record_write_outcome` in the same transaction as the
+        """Moves an `executing` action to `executed` (`success=True`) or `execution_failed`, once
+        -- called from `app.tools.approvals.record_write_outcome` in the same transaction as the
         matching `executed`/`failed_to_execute` audit row. Returns False (a no-op) for an unknown
-        or cross-tenant id, or an action that is not `approved` (never approved, or its outcome is
-        already recorded). A standing-grant execution has no pending action and never calls
+        or cross-tenant id, or an action that is not `executing`: one that was never claimed
+        (still `approved` -- no path may skip `claim_for_execution()`), or whose outcome is
+        already recorded. A standing-grant execution has no pending action and never calls
         this."""
+        result = await session.execute(
+            update(PendingAction)
+            .where(
+                PendingAction.tenant_id == ctx.tenant_id,
+                PendingAction.id == pending_action_id,
+                PendingAction.status == EXECUTING,
+            )
+            .values(status=EXECUTED if success else EXECUTION_FAILED)
+        )
+        return result.rowcount > 0
+
+    async def claim_for_execution(
+        self, session: AsyncSession, ctx: RequestContext, *, pending_action_id: UUID
+    ) -> bool:
+        """Moves an `approved` action to `executing`, once (#122) -- the claim a caller must win
+        before it runs the tool. Called by `app.tools.approvals.require_approval` right after a
+        successful `verify()`, in the *same* session/transaction, so the claim is the atomic
+        second half of the verification (module docstring). Returns True only when this call's
+        guarded `UPDATE` moved the row; False (a no-op) for an unknown or cross-tenant id, or an
+        action that is not `approved` -- `pending`, `refused`, `expired`, already `executing`
+        (a concurrent resume won the claim), or `executed`/`execution_failed`. A caller that gets
+        False must not execute.
+
+        Deliberately no expiry or hash check here: `verify()` has just made both in the same
+        transaction, and repeating them would only open a second, different answer to the same
+        question."""
         result = await session.execute(
             update(PendingAction)
             .where(
@@ -226,7 +269,7 @@ class PendingActionRepository:
                 PendingAction.id == pending_action_id,
                 PendingAction.status == APPROVED,
             )
-            .values(status=EXECUTED if success else EXECUTION_FAILED)
+            .values(status=EXECUTING)
         )
         return result.rowcount > 0
 
@@ -266,7 +309,9 @@ class PendingActionRepository:
         tenant owns (RLS plus the `WHERE` clause), never a fresh one, never one already resolved.
         A second call finds nothing, which is what makes the sweep idempotent. An overdue
         `approved` row is deliberately left alone: whether it expires is decided when someone
-        tries to run it (`mark_expired`), and it is never the sweep's to claim."""
+        tries to run it (`mark_expired`), and it is never the sweep's to claim. An `executing`
+        row is never touched either, however far past its `expires_at` (#122): only the outcome
+        path leaves that state."""
         cutoff = now or datetime.now(UTC)
         rows = await session.execute(
             update(PendingAction)
@@ -300,10 +345,16 @@ class PendingActionRepository:
         the record's status, and its expiry against the real clock -- all three must hold, or
         verification refuses outright. See the module docstring for why each check exists.
 
-        The status check requires exactly `approved`: `status_executed`/`status_execution_failed`
-        mean this action already ran (its outcome is recorded) and it cannot run again -- a
-        guarantee independent of the hash and the expiry; `status_expired` means the sweep (or an
-        earlier late resume) has already expired it and written its one `expired` event."""
+        The status check requires exactly `approved`: `status_executing` means another resume
+        has already claimed this action and is running it (#122);
+        `status_executed`/`status_execution_failed` mean this action already ran (its outcome is
+        recorded) and it cannot run again -- a guarantee independent of the hash and the expiry;
+        `status_expired` means the sweep (or an earlier late resume) has already expired it and
+        written its one `expired` event.
+
+        Read-only: a caller about to execute follows an `ok` result with `claim_for_execution()`
+        in the same transaction and runs the tool only if that claim succeeds (module
+        docstring)."""
         action = await self.get(session, ctx, pending_action_id=pending_action_id)
         if action is None:
             return VerificationResult(ok=False, reason="not_found")
