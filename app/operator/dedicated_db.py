@@ -29,11 +29,11 @@ Idempotency is keyed on step 3's migration-secret file: if it already exists, ev
 assumed already done, and this function returns immediately without opening `admin_url` (which
 may not even have been supplied on a re-run).
 
-`ensure_dedicated_admin_membership` writes the tenant's own bookkeeping stub row and first admin
-membership *into that dedicated database* -- unlike a pooled tenant, whose membership lives in
+`ensure_dedicated_membership` writes the tenant's own bookkeeping stub row and a membership of a
+given role *into that dedicated database* -- unlike a pooled tenant, whose membership lives in
 the same database as the control plane, a dedicated tenant's membership can only ever live in its
 own database (`tests/test_tenant_session_routing_integration.py` proves a dedicated tenant's data
-is physically absent from the pooled database). It also mirrors the admin identity row into the
+is physically absent from the pooled database). It also mirrors the identity row into the
 dedicated database's own (otherwise unused) `control.identities` table, through
 `app.repositories.control.IdentityRepository.upsert` (#114) rather than SQL of its own:
 `memberships.identity_id` foreign-keys to it in every database migrations create it in, even
@@ -41,8 +41,14 @@ though identity resolution at request time always reads the pooled database's co
 (`app/repositories/control.py`) -- the dedicated database's copy exists only to satisfy that
 per-database foreign key. The `tenants` stub row stays this module's own raw SQL (it is not the
 control schema); the membership is written through
-`app.repositories.memberships.ensure_membership` (see `ensure_dedicated_admin_membership`'s own
-docstring).
+`app.repositories.memberships.ensure_membership` (see `ensure_dedicated_membership`'s own
+docstring), refusing (`MembershipRoleConflictError`) rather than silently changing an existing
+membership of a different role.
+
+`ensure_dedicated_admin_membership` is a thin `role="admin"` wrapper over
+`ensure_dedicated_membership` -- `create_tenant`'s own call site and its worked tests predate the
+generalization (#83, `app.operator.add_membership`, the operator command that adds a membership
+of any role to an already-provisioned tenant).
 """
 
 from __future__ import annotations
@@ -59,9 +65,14 @@ from sqlalchemy.engine import URL, make_url
 
 import scripts.migrate as migrate_module
 import scripts.provision_roles as provision_roles_module
+from app.context import Role
 from app.db.lifecycle import owner_engine
 from app.repositories.control import IdentityRepository
-from app.repositories.memberships import ensure_membership
+from app.repositories.memberships import (
+    MembershipRoleConflictError,
+    ensure_membership,
+    get_role_owner,
+)
 
 # Mirrors app/db/engine_registry.py's own default exactly -- this is the first code path that
 # *writes* to that directory rather than only reading it.
@@ -273,7 +284,7 @@ async def drop_dedicated_database(*, alias: str, admin_url: str | None) -> str:
     return "removed"
 
 
-async def ensure_dedicated_admin_membership(
+async def ensure_dedicated_membership(
     *,
     owner_dsn: str,
     tenant_id: UUID,
@@ -282,23 +293,26 @@ async def ensure_dedicated_admin_membership(
     identity_id: UUID,
     issuer: str,
     subject: str,
-    admin_email: str,
+    email: str,
+    role: Role,
 ) -> str:
-    """Write the tenant's bookkeeping stub row and first admin membership into its own dedicated
-    database (idempotent). Returns `"created"` or `"already exists"` for the membership, matching
-    `create_tenant`'s own pooled-path vocabulary.
+    """Write the tenant's bookkeeping stub row and a membership of `role` into its own dedicated
+    database (idempotent). Returns `"created"` or `"already exists"`, matching `create_tenant`'s
+    own pooled-path vocabulary -- raises `MembershipRoleConflictError` (issue #83) instead of
+    either of those if a membership already exists for `identity_id` with a *different* role.
 
     The `tenants`/`memberships` rows below are this dedicated database's *own* copies, not the
     control schema. The `tenants` stub stays this module's own raw SQL (#114, spec #95's own
     decision); the membership goes through the membership repository's owner-side
-    `ensure_membership` (code review 2026-09-26, CLAUDE.md rule 3), and the `control.identities`
-    mirror row through `IdentityRepository.upsert`. The tenant context both need is set here, on
-    this dedicated-database connection (see the comment below)."""
+    `ensure_membership`/`get_role_owner` (code review 2026-09-26, CLAUDE.md rule 3, #83), and the
+    `control.identities` mirror row through `IdentityRepository.upsert`. The tenant context all
+    three need is set here, on this dedicated-database connection (see the comment below)."""
     async with owner_engine(owner_dsn) as engine, engine.begin() as conn:
         # The one tenant-context `set_config` outside the control repository, kept here on
         # purpose: this connection is to the tenant's *dedicated* database, which the control
-        # repository's forced-RLS helper never reaches, and both the `tenants` stub row below and
-        # `ensure_membership` need it (forced RLS binds the owner role too).
+        # repository's forced-RLS helper never reaches, and the `tenants` stub row below,
+        # `get_role_owner`, and `ensure_membership` all need it (forced RLS binds the owner role
+        # too).
         await conn.execute(
             text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": str(tenant_id)}
         )
@@ -314,8 +328,38 @@ async def ensure_dedicated_admin_membership(
         # memberships->control.identities foreign key -- never read back from here (identity
         # resolution always reads the pooled database's copy, app/repositories/control.py).
         await IdentityRepository().upsert(
-            conn, id=identity_id, issuer=issuer, subject=subject, email=admin_email
+            conn, id=identity_id, issuer=issuer, subject=subject, email=email
         )
+        existing_role = await get_role_owner(conn, tenant_id=tenant_id, identity_id=identity_id)
+        if existing_role is not None and existing_role != role:
+            raise MembershipRoleConflictError(tenant_id, identity_id, existing_role, role)
         return await ensure_membership(
-            conn, tenant_id=tenant_id, identity_id=identity_id, role="admin"
+            conn, tenant_id=tenant_id, identity_id=identity_id, role=role
         )
+
+
+async def ensure_dedicated_admin_membership(
+    *,
+    owner_dsn: str,
+    tenant_id: UUID,
+    tenant_name: str,
+    tenant_settings_json: str,
+    identity_id: UUID,
+    issuer: str,
+    subject: str,
+    admin_email: str,
+) -> str:
+    """Thin `role="admin"` wrapper over `ensure_dedicated_membership` above -- `create_tenant`'s
+    own call site and its worked tests predate the generalization (#83); see that function's
+    docstring for the full contract."""
+    return await ensure_dedicated_membership(
+        owner_dsn=owner_dsn,
+        tenant_id=tenant_id,
+        tenant_name=tenant_name,
+        tenant_settings_json=tenant_settings_json,
+        identity_id=identity_id,
+        issuer=issuer,
+        subject=subject,
+        email=admin_email,
+        role="admin",
+    )

@@ -41,6 +41,7 @@ uv run python scripts/operator.py create "My Tenant" --residency eu --admin-emai
 uv run python scripts/provision_roles.py <admin-database-url>  # managed Postgres, no init hook
 uv run python scripts/operator.py suspend <tenant-id-or-name>    # suspend a tenant (idempotent)
 uv run python scripts/operator.py unsuspend <tenant-id-or-name>  # restore it, nothing re-provisioned
+uv run python scripts/operator.py add-membership <tenant-id-or-name> <role> <email>  # attach an additional membership, idempotent; refuses a suspended tenant or a role change
 uv run python scripts/operator.py erase <tenant-id-or-name>      # irreversible; refuses a non-suspended tenant; --dry-run to preview
 uv run python scripts/retention.py        # delete every tenant's expired conversations (ADR-0006; default 90 days)
 uv run uvicorn app.main:app --reload      # API locally, http://localhost:8000/docs
@@ -143,7 +144,7 @@ Always `uv run <cmd>`, never a global `python`/`pip`.
    `read_gateway_credential_alias`/`write_gateway_credential_alias`, `enumerate_referenced_aliases`,
    `get_record`, behind the one private `_set_owner_tenant_context` forced-RLS helper) is what the
    session router, the guard, the migration runner, the operator commands
-   (`app/operator/create.py`/`erase.py`/`suspend.py`/`listing.py`/`lookup.py`), and
+   (`app/operator/create.py`/`erase.py`/`suspend.py`/`listing.py`/`lookup.py`/`add_membership.py`), and
    `app/gateway_provisioning.py` all read and write through now (spec A5 / #114) — no other module
    issues SQL against `control.*` directly. The operator tool's own public, test-drivable entry
    point is `app.operator.cli.run_operator(argv, *, engine=None, admin_client=None)` (spec A5 /
@@ -289,7 +290,7 @@ tests/                pytest; RLS integration test with pgserver
 docker/               Postgres init (app role), LiteLLM config
 config/               residency.toml -- the residency allow-list (ADR-0008), loaded by app/config.py
 docs/                 adr/, agents/ (skill config), frontend.md, mobile.md, deployment.md, residency.md, mcp-connection.md
-app/operator/          operator tool: `cli.py`'s `run_operator()` is the one public, test-drivable entry point; `main()` is its synchronous script wrapper (scripts/operator.py's own entry point; replaces scripts/seed.py); tenant lookup, tenant listing, `create`, `suspend`/`unsuspend`, `erase` are compositions over `app/repositories/control.py`'s `ControlRepository`, the one path for `control` schema SQL
+app/operator/          operator tool: `cli.py`'s `run_operator()` is the one public, test-drivable entry point; `main()` is its synchronous script wrapper (scripts/operator.py's own entry point; replaces scripts/seed.py); tenant lookup, tenant listing, `create`, `suspend`/`unsuspend`, `add-membership`, `erase` are compositions over `app/repositories/control.py`'s `ControlRepository`, the one path for `control` schema SQL
 ```
 
 ## Do not touch without checking first

@@ -946,3 +946,28 @@ def test_adr_0007_points_at_the_run_module_and_the_decorator() -> None:
     assert "app/agents/run.py" in ADR_0007
     assert "writing_tool" in ADR_0007
     assert "app/agents/writing_tools.py" in ADR_0007
+
+
+# --- Issue #83's closing ticket: `add-membership`, and ADR-0003/ADR-0012 flip to accepted --------
+
+ADR_0003 = (REPO_ROOT / "docs" / "adr" / "0003-identity-and-membership.md").read_text(
+    encoding="utf-8"
+)
+
+
+def test_adr_0003_is_accepted_not_proposed() -> None:
+    status_line = next(line for line in ADR_0003.splitlines() if line.startswith("- **Status:**"))
+    assert "accepted" in status_line
+    assert "proposed" not in status_line
+
+
+def test_adr_0012_is_accepted_not_proposed() -> None:
+    status_line = next(line for line in ADR_0012.splitlines() if line.startswith("- **Status:**"))
+    assert "accepted" in status_line
+    assert "proposed" not in status_line
+
+
+def test_claude_md_commands_lists_add_membership() -> None:
+    commands_block = CLAUDE_MD.split("## Commands", 1)[1].split("## Architecture rules", 1)[0]
+    assert "scripts/operator.py add-membership" in commands_block
+    assert "idempotent" in commands_block
