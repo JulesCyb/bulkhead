@@ -162,3 +162,37 @@ def test_pooled_alias_never_reads_the_migration_secrets_directory(migrate_env):
 
     version = migrate_module.asyncio.run(_alembic_version(migrate_env["pooled"].owner_url))
     assert version == _head_revision()
+
+
+def test_an_in_process_migration_run_leaves_existing_loggers_enabled(migrate_env):
+    """(#118) `migrations/env.py` configures logging from `alembic.ini` on every run. With the
+    stdlib default (`disable_existing_loggers=True`) that silently disabled every logger created
+    before the run -- in the operator process, everything logged after
+    `ensure_dedicated_database` had provisioned a dedicated tenant's database vanished. A logger
+    that exists before an in-process `migrate_alias` call, with its own handler, must still be
+    enabled and still deliver records afterwards. (Its own handler, not `caplog`: `fileConfig`
+    legitimately replaces the *root* logger's handlers, which is where `caplog` listens.)"""
+    import logging
+
+    class _Collect(logging.Handler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.messages: list[str] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            self.messages.append(record.getMessage())
+
+    survivor = logging.getLogger("bulkhead.test.survives_migration")
+    survivor.setLevel(logging.INFO)
+    collector = _Collect()
+    survivor.addHandler(collector)
+    try:
+        assert not survivor.disabled
+
+        migrate_module.migrate_alias(POOLED_ALIAS)
+
+        assert not survivor.disabled
+        survivor.info("still here")
+        assert collector.messages == ["still here"]
+    finally:
+        survivor.removeHandler(collector)

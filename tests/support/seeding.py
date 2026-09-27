@@ -66,7 +66,6 @@ from tests.support.cluster import (
     Cluster,
     _with_database,
     create_database,
-    migration_run_without_disrupting_logging,
 )
 from tests.support.gateway import fake_gateway_admin_client
 
@@ -655,21 +654,15 @@ async def _seed_tenant_via_operator(
     try:
         async with owner_engine.begin() as conn:
             await assert_known_not_null_columns(conn, _KNOWN_NOT_NULL_COLUMNS)
-            # Wraps the whole call, not just a dedicated tier's migration step: harmless for a
-            # pooled tenant (which never calls into Alembic at all) and this is the one call site
-            # every via_operator seed goes through -- see
-            # `migration_run_without_disrupting_logging`'s own docstring for why an in-process
-            # migration run must always be wrapped like this within a single pytest session.
-            with migration_run_without_disrupting_logging():
-                result = await create_tenant(
-                    conn,
-                    tenant_name=name,
-                    residency=residency,
-                    admin_email=admin_email,
-                    isolation_tier=isolation_tier,
-                    dedicated_db_admin_url=dedicated_admin_url,
-                    admin_client=admin_client,
-                )
+            result = await create_tenant(
+                conn,
+                tenant_name=name,
+                residency=residency,
+                admin_email=admin_email,
+                isolation_tier=isolation_tier,
+                dedicated_db_admin_url=dedicated_admin_url,
+                admin_client=admin_client,
+            )
 
             if isolation_tier == "pooled":
                 admin_membership_id = await _admin_membership_id(
@@ -850,8 +843,7 @@ async def _provision_dedicated_tenant_database(cluster: Cluster, alias: str) -> 
     # itself calls asyncio.run() -- fatal if invoked directly from a coroutine already running
     # inside an event loop (this one), so it runs in a worker thread instead, exactly like
     # app.operator.dedicated_db.ensure_dedicated_database does for the same reason.
-    with migration_run_without_disrupting_logging():
-        await asyncio.to_thread(migrate_module.migrate_alias, alias)
+    await asyncio.to_thread(migrate_module.migrate_alias, alias)
 
     app_secret = app_dir / alias
     app_secret.parent.mkdir(parents=True, exist_ok=True)
