@@ -1,0 +1,15 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "packageRules": [
+    {
+      "description": "Keep Dockerfile/docker-compose image tags AND digests current (issue #80) -- a bare tag can be silently repointed by a registry, so the digest is kept in lock-step with it.",
+      "matchManagers": ["dockerfile", "docker-compose"],
+      "pinDigests": true
+    }
+  ],
+  "lockFileMaintenance": {
+    "description": "Refresh uv.lock (via the pep621 manager) on a schedule, not just on a direct pyproject.toml dependency bump.",
+    "enabled": true
+  }
+}
