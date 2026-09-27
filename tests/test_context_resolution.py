@@ -259,8 +259,9 @@ ALLOWED_CONSTRUCTION_SITES: dict[str, int] = {
     "app/token_verifier.py": 1,
     # Same shape for the agent-credential exchange: no identity is known yet, nothing returned.
     "app/agent_credential_exchange.py": 1,
-    # A job, not a request: the retention job's own fixed job identity (ADR-0006, rule 1).
-    "app/retention.py": 1,
+    # A job, not a request: the fixed job identity every scheduled per-tenant job (retention,
+    # ADR-0006; the pending-action sweep, ADR-0007/#82) gets from the one shared loop (rule 1).
+    "app/tenant_jobs.py": 1,
     # #102 moved the stdio-only development fallback into `resolve_stdio_env_context` above;
     # `app/mcp/server.py`'s `_context_from_env` is now a thin wrapper with no construction site
     # of its own, so it no longer appears here at all.

@@ -417,6 +417,46 @@ async def test_approving_executes_exactly_once_and_response_reflects_the_change(
     kinds = await _audit_kinds_for_tenant(environment.superuser_url, tenant_id=tenant.tenant_id)
     assert kinds == ["requested", "approved", "executed"]
 
+    # #82: the pending action itself records that it ran -- `verify()` requires `approved`, so
+    # it can never verify (and run) a second time.
+    rows = await _pending_action_rows(environment.superuser_url, tenant_id=tenant.tenant_id)
+    assert [row["status"] for row in rows] == ["executed"]
+
+
+async def test_an_approved_write_that_finds_nothing_marks_the_action_execution_failed(
+    environment, client, use_model
+):
+    """#82: an approved call whose body does not succeed (here: `rename_document` on an id that
+    resolves to no document -- the decorator's "nothing to act on" branch) moves the pending
+    action to `execution_failed`, alongside the `failed_to_execute` audit row."""
+    tenant = await seed_tenant(environment, roles=["member"], via_operator=False)
+    identity_id = tenant.identities["member"]
+    await seed_conversation(
+        environment,
+        tenant_id=tenant.tenant_id,
+        identity_id=identity_id,
+        conversation_id=CONVERSATION_ID,
+    )
+    missing_document_id = uuid.uuid4()
+
+    use_model(_rename_model(document_id=missing_document_id, title=NEW_TITLE))
+
+    async with client:
+        await _propose(client, tenant.tenant_id, identity_id)
+        await _resume(
+            client,
+            tenant.tenant_id,
+            identity_id,
+            document_id=missing_document_id,
+            title=NEW_TITLE,
+            approved=True,
+        )
+
+    kinds = await _audit_kinds_for_tenant(environment.superuser_url, tenant_id=tenant.tenant_id)
+    assert kinds == ["requested", "approved", "failed_to_execute"]
+    rows = await _pending_action_rows(environment.superuser_url, tenant_id=tenant.tenant_id)
+    assert [row["status"] for row in rows] == ["execution_failed"]
+
 
 async def test_writing_tool_approval_audit_rows_carry_the_delegation_means(
     environment, client, use_model
@@ -642,6 +682,70 @@ async def test_expired_approval_is_refused_and_marked_expired(environment, clien
 
     kinds = await _audit_kinds_for_tenant(environment.superuser_url, tenant_id=tenant.tenant_id)
     assert kinds == ["requested", "approved", "expired"]
+
+    # #82: the late resume also moves the row itself to `expired` (`mark_expired`), so neither a
+    # later sweep nor a second late resume can record a second `expired` event for it.
+    rows = await _pending_action_rows(environment.superuser_url, tenant_id=tenant.tenant_id)
+    assert [row["status"] for row in rows] == ["expired"]
+
+
+async def test_late_resume_after_the_sweep_records_no_second_expired_event(
+    environment, client, use_model
+):
+    """#82: once the sweep has expired an unanswered pending action (and written its one
+    `expired` event), a late approval neither executes nor records anything new -- the resolve
+    step finds no `pending` row to approve, and the execution-time `verify()` reports
+    `status_expired`, for which `require_approval` records nothing (the sweep's event already
+    says everything true about the action). Exactly one `expired` event, never two."""
+    from app.pending_action_sweep import run_pending_action_sweep
+
+    tenant = await seed_tenant(environment, roles=["member"], via_operator=False)
+    identity_id = tenant.identities["member"]
+    await seed_conversation(
+        environment,
+        tenant_id=tenant.tenant_id,
+        identity_id=identity_id,
+        conversation_id=CONVERSATION_ID,
+    )
+    document_id = await seed_document(
+        environment, tenant_id=tenant.tenant_id, identity_id=identity_id, title=ORIGINAL_TITLE
+    )
+
+    use_model(_rename_model(document_id=document_id, title=NEW_TITLE))
+
+    async with client:
+        await _propose(client, tenant.tenant_id, identity_id)
+        await _set_pending_action_expiry_in_the_past(
+            environment.superuser_url, tenant_id=tenant.tenant_id
+        )
+
+        engine = create_async_engine(environment.owner_url)
+        try:
+            async with engine.begin() as conn:
+                await run_pending_action_sweep(conn)
+        finally:
+            await engine.dispose()
+        assert await _audit_kinds_for_tenant(
+            environment.superuser_url, tenant_id=tenant.tenant_id
+        ) == ["requested", "expired"]
+
+        resumed = await _resume(
+            client,
+            tenant.tenant_id,
+            identity_id,
+            document_id=document_id,
+            title=NEW_TITLE,
+            approved=True,
+        )
+
+    assert resumed.status_code == 200
+    assert await _document_title(environment.superuser_url, document_id=document_id) == (
+        ORIGINAL_TITLE
+    )
+    kinds = await _audit_kinds_for_tenant(environment.superuser_url, tenant_id=tenant.tenant_id)
+    assert kinds == ["requested", "expired"]
+    rows = await _pending_action_rows(environment.superuser_url, tenant_id=tenant.tenant_id)
+    assert [row["status"] for row in rows] == ["expired"]
 
 
 async def test_writing_tool_goes_through_the_shared_repository_layer(

@@ -238,6 +238,8 @@ class PendingAction(Base):
     # resolution uses across the propose/resume runs -- see that migration's docstring.
     tool_call_id: Mapped[str] = mapped_column(String(200))
     asking_membership_id: Mapped[UUID] = mapped_column(ForeignKey("memberships.id"))
+    # pending/approved/refused/expired/executed/execution_failed (migration 0043, #82); every
+    # transition lives in `PendingActionRepository`, nothing else writes this column.
     status: Mapped[str] = mapped_column(String(20), default="pending")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

@@ -47,11 +47,13 @@ from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from pydantic_ai import ApprovalRequired, RunContext, ToolFailed
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.context import RequestContext
 from app.db.session import tenant_session
 from app.repositories import approval_audit as audit_kinds
+from app.repositories import pending_actions as pending_statuses
 from app.repositories.approval_audit import ApprovalAuditRepository
 from app.repositories.memberships import MembershipRepository
 from app.repositories.pending_actions import PendingActionRepository
@@ -172,20 +174,19 @@ async def require_approval(ctx: RunContext[AssistantDeps], **arguments: Any) -> 
                     arguments=arguments,
                 )
                 if not verification.ok:
-                    kind = (
-                        audit_kinds.EXPIRED
-                        if verification.reason == "expired"
-                        else audit_kinds.FAILED_TO_EXECUTE
+                    kind = await _audit_kind_for_failed_verification(
+                        session, rc, pending_action_id=pending.id, reason=verification.reason
                     )
-                    await ApprovalAuditRepository().record(
-                        session,
-                        rc,
-                        kind=kind,
-                        tool_name=tool_name,
-                        actor_membership_id=membership.id,
-                        pending_action_id=pending.id,
-                        details={"reason": verification.reason},
-                    )
+                    if kind is not None:
+                        await ApprovalAuditRepository().record(
+                            session,
+                            rc,
+                            kind=kind,
+                            tool_name=tool_name,
+                            actor_membership_id=membership.id,
+                            pending_action_id=pending.id,
+                            details={"reason": verification.reason},
+                        )
                     denial = f"approval could not be verified: {verification.reason}"
                 elif membership.role not in EXECUTION_ROLES:
                     # The execution-time role re-check ADR-0007 calls for, distinct from -- and run
@@ -218,6 +219,32 @@ async def require_approval(ctx: RunContext[AssistantDeps], **arguments: Any) -> 
         raise ApprovalRequired()
 
 
+async def _audit_kind_for_failed_verification(
+    session: AsyncSession, rc: RequestContext, *, pending_action_id: UUID, reason: str | None
+) -> str | None:
+    """Which audit milestone (if any) a failed `verify()` on the resumed pass records (#82).
+
+    - `expired` -- an `approved` action past its window, answered late: the row is moved to
+      `expired` (`PendingActionRepository.mark_expired`) and `EXPIRED` is recorded *only if that
+      transition actually happened*, so a second late resume never records a second `expired`
+      event (and the sweep never touches an `approved` row, so it cannot record one either).
+    - `status_expired` -- the sweep (`app/pending_action_sweep.py`) or an earlier late resume
+      already expired this action and wrote its one `expired` event: nothing new is recorded.
+      That event already says everything true about the action; recording `failed_to_execute`
+      here would claim an execution attempt against a proposal that had already lapsed, and a
+      second `expired` would break "exactly one `expired` per action". The call is still denied.
+    - anything else (hash mismatch, not yet approved, already executed) -- `FAILED_TO_EXECUTE`,
+      unchanged from before #82."""
+    if reason == "expired":
+        moved = await PendingActionRepository().mark_expired(
+            session, rc, pending_action_id=pending_action_id
+        )
+        return audit_kinds.EXPIRED if moved else None
+    if reason == f"status_{pending_statuses.EXPIRED}":
+        return None
+    return audit_kinds.FAILED_TO_EXECUTE
+
+
 async def record_write_outcome(
     rc: RequestContext, approval: ApprovalContext | None, *, success: bool
 ) -> None:
@@ -226,10 +253,19 @@ async def record_write_outcome(
     `app/repositories/approval_audit.py`'s module docstring), never something `require_approval()`
     itself claims to know in advance. A no-op when `approval` is None (the validator never ran, or
     denied the call before recording an `ApprovalContext` -- there is nothing for this call to
-    add)."""
+    add).
+
+    For a member-approved call (`approval.pending_action_id` set) the pending action itself moves
+    `approved -> executed | execution_failed` in the same transaction as the audit row (#82), so
+    the stored record says the call ran and `verify()` never lets it run again. A standing-grant
+    call has no pending action; only its audit row is written."""
     if approval is None:
         return
     async with tenant_session(rc) as session:
+        if approval.pending_action_id is not None:
+            await PendingActionRepository().mark_execution_outcome(
+                session, rc, pending_action_id=approval.pending_action_id, success=success
+            )
         await ApprovalAuditRepository().record(
             session,
             rc,
