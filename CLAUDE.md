@@ -25,7 +25,10 @@ ADR wins — then update this file.
   dependencies, always installed — content-free by default, per-tenant opt-in, one trace sink
   per residency, ADR-0008)
 - Frontend: none in this repo — Next.js + Vercel AI SDK against `POST /v1/t/{tenant_id}/api/chat`, see `docs/frontend.md`; a mobile app as another client, see `docs/mobile.md`
-- Operations: Docker Compose (`docker-compose.yml`), hosted in an EU region
+- Operations: Docker Compose (`docker-compose.yml`), hosted in an EU region. Every image is
+  pinned by digest (`name:tag@sha256:<digest>`) and the Docker build installs only from
+  `uv.lock` (`uv sync --locked`, no fallback) — see "Image and dependency pins" in
+  `docs/deployment.md` (issue #80).
 
 ## Commands
 

@@ -36,11 +36,13 @@
   environment variables in `.env`; rotating a secret is then replacing the file and redeploying,
   with no code change. `.env`/`environment:` stays the right choice for local development.
 - **Image pins**: every pulled image in `docker-compose.yml` (`postgres`, `litellm`) names a
-  specific version, never `latest`/a bare major-version tag — `docker compose config` is the
-  place this is enforced (`tests/test_deployment_hardening_compose.py`,
-  `tests/test_gateway_compose.py`). `api`/`migrate` build from this repo's own `Dockerfile`, whose
-  own base images (`python:3.12-slim`, `ghcr.io/astral-sh/uv`) are pinned there for the same
-  reason.
+  specific version *and* its digest (`name:tag@sha256:<digest>`), never `latest`/a bare
+  major-version tag and never a tag alone — `docker compose config` is the place the version pin
+  is enforced (`tests/test_deployment_hardening_compose.py`, `tests/test_gateway_compose.py`);
+  `tests/test_supply_chain_pins.py` enforces the digest. `api`/`migrate` build from this repo's
+  own `Dockerfile`, whose own base image (`python:3.12-slim`) is pinned by digest there for the
+  same reason, and whose `uv sync` steps install with `--locked` (no fallback) so the build never
+  silently resolves dependencies outside `uv.lock`. See "Image and dependency pins" below.
 - **Local env files**: `.gitignore`/`.dockerignore` exclude any `.env.<anything>` (not just the
   exact name `.env`) by default, so a locally created `.env.local`/`.env.production` never lands
   in git or an image layer; `.env.example` is explicitly re-included in both so the template stays
@@ -126,6 +128,40 @@ own database genuinely lives on that same Postgres instance (ADR-0009), and a Po
 `127.0.0.1` on the host cannot be reached from a container with no shared Docker network at all;
 splitting the gateway onto its own Postgres instance would remove that overlap entirely but is a
 bigger change than this networking pass (see `tests/test_deployment_hardening_compose.py`).
+
+## Image and dependency pins (issue #80)
+
+Every pulled image is pinned as `name:tag@sha256:<digest>`: `python:3.12-slim` in `Dockerfile`,
+and `pgvector/pgvector:0.8.6-pg17`/`ghcr.io/berriai/litellm:v1.80.11-stable.1` in
+`docker-compose.yml`. A tag alone is not a fixed reference — a registry can repoint a tag at a
+different build without changing it — so the tag stays for readability but the digest is what is
+actually pulled and what a reviewer actually reviewed. `Dockerfile`'s `uv sync` steps use
+`--locked --no-dev`, with no `|| uv sync ...` fallback: the build fails outright if `uv.lock` is
+missing or does not match `pyproject.toml`, rather than silently resolving a fresh, unreviewed
+dependency set. `tests/test_supply_chain_pins.py` fails the suite if a `FROM`/`image:` reference
+loses its digest, or a `uv sync` step loses `--locked` or grows a fallback back.
+
+Renovate (`renovate.json`, `pinDigests: true` for the `dockerfile`/`docker-compose` managers) keeps
+every image's tag *and* digest current together, and `lockFileMaintenance` keeps `uv.lock` current
+— each as its own PR, so nothing here needs a person to remember to bump it by hand.
+
+**How an AI agent (or a person) updates a pin by hand** — before Renovate's PR lands, or if
+Renovate is not running — change the tag and the digest in the same edit, always together: never
+remove a digest, and never leave one that no longer matches the tag next to it. To look up the
+current digest for `name:tag`:
+
+- `docker buildx imagetools inspect name:tag` (or `docker manifest inspect name:tag`) — read the
+  top-level `Digest:` line. That is the multi-arch *index* digest, the one `docker pull name:tag`
+  itself resolves to; a single platform manifest's own digest further down the output is the wrong
+  one to pin.
+- Without Docker: `skopeo inspect docker://name:tag`, or a direct registry API call. Docker Hub:
+  get an anonymous token from
+  `https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/<image>:pull`,
+  then read the `Docker-Content-Digest` response header from a `GET`/`HEAD` on
+  `https://registry-1.docker.io/v2/library/<image>/manifests/<tag>` sent with
+  `Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json`.
+  ghcr.io images take a token the same way from
+  `https://ghcr.io/token?scope=repository:<owner>/<image>:pull`.
 
 ## Scaling / relocation
 

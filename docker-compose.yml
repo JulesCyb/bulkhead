@@ -1,6 +1,8 @@
 services:
   postgres:
-    image: pgvector/pgvector:0.8.6-pg17  # pinned release, not the floating pg17 tag (#18)
+    # pinned release + digest (#18, #80), not the floating pg17 tag and not a tag that a registry
+    # could silently repoint
+    image: pgvector/pgvector:0.8.6-pg17@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f
     networks:
       # `db`: the application's own path to postgres (api, migrate). `gatewaydb`: a separate,
       # disjoint network carrying only the gateway's own database traffic (#18) — the gateway
@@ -123,7 +125,8 @@ services:
   # application's database traffic, and `migrate` (which never calls the gateway) has no route
   # to the gateway at all. See docker-compose.yml `networks:` and ADR-0009.
   litellm:
-    image: ghcr.io/berriai/litellm:v1.80.11-stable.1  # pinned release, not a floating tag
+    # pinned release + digest (#80), not a floating tag
+    image: ghcr.io/berriai/litellm:v1.80.11-stable.1@sha256:47afa3b6f6af446488f51f4bbcefbef4cf5f01da4b22c4f440a918def952842d
     networks: [gatewaydb, gateway]
     environment:
       DATABASE_URL: postgresql://gateway:${GATEWAY_DB_PASSWORD:-gateway}@postgres:5432/gateway
