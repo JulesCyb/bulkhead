@@ -105,6 +105,14 @@ class VerificationResult:
     reason: str | None = None
 
 
+def status_reason(status: str) -> str:
+    """The one spelling of a `VerificationResult.reason` that names a status (`status_expired`,
+    `status_executing`, ...): `verify()` produces it here, and the approval machinery
+    (`app.tools.approvals`) compares against and reports the same function's output, so the two
+    can never drift apart."""
+    return f"status_{status}"
+
+
 @dataclass(frozen=True, slots=True)
 class ExpiredPendingAction:
     """One row `expire_overdue()` moved from `pending` to `expired` -- exactly what the sweep needs
@@ -359,7 +367,7 @@ class PendingActionRepository:
         if action is None:
             return VerificationResult(ok=False, reason="not_found")
         if action.status != APPROVED:
-            return VerificationResult(ok=False, reason=f"status_{action.status}")
+            return VerificationResult(ok=False, reason=status_reason(action.status))
         if datetime.now(UTC) >= _as_aware(action.expires_at):
             return VerificationResult(ok=False, reason="expired")
         if action.args_hash != hash_arguments(tool_name, arguments):

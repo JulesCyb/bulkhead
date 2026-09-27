@@ -214,7 +214,10 @@ async def require_approval(ctx: RunContext[AssistantDeps], **arguments: Any) -> 
                     # and then match nothing). Denied exactly like a failed verification with
                     # that status, and like it records nothing: the winner's own `executed`/
                     # `failed_to_execute` is the one true outcome of this action.
-                    denial = f"approval could not be verified: status_{pending_statuses.EXECUTING}"
+                    denial = (
+                        "approval could not be verified: "
+                        f"{pending_statuses.status_reason(pending_statuses.EXECUTING)}"
+                    )
                 else:
                     ctx.deps.pending_approval = ApprovalContext(
                         actor_membership_id=membership.id,
@@ -257,7 +260,10 @@ async def _audit_kind_for_failed_verification(
             session, rc, pending_action_id=pending_action_id
         )
         return audit_kinds.EXPIRED if moved else None
-    if reason in (f"status_{pending_statuses.EXPIRED}", f"status_{pending_statuses.EXECUTING}"):
+    if reason in (
+        pending_statuses.status_reason(pending_statuses.EXPIRED),
+        pending_statuses.status_reason(pending_statuses.EXECUTING),
+    ):
         return None
     return audit_kinds.FAILED_TO_EXECUTE
 
